@@ -1,0 +1,36 @@
+{
+  "name": "agency",
+  "version": "0.0.0",
+  "description": "Agent orchestration CLI",
+  "type": "module",
+  "bin": {
+    "agency": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "build": "tsc",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@langchain/core": "1.2.5",
+    "@langchain/langgraph": "1.4.9",
+    "@langchain/langgraph-checkpoint-sqlite": "1.0.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.2.0",
+    "eslint": "10.8.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.66.0",
+    "vitest": "4.1.9"
+  }
+}
