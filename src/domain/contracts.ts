@@ -113,6 +113,8 @@ export const RunSummarySchema = z.strictObject({
   status: RunStatusSchema,
   objective: NonEmptyStringSchema,
   summary: z.string(),
+  verification: VerificationResultSchema.optional(),
+  changedFiles: z.array(NonEmptyStringSchema).optional(),
 });
 export type RunSummary = z.infer<typeof RunSummarySchema>;
 

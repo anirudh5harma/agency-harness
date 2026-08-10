@@ -1,16 +1,176 @@
 import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { runAgency, type TerminalIO, type TextOutput } from "../src/cli/index.js";
+import { FakeCodingRuntime } from "../src/coding/index.js";
+import type { Plan } from "../src/domain/index.js";
 
 const execFileAsync = promisify(execFile);
-const cliPath = fileURLToPath(new URL("../src/cli/index.ts", import.meta.url));
+const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+const builtCliPath = fileURLToPath(new URL("../dist/cli/index.js", import.meta.url));
+const temporaryDirectories: string[] = [];
 
-describe("agency CLI", () => {
-  it("starts and reports its foundation status", async () => {
-    const { stderr, stdout } = await execFileAsync(process.execPath, [cliPath]);
+class BufferOutput implements TextOutput {
+  value = "";
+  write(text: string): void {
+    this.value += text;
+  }
+}
 
-    expect(stderr).toBe("");
-    expect(stdout).toBe("Agency CLI foundation ready. Runtime coming next.\n");
+class ScriptedIO implements TerminalIO {
+  readonly prompts: string[] = [];
+  closeCalls = 0;
+
+  constructor(private readonly lines: Array<string | null>) {}
+
+  async readLine(prompt: string): Promise<string | null> {
+    this.prompts.push(prompt);
+    return this.lines.shift() ?? null;
+  }
+
+  onInterrupt(): () => void {
+    return () => {};
+  }
+
+  close(): void {
+    this.closeCalls += 1;
+  }
+}
+
+const plan: Plan = {
+  objective: "Make the requested change",
+  assumptions: [],
+  steps: [{ id: "1", description: "Update the project" }],
+  likelyFiles: [],
+  verificationStrategy: ["Run tests"],
+};
+
+async function git(cwd: string, args: string[]): Promise<void> {
+  await execFileAsync("git", args, { cwd });
+}
+
+async function temporaryGitProject(options: { verification?: boolean } = {}): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "agency-cli-"));
+  temporaryDirectories.push(directory);
+  await git(directory, ["init", "-q"]);
+  await git(directory, ["config", "user.email", "agency@example.com"]);
+  await git(directory, ["config", "user.name", "Agency Test"]);
+  await writeFile(
+    join(directory, "package.json"),
+    JSON.stringify({
+      name: "fixture",
+      scripts: options.verification
+        ? { test: "node -e \"console.log('verified')\"" }
+        : {},
+    }),
+  );
+  await writeFile(join(directory, "tracked.txt"), "initial\n");
+  await git(directory, ["add", "package.json", "tracked.txt"]);
+  await git(directory, ["commit", "-qm", "initial"]);
+  return directory;
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  );
+});
+
+describe("Agency terminal application", () => {
+  it("keeps two natural-language turns in one REPL and session", async () => {
+    const cwd = await temporaryGitProject();
+    const runtime = new FakeCodingRuntime();
+    for (const suffix of ["one", "two"]) {
+      runtime.enqueuePlanResult({ plan, message: `plan ${suffix}` });
+      runtime.enqueueExecuteResult({ message: `done ${suffix}`, changedFiles: [], sessionId: "pi" });
+    }
+    const io = new ScriptedIO(["first task", "follow-up task", "/exit"]);
+    const output = new BufferOutput();
+    const errors = new BufferOutput();
+    let nextId = 0;
+
+    await runAgency({
+      cwd,
+      io,
+      output,
+      errorOutput: errors,
+      runtimeFactory: async () => runtime,
+      createId: () => `id-${++nextId}`,
+    });
+
+    expect(runtime.calls.createPlan).toHaveLength(2);
+    expect(runtime.calls.createPlan[1]?.sessionContext?.recentTurns.map(({ content }) => content))
+      .toEqual(["first task", "follow-up task"]);
+    expect(runtime.calls.createPlan[0]?.sessionContext?.sessionId)
+      .toBe(runtime.calls.createPlan[1]?.sessionContext?.sessionId);
+    expect(io.prompts.filter((prompt) => prompt === "agency> ")).toHaveLength(3);
+    expect(output.value).toContain("Done:");
+    expect(errors.value).toBe("");
+    expect(runtime.isDisposed).toBe(true);
+    expect(io.closeCalls).toBe(1);
+  });
+
+  it("routes slash commands without invoking the coding runtime and starts a new session", async () => {
+    const cwd = await temporaryGitProject({ verification: true });
+    await writeFile(join(cwd, "tracked.txt"), "changed\n");
+    const runtime = new FakeCodingRuntime();
+    const io = new ScriptedIO([
+      "/help",
+      "/status",
+      "/diff",
+      "/verify",
+      "/new",
+      "/status",
+      "/wat",
+      "/exit",
+    ]);
+    const output = new BufferOutput();
+    const errors = new BufferOutput();
+
+    await runAgency({ cwd, io, output, errorOutput: errors, runtimeFactory: async () => runtime });
+
+    expect(runtime.calls.createPlan).toHaveLength(0);
+    expect(runtime.calls.execute).toHaveLength(0);
+    expect(output.value).toContain("Commands:");
+    expect(output.value).toContain("-initial");
+    expect(output.value).toContain("+changed");
+    expect(output.value).toContain("Verification: passed");
+    const sessions = [...output.value.matchAll(/Session: ([^\n]+)/g)].map((match) => match[1]);
+    expect(sessions).toHaveLength(2);
+    expect(sessions[0]).not.toBe(sessions[1]);
+    expect(errors.value).toContain("Unknown command: /wat");
+  });
+
+  it("renders a failed graph run truthfully and returns to the prompt", async () => {
+    const cwd = await temporaryGitProject();
+    const runtime = new FakeCodingRuntime();
+    runtime.enqueuePlanResult(new Error("planner unavailable"));
+    const io = new ScriptedIO(["do something", "/exit"]);
+    const output = new BufferOutput();
+    const errors = new BufferOutput();
+
+    await runAgency({ cwd, io, output, errorOutput: errors, runtimeFactory: async () => runtime });
+
+    expect(errors.value).toContain("Failed: Run failed: planner unavailable");
+    expect(output.value).not.toContain("Done:");
+    expect(io.prompts.filter((prompt) => prompt === "agency> ")).toHaveLength(2);
+  });
+
+  it("fails clearly and nonzero when started outside Git", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agency-outside-git-"));
+    temporaryDirectories.push(cwd);
+    await execFileAsync("npm", ["run", "build"], { cwd: projectRoot });
+    const error = await execFileAsync(process.execPath, [builtCliPath], { cwd }).catch(
+      (cause: unknown) => cause as { code: number; stderr: string },
+    );
+
+    expect(error.code).not.toBe(0);
+    expect(error.stderr).toContain("Agency could not start: No Git repository contains");
   });
 });
