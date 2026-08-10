@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -8,9 +8,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   InfrastructureError,
   captureGitBaseline,
+  ensureAgencyMetadataIgnored,
   findGitRoot,
   getChangedFiles,
   inspectRepository,
+  resolveGitExcludePath,
 } from "../../src/repo/index.js";
 
 const execFileAsync = promisify(execFile);
@@ -48,6 +50,46 @@ afterEach(async () => {
 });
 
 describe("repository inspection", () => {
+  it("adds the Agency rule to the local exclude exactly once", async () => {
+    const root = await initializedRepository();
+    const excludePath = await resolveGitExcludePath(root);
+    const before = await readFile(excludePath, "utf8");
+
+    await ensureAgencyMetadataIgnored(root);
+    await ensureAgencyMetadataIgnored(root);
+
+    const after = await readFile(excludePath, "utf8");
+    expect(after.startsWith(before)).toBe(true);
+    expect(after.split(/\r?\n/u).filter((line) => line === ".devagency/"))
+      .toHaveLength(1);
+  });
+
+  it("reports local exclude update failures as typed infrastructure errors", async () => {
+    const root = await initializedRepository();
+    const excludePath = await resolveGitExcludePath(root);
+    await rm(excludePath);
+    await mkdir(excludePath);
+
+    await expect(ensureAgencyMetadataIgnored(root)).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "GIT_EXCLUDE_SETUP_FAILED",
+    });
+  });
+
+  it("resolves and updates the Git exclude file from a linked worktree", async () => {
+    const root = await initializedRepository();
+    const worktree = `${root}-linked`;
+    temporaryDirectories.push(worktree);
+    await git(root, "worktree", "add", "-b", "linked", worktree);
+
+    const excludePath = await resolveGitExcludePath(worktree);
+    await ensureAgencyMetadataIgnored(worktree);
+
+    expect(excludePath).not.toBe(join(worktree, ".git", "info", "exclude"));
+    expect((await readFile(excludePath, "utf8")).split(/\r?\n/u))
+      .toContain(".devagency/");
+  });
+
   it("reports a typed infrastructure error outside Git", async () => {
     const directory = await temporaryDirectory();
 

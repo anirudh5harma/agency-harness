@@ -19,7 +19,12 @@ import {
   routeAfterVerification,
   type CodingRunGraphDependencies,
 } from "../../src/graph/index.js";
+import type {
+  TrajectoryLifecycleEvent,
+  TrajectoryWriter,
+} from "../../src/observability/index.js";
 import { IncompleteRunRegistry } from "../../src/persistence/index.js";
+import { InfrastructureError } from "../../src/process/index.js";
 import {
   captureGitBaseline,
   getChangedFiles,
@@ -102,6 +107,92 @@ afterEach(async () => {
 });
 
 describe("coding run graph", () => {
+  it("records the successful lifecycle in order without UI event payloads", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    const events: TrajectoryLifecycleEvent[] = [];
+    deps.trajectoryWriter = {
+      append: async (event) => {
+        events.push(event.event);
+      },
+    } satisfies TrajectoryWriter;
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("completed");
+    expect(events).toEqual([
+      "run_started",
+      "prepare_started",
+      "prepare_completed",
+      "plan_started",
+      "plan_completed",
+      "execution_started",
+      "execution_completed",
+      "verification_started",
+      "verification_passed",
+      "verification_completed",
+      "run_completed",
+    ]);
+  });
+
+  it("records failed verification and repair lifecycles in order", async () => {
+    const { root, runtime, deps } = await setup([
+      verification("failed"),
+      verification("passed"),
+    ]);
+    const events: TrajectoryLifecycleEvent[] = [];
+    deps.trajectoryWriter = {
+      append: async (event) => {
+        events.push(event.event);
+      },
+    } satisfies TrajectoryWriter;
+    runtime.enqueueExecuteResult({ message: "broken", changedFiles: [], sessionId: "pi-1" });
+    runtime.enqueueRepairResult({ message: "fixed", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("completed");
+    expect(events).toEqual([
+      "run_started",
+      "prepare_started",
+      "prepare_completed",
+      "plan_started",
+      "plan_completed",
+      "execution_started",
+      "execution_completed",
+      "verification_started",
+      "verification_failed",
+      "verification_completed",
+      "repair_started",
+      "repair_completed",
+      "verification_started",
+      "verification_passed",
+      "verification_completed",
+      "run_completed",
+    ]);
+  }, 10_000);
+
+  it("treats trajectory write failures as infrastructure failures, never repair input", async () => {
+    const { root, runtime, deps } = await setup([]);
+    deps.trajectoryWriter = {
+      append: async () => {
+        throw new InfrastructureError(
+          "TRAJECTORY_WRITE_FAILED",
+          "Could not persist trajectory",
+        );
+      },
+    };
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      recoverable: false,
+      message: "Could not persist trajectory",
+    });
+    expect(runtime.calls.repair).toHaveLength(0);
+  });
+
   it("runs prepare through summarize on success and clears incomplete metadata", async () => {
     const { root, runtime, graph } = await setup([verification("passed")]);
     runtime.enqueueExecuteResult({ message: "done", changedFiles: ["fake.txt"], sessionId: "pi-1" });

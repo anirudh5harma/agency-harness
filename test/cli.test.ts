@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { runAgency, type TerminalIO, type TextOutput } from "../src/cli/index.js";
 import { FakeCodingRuntime } from "../src/coding/index.js";
 import type { Plan } from "../src/domain/index.js";
+import { resolveGitExcludePath } from "../src/repo/index.js";
 
 const execFileAsync = promisify(execFile);
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -83,6 +84,35 @@ afterEach(async () => {
 });
 
 describe("Agency terminal application", () => {
+  it("keeps a clean repository clean after repeated metadata startup", async () => {
+    const cwd = await temporaryGitProject();
+    const beforeIgnore = await readFile(join(cwd, ".gitignore"), "utf8").catch(
+      () => null,
+    );
+
+    for (let startup = 0; startup < 2; startup += 1) {
+      await runAgency({
+        cwd,
+        io: new ScriptedIO(["/exit"]),
+        output: new BufferOutput(),
+        errorOutput: new BufferOutput(),
+        runtimeFactory: async () => new FakeCodingRuntime(),
+      });
+    }
+
+    const { stdout } = await execFileAsync(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { cwd },
+    );
+    const exclude = await readFile(await resolveGitExcludePath(cwd), "utf8");
+    expect(stdout).toBe("");
+    expect(exclude.split(/\r?\n/u).filter((line) => line === ".devagency/"))
+      .toHaveLength(1);
+    expect(await readFile(join(cwd, ".gitignore"), "utf8").catch(() => null))
+      .toBe(beforeIgnore);
+  });
+
   it("keeps two natural-language turns in one REPL and session", async () => {
     const cwd = await temporaryGitProject();
     const runtime = new FakeCodingRuntime();
@@ -114,6 +144,10 @@ describe("Agency terminal application", () => {
     expect(errors.value).toBe("");
     expect(runtime.isDisposed).toBe(true);
     expect(io.closeCalls).toBe(1);
+    expect(await readFile(join(cwd, ".devagency", "runs", "id-1.jsonl"), "utf8"))
+      .toContain('"event":"run_started"');
+    expect(await readFile(join(cwd, ".devagency", "runs", "id-3.jsonl"), "utf8"))
+      .toContain('"event":"run_completed"');
   });
 
   it("routes slash commands without invoking the coding runtime and starts a new session", async () => {

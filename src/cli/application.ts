@@ -10,13 +10,21 @@ import {
   type CodingRunState,
 } from "../graph/index.js";
 import {
+  JsonlTrajectoryWriter,
+  type TrajectoryWriter,
+} from "../observability/index.js";
+import {
   createSqliteCheckpointPersistence,
   IncompleteRunRegistry,
   inspectIncompleteRunRecovery,
   type IncompleteRunRecoveryInspection,
   type SqliteCheckpointPersistence,
 } from "../persistence/index.js";
-import { inspectRepository, type RepositoryInspection } from "../repo/index.js";
+import {
+  ensureAgencyMetadataIgnored,
+  inspectRepository,
+  type RepositoryInspection,
+} from "../repo/index.js";
 import { SessionStore } from "../session/index.js";
 import { SlashCommandRouter, type SlashCommandDependencies } from "./commands.js";
 import { AgencyRepl, type ReplHandler, type TerminalIO } from "./repl.js";
@@ -47,6 +55,7 @@ export interface AgencyApplicationDependencies {
   output: TextOutput;
   errorOutput: TextOutput;
   inspectRepository?: (cwd: string) => Promise<RepositoryInspection>;
+  ensureMetadataIgnored?: (root: string) => Promise<void>;
   sessionStoreFactory?: (root: string) => SessionStoreBoundary;
   eventBusFactory?: () => EventBus;
   rendererFactory?: (
@@ -57,11 +66,13 @@ export interface AgencyApplicationDependencies {
   checkpointFactory?: (root: string) => Promise<SqliteCheckpointPersistence>;
   runtimeFactory?: () => Promise<CodingRuntime>;
   registryFactory?: (root: string) => IncompleteRunRegistryBoundary;
+  trajectoryWriterFactory?: (root: string) => TrajectoryWriter;
   graphFactory?: (input: {
     runtime: CodingRuntime;
     registry: IncompleteRunRegistryBoundary;
     eventBus: EventBus;
     checkpoint: SqliteCheckpointPersistence;
+    trajectoryWriter: TrajectoryWriter;
   }) => CodingRunGraphRunner;
   inspectRecovery?: (
     registry: IncompleteRunRegistryBoundary,
@@ -127,6 +138,9 @@ export class AgencyApplication implements ReplHandler {
   ): Promise<AgencyApplication> {
     const inspect = dependencies.inspectRepository ?? inspectRepository;
     const inspection = await inspect(dependencies.cwd);
+    await (dependencies.ensureMetadataIgnored ?? ensureAgencyMetadataIgnored)(
+      inspection.rootPath,
+    );
     const sessionStore =
       dependencies.sessionStoreFactory?.(inspection.rootPath) ??
       new SessionStore(inspection.rootPath);
@@ -148,14 +162,25 @@ export class AgencyApplication implements ReplHandler {
       const registry =
         dependencies.registryFactory?.(inspection.rootPath) ??
         new IncompleteRunRegistry(inspection.rootPath);
+      const trajectoryWriter =
+        dependencies.trajectoryWriterFactory?.(inspection.rootPath) ??
+        new JsonlTrajectoryWriter(inspection.rootPath);
       const graph = dependencies.graphFactory?.({
         runtime,
         registry,
         eventBus,
         checkpoint,
+        trajectoryWriter,
       }) ??
         createCodingRunGraph(
-          { runtime, registry, eventBus },
+          {
+            runtime,
+            registry,
+            eventBus,
+            trajectoryWriter,
+            // Bootstrap already established the local exclusion before persistence.
+            ensureMetadataIgnored: async () => {},
+          },
           { checkpointer: checkpoint.checkpointer },
         );
       return new AgencyApplication({

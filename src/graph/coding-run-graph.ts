@@ -21,6 +21,11 @@ import {
 } from "../domain/index.js";
 import type { EventBus } from "../events/index.js";
 import type {
+  TrajectoryLifecycleEvent,
+  TrajectoryMetadata,
+  TrajectoryWriter,
+} from "../observability/index.js";
+import type {
   IncompleteRunEntry,
   IncompleteRunRegistry,
 } from "../persistence/index.js";
@@ -32,6 +37,7 @@ import {
 } from "../process/index.js";
 import {
   captureGitBaseline,
+  ensureAgencyMetadataIgnored,
   getChangedFiles,
   inspectRepository,
   type GitBaseline,
@@ -164,6 +170,8 @@ export interface CodingRunGraphDependencies {
     signal: AbortSignal,
   ) => Promise<VerificationResult>;
   eventBus?: EventBus;
+  trajectoryWriter?: TrajectoryWriter;
+  ensureMetadataIgnored?: (rootPath: string) => Promise<void>;
   registry: IncompleteRunRegistryBoundary | IncompleteRunRegistry;
   now?: () => Date;
 }
@@ -187,6 +195,15 @@ type PhaseStatus = Extract<
   CodingRunState["status"],
   "preparing" | "planning" | "executing" | "verifying" | "repairing"
 >;
+
+type PhaseName = "plan" | "execution" | "verification" | "repair";
+
+interface PhaseBoundary {
+  startedAt: Date;
+  result:
+    | { status: PhaseStatus; updatedAt: string }
+    | { status: "failed"; failure: FailureContext; updatedAt: string };
+}
 
 function concise(value: string, limit = MAX_TEXT): string {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -308,6 +325,51 @@ export function createCodingRunGraph(
         cwd,
       ));
   const now = dependencies.now ?? (() => new Date());
+  const ensureMetadataIgnored =
+    dependencies.ensureMetadataIgnored ?? ensureAgencyMetadataIgnored;
+
+  async function recordTrajectory(
+    state: Pick<CodingRunState, "runId" | "sessionId">,
+    event: TrajectoryLifecycleEvent,
+    options: {
+      at?: Date;
+      startedAt?: Date;
+      metadata?: TrajectoryMetadata;
+    } = {},
+  ): Promise<void> {
+    if (dependencies.trajectoryWriter === undefined) return;
+    const at = options.at ?? now();
+    await dependencies.trajectoryWriter.append({
+      timestamp: at.toISOString(),
+      runId: state.runId,
+      sessionId: state.sessionId,
+      event,
+      ...(options.startedAt === undefined
+        ? {}
+        : { durationMs: Math.max(0, at.getTime() - options.startedAt.getTime()) }),
+      ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
+    });
+  }
+
+  async function failureAfterRecording(
+    state: Pick<CodingRunState, "runId" | "sessionId">,
+    event: TrajectoryLifecycleEvent,
+    startedAt: Date,
+    error: unknown,
+  ): Promise<unknown> {
+    if (
+      error instanceof InfrastructureError &&
+      error.code === "TRAJECTORY_WRITE_FAILED"
+    ) {
+      return error;
+    }
+    try {
+      await recordTrajectory(state, event, { startedAt });
+      return error;
+    } catch (writeError) {
+      return writeError;
+    }
+  }
 
   async function actualChangedFiles(baseline: GitBaseline): Promise<string[]> {
     return (await changedFilesSince(baseline))
@@ -319,24 +381,44 @@ export function createCodingRunGraph(
   async function enterPhase(
     state: CodingRunState,
     status: PhaseStatus,
-  ): Promise<{ status: PhaseStatus; updatedAt: string } | { status: "failed"; failure: FailureContext; updatedAt: string }> {
-    const updatedAt = now().toISOString();
+    phase: PhaseName,
+  ): Promise<PhaseBoundary> {
+    const startedAt = now();
+    const updatedAt = startedAt.toISOString();
     try {
+      await recordTrajectory(state, `${phase}_started`, { at: startedAt });
       dependencies.eventBus?.emit({ type: "phase", phase: status as AgencyPhase });
       await dependencies.registry.updateStatus(state.runId, status, updatedAt);
-      return { status, updatedAt };
+      return { startedAt, result: { status, updatedAt } };
     } catch (error) {
+      const reportedError = await failureAfterRecording(
+        state,
+        `${phase}_failed`,
+        startedAt,
+        error,
+      );
       return {
-        status: "failed",
-        failure: infrastructureFailure(status, error),
-        updatedAt,
+        startedAt,
+        result: {
+          status: "failed",
+          failure: infrastructureFailure(status, reportedError),
+          updatedAt,
+        },
       };
     }
   }
 
   const prepare: typeof CodingRunStateSchema.Node = async (state) => {
     const createdAt = state.createdAt ?? now().toISOString();
+    let startedAt = now();
+    let metadataSafe = false;
     try {
+      const inspection = await inspect(state.repoPath);
+      await ensureMetadataIgnored(inspection.rootPath);
+      metadataSafe = true;
+      startedAt = now();
+      await recordTrajectory(state, "run_started", { at: startedAt });
+      await recordTrajectory(state, "prepare_started", { at: startedAt });
       dependencies.eventBus?.emit({ type: "phase", phase: "preparing" });
       await dependencies.registry.upsert({
         runId: state.runId,
@@ -347,12 +429,12 @@ export function createCodingRunGraph(
         createdAt,
         updatedAt: createdAt,
       });
-      const inspection = await inspect(state.repoPath);
       const repoInstructions = await loadInstructions(
         inspection.rootPath,
         inspection.instructionFiles,
       );
       const baseline = await captureBaseline(inspection.rootPath);
+      await recordTrajectory(state, "prepare_completed", { startedAt });
       return {
         status: "preparing",
         repoPath: inspection.rootPath,
@@ -363,9 +445,17 @@ export function createCodingRunGraph(
         updatedAt: createdAt,
       };
     } catch (error) {
+      const reportedError = metadataSafe
+        ? await failureAfterRecording(
+            state,
+            "prepare_failed",
+            startedAt,
+            error,
+          )
+        : error;
       return {
         status: "failed",
-        failure: infrastructureFailure("preparing", error),
+        failure: infrastructureFailure("preparing", reportedError),
         createdAt,
         updatedAt: now().toISOString(),
       };
@@ -374,10 +464,12 @@ export function createCodingRunGraph(
 
   const planNode: typeof CodingRunStateSchema.Node = async (state, runtime) => {
     if (state.status === "failed") return {};
-    const boundary = await enterPhase(state, "planning");
-    if (boundary.status === "failed") return boundary;
+    const boundary = await enterPhase(state, "planning", "plan");
+    if (boundary.result.status === "failed") return boundary.result;
     if (state.repoContext === null) {
-      return { status: "failed", failure: infrastructureFailure("planning", new Error("Repository context is unavailable")) };
+      const error = new Error("Repository context is unavailable");
+      const reportedError = await failureAfterRecording(state, "plan_failed", boundary.startedAt, error);
+      return { status: "failed", failure: infrastructureFailure("planning", reportedError) };
     }
     try {
       const result = await dependencies.runtime.createPlan({
@@ -387,18 +479,25 @@ export function createCodingRunGraph(
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
       });
-      return { ...boundary, codingPlan: BoundedPlanSchema.parse(result.plan), executionMessage: concise(result.message) };
+      const codingPlan = BoundedPlanSchema.parse(result.plan);
+      await recordTrajectory(state, "plan_completed", {
+        startedAt: boundary.startedAt,
+      });
+      return { ...boundary.result, codingPlan, executionMessage: concise(result.message) };
     } catch (error) {
-      return { ...boundary, status: "failed", failure: infrastructureFailure("planning", error) };
+      const reportedError = await failureAfterRecording(state, "plan_failed", boundary.startedAt, error);
+      return { ...boundary.result, status: "failed", failure: infrastructureFailure("planning", reportedError) };
     }
   };
 
   const execute: typeof CodingRunStateSchema.Node = async (state, runtime) => {
     if (state.status === "failed") return {};
-    const boundary = await enterPhase(state, "executing");
-    if (boundary.status === "failed") return boundary;
+    const boundary = await enterPhase(state, "executing", "execution");
+    if (boundary.result.status === "failed") return boundary.result;
     if (state.repoContext === null || state.codingPlan === null || state.baseline === null) {
-      return { status: "failed", failure: infrastructureFailure("executing", new Error("Prepared run state is incomplete")) };
+      const error = new Error("Prepared run state is incomplete");
+      const reportedError = await failureAfterRecording(state, "execution_failed", boundary.startedAt, error);
+      return { status: "failed", failure: infrastructureFailure("executing", reportedError) };
     }
     try {
       const result = await dependencies.runtime.execute({
@@ -409,21 +508,27 @@ export function createCodingRunGraph(
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
       });
+      const changedFiles = await actualChangedFiles(state.baseline);
+      await recordTrajectory(state, "execution_completed", {
+        startedAt: boundary.startedAt,
+        metadata: { changedFileCount: changedFiles.length },
+      });
       return {
-        ...boundary,
-        changedFiles: await actualChangedFiles(state.baseline),
+        ...boundary.result,
+        changedFiles,
         executionMessage: concise(result.message),
         failure: null,
       };
     } catch (error) {
-      return { ...boundary, status: "failed", failure: infrastructureFailure("executing", error) };
+      const reportedError = await failureAfterRecording(state, "execution_failed", boundary.startedAt, error);
+      return { ...boundary.result, status: "failed", failure: infrastructureFailure("executing", reportedError) };
     }
   };
 
   const verify: typeof CodingRunStateSchema.Node = async (state, runtime) => {
     if (state.status === "failed") return {};
-    const boundary = await enterPhase(state, "verifying");
-    if (boundary.status === "failed") return boundary;
+    const boundary = await enterPhase(state, "verifying", "verification");
+    if (boundary.result.status === "failed") return boundary.result;
     try {
       const commands = await detectCommands(state.repoPath);
       const verification = boundedVerification(
@@ -434,8 +539,12 @@ export function createCodingRunGraph(
         ),
       );
       if (verification.status === "failed") {
+        await recordTrajectory(state, "verification_failed");
+        await recordTrajectory(state, "verification_completed", {
+          startedAt: boundary.startedAt,
+        });
         return {
-          ...boundary,
+          ...boundary.result,
           verification,
           failure: {
             stage: "verifying",
@@ -447,22 +556,29 @@ export function createCodingRunGraph(
           },
         };
       }
-      return { ...boundary, verification, failure: null };
+      await recordTrajectory(state, "verification_passed");
+      await recordTrajectory(state, "verification_completed", {
+        startedAt: boundary.startedAt,
+      });
+      return { ...boundary.result, verification, failure: null };
     } catch (error) {
-      return { ...boundary, status: "failed", failure: infrastructureFailure("verifying", error) };
+      const reportedError = await failureAfterRecording(state, "verification_failed", boundary.startedAt, error);
+      return { ...boundary.result, status: "failed", failure: infrastructureFailure("verifying", reportedError) };
     }
   };
 
   const repair: typeof CodingRunStateSchema.Node = async (state, runtime) => {
-    const boundary = await enterPhase(state, "repairing");
-    if (boundary.status === "failed") return boundary;
+    const boundary = await enterPhase(state, "repairing", "repair");
+    if (boundary.result.status === "failed") return boundary.result;
     if (
       state.repoContext === null ||
       state.codingPlan === null ||
       state.baseline === null ||
       state.failure === null
     ) {
-      return { status: "failed", failure: infrastructureFailure("repairing", new Error("Repair state is incomplete")) };
+      const error = new Error("Repair state is incomplete");
+      const reportedError = await failureAfterRecording(state, "repair_failed", boundary.startedAt, error);
+      return { status: "failed", failure: infrastructureFailure("repairing", reportedError) };
     }
     const attempt = state.attempt + 1;
     try {
@@ -476,15 +592,21 @@ export function createCodingRunGraph(
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
       });
+      const changedFiles = await actualChangedFiles(state.baseline);
+      await recordTrajectory(state, "repair_completed", {
+        startedAt: boundary.startedAt,
+        metadata: { attempt, changedFileCount: changedFiles.length },
+      });
       return {
-        ...boundary,
+        ...boundary.result,
         attempt,
-        changedFiles: await actualChangedFiles(state.baseline),
+        changedFiles,
         executionMessage: concise(result.message),
         failure: null,
       };
     } catch (error) {
-      return { ...boundary, attempt, status: "failed", failure: infrastructureFailure("repairing", error) };
+      const reportedError = await failureAfterRecording(state, "repair_failed", boundary.startedAt, error);
+      return { ...boundary.result, attempt, status: "failed", failure: infrastructureFailure("repairing", reportedError) };
     }
   };
 
@@ -498,6 +620,13 @@ export function createCodingRunGraph(
         : `Run failed: ${state.failure?.message ?? "unknown failure"}.`;
     try {
       await dependencies.registry.updateStatus(state.runId, status, now().toISOString());
+      await recordTrajectory(state, "run_completed", {
+        metadata: {
+          status,
+          attempt: state.attempt,
+          changedFileCount: state.changedFiles.length,
+        },
+      });
     } catch (error) {
       status = "failed";
       summary = `Run failed while finalizing incomplete-run metadata: ${errorMessage(error)}.`;
