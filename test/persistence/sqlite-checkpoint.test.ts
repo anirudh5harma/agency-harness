@@ -82,6 +82,24 @@ describe("SQLite checkpoint persistence", () => {
     persistence.close();
   });
 
+  it("deletes a terminal thread while retaining an incomplete thread", async () => {
+    const projectRoot = await temporaryProject();
+    const persistence = await createSqliteCheckpointPersistence(projectRoot);
+    const graph = compileTestGraph(persistence.checkpointer);
+    await graph.invoke({ value: "completed" }, config("terminal-thread"));
+    await graph.invoke({ value: "executing" }, config("incomplete-thread"));
+
+    await persistence.deleteThread("terminal-thread");
+
+    await expect(graph.getState(config("terminal-thread"))).resolves.toMatchObject({
+      values: {},
+    });
+    await expect(graph.getState(config("incomplete-thread"))).resolves.toMatchObject({
+      values: { value: "executing" },
+    });
+    persistence.close();
+  });
+
   it("closes safely more than once", async () => {
     const persistence = await createSqliteCheckpointPersistence(
       await temporaryProject(),
@@ -157,6 +175,61 @@ describe("SQLite checkpoint persistence", () => {
     persistence.close();
   });
 
+  it("classifies an END checkpoint with finalizing failure as terminal instead of resumable", async () => {
+    const entry = {
+      runId: "run-finalizing",
+      threadId: "thread-finalizing",
+      sessionId: "session-1",
+      userIntent: "Resume this work",
+      status: "verifying" as const,
+      createdAt: "2026-08-10T10:00:00.000Z",
+      updatedAt: "2026-08-10T10:01:00.000Z",
+    };
+
+    await expect(inspectIncompleteRunRecovery(
+      { list: async () => [entry] },
+      {
+        getState: async () => ({
+          values: {
+            runId: entry.runId,
+            threadId: entry.threadId,
+            status: "failed",
+            failure: { stage: "finalizing", message: "registry unavailable" },
+          },
+          next: [],
+          tasks: [],
+        }),
+      },
+    )).resolves.toMatchObject([{
+      status: "terminal_checkpoint",
+      terminalStatus: "failed",
+      entry,
+    }]);
+  });
+
+  it("keeps a terminal-looking checkpoint resumable while graph work remains", async () => {
+    const entry = {
+      runId: "run-pending",
+      threadId: "thread-pending",
+      sessionId: "session-1",
+      userIntent: "Resume this work",
+      status: "verifying" as const,
+      createdAt: "2026-08-10T10:00:00.000Z",
+      updatedAt: "2026-08-10T10:01:00.000Z",
+    };
+
+    await expect(inspectIncompleteRunRecovery(
+      { list: async () => [entry] },
+      {
+        getState: async () => ({
+          values: { runId: entry.runId, threadId: entry.threadId, status: "failed" },
+          next: ["summarize"],
+          tasks: [{ name: "summarize" }],
+        }),
+      },
+    )).resolves.toMatchObject([{ status: "resumable", entry }]);
+  });
+
   it("distinguishes a checkpoint owned by another run as stale", async () => {
     const projectRoot = await temporaryProject();
     const registry = new IncompleteRunRegistry(projectRoot);
@@ -222,5 +295,11 @@ describe("SQLite checkpoint persistence", () => {
         },
       }),
     ).rejects.toMatchObject({ code: "CHECKPOINT_READ_FAILED" });
+
+    const persistence = await createSqliteCheckpointPersistence(projectRoot);
+    persistence.close();
+    await expect(persistence.deleteThread("thread-1")).rejects.toMatchObject({
+      code: "CHECKPOINT_DELETE_FAILED",
+    });
   });
 });

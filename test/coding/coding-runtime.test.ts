@@ -58,10 +58,16 @@ describe("FakeCodingRuntime", () => {
     fake.enqueueRepairResult(repairResult);
 
     const createInput: CreatePlanInput = { intent: "Build it", repo };
-    const executeInput: ExecuteInput = { intent: "Build it", repo, plan };
+    const executeInput: ExecuteInput = {
+      intent: "Build it",
+      repo,
+      plan,
+      sessionId: "agency-session-1",
+    };
     const repairInput: RepairInput = {
       ...executeInput,
       attempt: 1,
+      changedFiles: ["src/coding/runtime.ts"],
       failure: {
         stage: "verifying",
         message: "Tests failed",

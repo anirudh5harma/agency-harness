@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type {
   AgentSessionEvent,
@@ -10,6 +13,7 @@ import type { AgencyEvent, Plan, RepoContext } from "../../src/domain/index.js";
 import { InfrastructureError } from "../../src/process/index.js";
 import {
   PiCodingRuntime,
+  createSafeResourceLoader,
   normalizePiEvent,
   type PiSdkBoundary,
   type PiSession,
@@ -108,6 +112,10 @@ function createBoundary(options: {
   executorPrompt?: (session: StubSession, prompt: string) => Promise<void>;
   plannerPrompt?: (session: StubSession, prompt: string) => Promise<void>;
   plannerValue?: unknown;
+  createSession?: (
+    sessionOptions: CreateAgentSessionOptions,
+    createDefault: () => Promise<{ session: StubSession }>,
+  ) => Promise<{ session: StubSession }>;
 }) {
   const sessionOptions: CreateAgentSessionOptions[] = [];
   const sessions: StubSession[] = [];
@@ -115,11 +123,24 @@ function createBoundary(options: {
   const modelRuntime = { runtime: true };
   const inMemoryManager = { manager: "memory" };
   const persistentManager = { manager: "persistent" };
+  const resourceLoader = { loader: "safe" };
+  const bashTool: ToolDefinition = {
+    name: "bash",
+    label: "Bash",
+    description: "Run a shell command",
+    parameters: { type: "object" } as never,
+    async execute() {
+      return { content: [{ type: "text", text: "allowed" }], details: {} };
+    },
+  };
   const sdk: PiSdkBoundary = {
     createModelRuntime: vi.fn(async () => modelRuntime as never),
     inMemorySessionManager: vi.fn(() => inMemoryManager as never),
     createSessionManager: vi.fn(() => persistentManager as never),
+    createResourceLoader: vi.fn(async () => resourceLoader as never),
+    createBashTool: vi.fn(() => bashTool as never),
     createAgentSession: vi.fn(async (sessionOptionsInput) => {
+      const createDefault = async () => {
       sessionOptions.push(sessionOptionsInput);
       const isPlanner = sessionOptionsInput.tools?.includes("submit_plan") === true;
       const session = new StubSession(
@@ -154,6 +175,8 @@ function createBoundary(options: {
       );
       sessions.push(session);
       return { session };
+      };
+      return options.createSession?.(sessionOptionsInput, createDefault) ?? createDefault();
     }),
   };
   return {
@@ -164,6 +187,7 @@ function createBoundary(options: {
     modelRuntime,
     inMemoryManager,
     persistentManager,
+    resourceLoader,
   };
 }
 
@@ -188,11 +212,13 @@ describe("PiCodingRuntime", () => {
       cwd: repo.rootPath,
       modelRuntime: boundary.modelRuntime,
       sessionManager: boundary.inMemoryManager,
+      resourceLoader: boundary.resourceLoader,
       tools: ["read", "grep", "find", "ls", "submit_plan"],
     });
     expect(boundary.sessionOptions[0]?.tools).not.toEqual(
       expect.arrayContaining(["bash", "edit", "write"]),
     );
+    expect(boundary.sdk.createResourceLoader).toHaveBeenCalledWith(repo.rootPath);
     expect(boundary.sessionOptions[0]?.customTools?.[0]?.name).toBe("submit_plan");
     expect(boundary.submitResults).toEqual([
       {
@@ -238,17 +264,30 @@ describe("PiCodingRuntime", () => {
     });
     const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
 
-    const execution = await runtime.execute({ intent: "Build", repo, plan });
+    const execution = await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-1" });
     const repair = await runtime.repair({
       intent: "Build",
       repo,
       plan,
+      sessionId: "agency-1",
       attempt: 1,
+      changedFiles: ["src/coding/runtime.ts"],
       failure: {
         stage: "verifying",
         message: "One focused test failed",
         cause: "expected true",
         recoverable: true,
+        command: {
+          command: "npm test",
+          args: [],
+          cwd: repo.rootPath,
+          exitCode: 1,
+          signal: null,
+          stdout: `stdout-marker ${"o".repeat(2_000)}`,
+          stderr: `stderr-marker ${"e".repeat(2_000)}`,
+          durationMs: 10,
+          timedOut: false,
+        },
       },
     });
 
@@ -262,6 +301,7 @@ describe("PiCodingRuntime", () => {
       modelRuntime: boundary.modelRuntime,
       sessionManager: boundary.persistentManager,
       tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+      resourceLoader: boundary.resourceLoader,
     });
     expect(execution).toEqual({
       message: "Implemented the requested change. Ready for verification.",
@@ -275,6 +315,151 @@ describe("PiCodingRuntime", () => {
     expect(boundary.sessions[0]?.prompts[0]).toContain("independent verification");
     expect(boundary.sessions[0]?.prompts[1]).toContain("One focused test failed");
     expect(boundary.sessions[0]?.prompts[1]).toContain("attempt 1");
+    expect(boundary.sessions[0]?.prompts[1]).toContain('"changedFiles":["src/coding/runtime.ts"]');
+    expect(boundary.sessions[0]?.prompts[1]).toContain("Diagnose the failure before editing");
+    expect(boundary.sessions[0]?.prompts[1]).toContain("Never weaken or delete tests");
+    expect(boundary.sessions[0]?.prompts[1]).toContain("stdout-marker");
+    expect(boundary.sessions[0]?.prompts[1]).toContain("stderr-marker");
+    expect(boundary.sessions[0]?.prompts[1]?.length).toBeLessThan(10_000);
+  });
+
+  it("isolates executor sessions by Agency session while reusing execute-to-repair", async () => {
+    const boundary = createBoundary({});
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+
+    await runtime.execute({ intent: "First", repo, plan, sessionId: "agency-1" });
+    await runtime.repair({
+      intent: "First",
+      repo,
+      plan,
+      sessionId: "agency-1",
+      attempt: 1,
+      changedFiles: [],
+      failure: { stage: "verifying", message: "failed", recoverable: true },
+    });
+    await runtime.execute({ intent: "New", repo, plan, sessionId: "agency-2" });
+
+    expect(boundary.sessions).toHaveLength(2);
+    expect(boundary.sdk.createSessionManager).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts a session created after its signal was aborted and never prompts it", async () => {
+    let releaseCreation!: () => void;
+    const creationBlocked = new Promise<void>((resolve) => { releaseCreation = resolve; });
+    const boundary = createBoundary({
+      createSession: async (_options, createDefault) => {
+        await creationBlocked;
+        return createDefault();
+      },
+    });
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    const controller = new AbortController();
+
+    const execution = runtime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-1",
+      signal: controller.signal,
+    });
+    controller.abort();
+    releaseCreation();
+
+    await expect(execution).rejects.toMatchObject({ name: "AbortError" });
+    expect(boundary.sessions[0]?.abort).toHaveBeenCalledOnce();
+    expect(boundary.sessions[0]?.prompts).toEqual([]);
+  });
+
+  it("blocks repository-publishing git commands at the bash tool boundary", async () => {
+    const boundary = createBoundary({});
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-1" });
+    const bash = boundary.sessionOptions[0]?.customTools?.find((tool) => tool.name === "bash");
+    expect(bash).toBeDefined();
+
+    const invoke = (command: string) => bash!.execute(
+      "bash-1",
+      { command },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    await expect(invoke("git status --short")).resolves.toBeDefined();
+    await expect(invoke("git add src && git commit -m nope")).rejects.toThrow(
+      "Agency policy blocks",
+    );
+    await expect(invoke("gh pr create --fill")).rejects.toThrow("Agency policy blocks");
+
+    for (const bypass of [
+      `"git" "add" src`,
+      `git 'commit' -m nope`,
+      `sh -c 'git add src'`,
+      `gh pr "create" --fill`,
+      `gh --repo owner/project pr create --fill`,
+      `git config alias.ship 'push origin HEAD'`,
+      `git ship`,
+      `alias g=git; g add src`,
+      `./scripts/publish.sh`,
+    ]) {
+      await expect(invoke(bypass), bypass).rejects.toThrow("Agency policy blocks");
+    }
+
+    await expect(invoke("npm test -- --runInBand")).resolves.toBeDefined();
+    await expect(invoke("git diff -- src/coding/runtime.ts")).resolves.toBeDefined();
+  });
+
+  it("does not load target-project context files", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "agency-pi-loader-"));
+    try {
+      await writeFile(join(cwd, "AGENTS.md"), "UNTRUSTED PROJECT INSTRUCTIONS");
+      const loader = await createSafeResourceLoader(cwd);
+
+      expect(loader.getAgentsFiles().agentsFiles).toEqual([]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for cancellation and replaces the aborted executor before the next turn", async () => {
+    let releaseAbort!: () => void;
+    const abortBlocked = new Promise<void>((resolve) => { releaseAbort = resolve; });
+    const controller = new AbortController();
+    const boundary = createBoundary({
+      createSession: async (_options, createDefault) => {
+        const created = await createDefault();
+        if (boundary.sessions.length === 1) {
+          created.session.abort.mockImplementation(async () => abortBlocked);
+        }
+        return created;
+      },
+      executorPrompt: async () => {
+        controller.abort();
+      },
+    });
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+
+    const cancelled = runtime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-1",
+      signal: controller.signal,
+    });
+    void cancelled.catch(() => {});
+    await vi.waitFor(() => expect(boundary.sessions[0]?.abort).toHaveBeenCalledOnce());
+
+    const retry = runtime.execute({ intent: "Retry", repo, plan, sessionId: "agency-1" });
+    await expect(retry).resolves.toBeDefined();
+    expect(boundary.sessions).toHaveLength(2);
+
+    let settled = false;
+    void cancelled.finally(() => { settled = true; }).catch(() => {});
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseAbort();
+    await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
+    expect(boundary.sessions[0]?.dispose).toHaveBeenCalledOnce();
   });
 
   it("maps SDK failures to typed infrastructure failures and aborts active sessions", async () => {
@@ -285,7 +470,7 @@ describe("PiCodingRuntime", () => {
     });
     const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
 
-    await expect(runtime.execute({ intent: "Build", repo, plan })).rejects.toSatisfy(
+    await expect(runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-1" })).rejects.toSatisfy(
       (error: unknown) =>
         error instanceof InfrastructureError && error.code === "PI_PROVIDER_REQUEST_FAILED",
     );
@@ -319,7 +504,7 @@ describe("PiCodingRuntime", () => {
     const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
 
     const planningError = await runtime.createPlan({ intent: "Build", repo }).catch((error) => error);
-    const executionError = await runtime.execute({ intent: "Build", repo, plan }).catch((error) => error);
+    const executionError = await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-1" }).catch((error) => error);
 
     expect(planningError.message).not.toContain("Use /login");
 
@@ -395,5 +580,29 @@ describe("normalizePiEvent", () => {
     expect(state.finalMessage).toBe("Concise final message");
     expect(JSON.stringify(events)).not.toContain("private reasoning");
     expect(JSON.stringify(events)).not.toContain("very large raw output");
+  });
+
+  it("redacts secrets from command events before emission", () => {
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    const command = "curl -H 'Authorization: Bearer bearer-secret' -d 'password=hunter2&api_key=sk-secret123'";
+    const events = normalizePiEvent({
+      type: "tool_execution_start",
+      toolCallId: "bash-secret",
+      toolName: "bash",
+      args: { command },
+    }, state, 100);
+
+    expect(events).toEqual([
+      { type: "tool", tool: "bash" },
+      { type: "command_started", command: expect.stringContaining("[REDACTED]") },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("bearer-secret");
+    expect(JSON.stringify(events)).not.toContain("hunter2");
+    expect(JSON.stringify(events)).not.toContain("sk-secret123");
   });
 });

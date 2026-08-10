@@ -35,16 +35,23 @@ describe("real-Pi acceptance diagnostics", () => {
 
   it("accepts exactly two completed runs with passed verification", () => {
     expect(() => validateAgencyTranscript({
-      stdout: "Done: first\nDone: second\nStatus: completed\nVerification: passed\n",
+      stdout: "Verification: passed\nDone: first\nVerification: passed\nDone: second\nStatus: completed\nVerification: passed\n",
       stderr: "",
     })).not.toThrow();
+  });
+
+  it("rejects a global verification marker that does not belong to both completed runs", () => {
+    expect(() => validateAgencyTranscript({
+      stdout: "Done: first\nVerification: passed\nDone: second\nStatus: completed\n",
+      stderr: "",
+    })).toThrow(/each completed run to report Verification: passed/);
   });
 
   it("adds the bounded transcript to post-run artifact failures", () => {
     const error = postRunDiagnostic(
       new Error("custom error class missing\ntoken=artifact-secret"),
       {
-      stdout: "Done: first\nDone: second\nStatus: completed\nVerification: passed\n",
+      stdout: "Verification: passed\nDone: first\nVerification: passed\nDone: second\nStatus: completed\nVerification: passed\n",
       stderr: "",
       },
     );

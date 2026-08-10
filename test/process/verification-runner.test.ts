@@ -87,4 +87,25 @@ describe("VerificationRunner", () => {
     expect(verification.commands).toHaveLength(1);
     expect(execute).toHaveBeenCalledTimes(1);
   });
+
+  it("propagates command spawn failures instead of reporting verification failure", async () => {
+    const runner = new VerificationRunner();
+
+    await expect(
+      runner.run(
+        [
+          {
+            name: "test",
+            command: `agency-command-that-does-not-exist-${process.pid}`,
+            args: [],
+            required: true,
+          },
+        ],
+        process.cwd(),
+      ),
+    ).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "COMMAND_SPAWN_FAILED",
+    });
+  });
 });

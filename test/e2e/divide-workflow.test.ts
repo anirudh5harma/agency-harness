@@ -256,7 +256,7 @@ describe("divide fixture end to end", () => {
       const checkpointCount = database.prepare("SELECT count(*) AS count FROM checkpoints").get() as {
         count: number;
       };
-      expect(checkpointCount.count).toBeGreaterThanOrEqual(2);
+      expect(checkpointCount.count).toBe(0);
     } finally {
       database.close();
     }

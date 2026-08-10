@@ -25,6 +25,7 @@ import type {
 } from "../../src/observability/index.js";
 import { IncompleteRunRegistry } from "../../src/persistence/index.js";
 import { InfrastructureError } from "../../src/process/index.js";
+import { EventBus } from "../../src/events/index.js";
 import {
   captureGitBaseline,
   getChangedFiles,
@@ -56,6 +57,10 @@ async function repository(): Promise<string> {
 
 function verification(status: "passed" | "failed"): VerificationResult {
   return { status, summary: status === "passed" ? "tests passed" : "tests failed", commands: [] };
+}
+
+function skippedVerification(): VerificationResult {
+  return { status: "skipped", summary: "No verification commands detected", commands: [] };
 }
 
 function dependencies(
@@ -246,6 +251,133 @@ describe("coding run graph", () => {
     expect(runtime.calls.repair[0]?.failure.recoverable).toBe(true);
   });
 
+  it("detects verification before model edits and reuses the immutable commands for every pass", async () => {
+    const { root, runtime, deps } = await setup([
+      verification("failed"),
+      verification("passed"),
+    ]);
+    const originalCommands = [
+      { name: "test", command: "npm", args: ["run", "test"], required: true },
+    ];
+    const detect = vi.fn(async () => originalCommands);
+    const observed: unknown[] = [];
+    deps.detectVerificationCommands = detect;
+    deps.runVerification = vi.fn(async (commands) => {
+      observed.push(commands);
+      const result = [verification("failed"), verification("passed")][observed.length - 1];
+      if (result === undefined) throw new Error("unexpected verification pass");
+      return result;
+    });
+    runtime.enqueueExecuteResult({ message: "broken", changedFiles: [], sessionId: "pi-1" });
+    runtime.enqueueRepairResult({ message: "fixed", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("completed");
+    expect(detect).toHaveBeenCalledTimes(1);
+    expect(runtime.calls.createPlan).toHaveLength(1);
+    expect(state.verificationCommands).toEqual(originalCommands);
+    expect(observed).toEqual([originalCommands, originalCommands]);
+    expect(observed[0]).not.toBe(originalCommands);
+  });
+
+  it("rejects weakened verification scripts instead of accepting a green result", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    deps.detectVerificationCommands = async () => [
+      { name: "test", command: "npm", args: ["run", "test"], required: true },
+    ];
+    await writeFile(join(root, "package.json"), JSON.stringify({
+      scripts: { test: "node --test" },
+    }));
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    runtime.execute = async (executeInput) => {
+      const result = await FakeCodingRuntime.prototype.execute.call(runtime, executeInput);
+      await writeFile(join(root, "package.json"), JSON.stringify({
+        scripts: { test: "node -e true" },
+      }));
+      return result;
+    };
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      stage: "verifying",
+      recoverable: false,
+    });
+    expect(state.failure?.message).toContain("changed after preparation");
+    expect(deps.runVerification).not.toHaveBeenCalled();
+    expect(runtime.calls.repair).toHaveLength(0);
+  });
+
+  it("fails without repair when verification is skipped", async () => {
+    const { root, runtime, deps } = await setup([skippedVerification()]);
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("failed");
+    expect(state.verification?.status).toBe("skipped");
+    expect(state.failure).toMatchObject({
+      stage: "verifying",
+      recoverable: false,
+      message: "No verification commands detected",
+    });
+    expect(runtime.calls.repair).toHaveLength(0);
+  });
+
+  it("fails clearly when prepare detects no verification commands", async () => {
+    const { root, runtime, deps } = await setup([]);
+    deps.detectVerificationCommands = vi.fn(async () => []);
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("failed");
+    expect(state.summary).toContain("No verification commands detected before model execution");
+    expect(state.verification?.status).toBe("skipped");
+    expect(runtime.calls.createPlan).toHaveLength(0);
+    expect(runtime.calls.execute).toHaveLength(0);
+    expect(runtime.calls.repair).toHaveLength(0);
+  });
+
+  it("forwards runtime events to the shared event bus exactly once", async () => {
+    const { root, runtime, deps } = await setup([
+      verification("failed"),
+      verification("passed"),
+    ]);
+    const bus = new EventBus();
+    const messages: string[] = [];
+    const phases: string[] = [];
+    bus.subscribe("message", ({ content }) => messages.push(content));
+    bus.subscribe("phase", ({ phase }) => phases.push(phase));
+    deps.eventBus = bus;
+    runtime.enqueuePlanResult({ plan, message: "planned again" });
+    runtime.createPlan = async (planInput) => {
+      planInput.onEvent?.({ type: "phase", phase: "planning" });
+      planInput.onEvent?.({ type: "message", content: "plan event" });
+      return FakeCodingRuntime.prototype.createPlan.call(runtime, planInput);
+    };
+    runtime.enqueueExecuteResult({ message: "broken", changedFiles: [], sessionId: "pi-1" });
+    runtime.execute = async (executeInput) => {
+      executeInput.onEvent?.({ type: "phase", phase: "executing" });
+      executeInput.onEvent?.({ type: "message", content: "execute event" });
+      return FakeCodingRuntime.prototype.execute.call(runtime, executeInput);
+    };
+    runtime.enqueueRepairResult({ message: "fixed", changedFiles: [], sessionId: "pi-1" });
+    runtime.repair = async (repairInput) => {
+      repairInput.onEvent?.({ type: "phase", phase: "repairing" });
+      repairInput.onEvent?.({ type: "message", content: "repair event" });
+      return FakeCodingRuntime.prototype.repair.call(runtime, repairInput);
+    };
+
+    await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(messages).toEqual(["plan event", "execute event", "repair event"]);
+    expect(phases.filter((phase) => phase === "planning")).toHaveLength(1);
+    expect(phases.filter((phase) => phase === "executing")).toHaveLength(1);
+    expect(phases.filter((phase) => phase === "repairing")).toHaveLength(1);
+  });
+
   it("exhausts exactly the configured two repair attempts", async () => {
     const { root, runtime, graph } = await setup([
       verification("failed"),
@@ -278,6 +410,66 @@ describe("coding run graph", () => {
     });
     expect(state.summary).toContain("Pi process could not start");
     expect(runtime.calls.repair).toHaveLength(0);
+  });
+
+  it("reports terminal metadata failures at the truthful finalizing stage", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    const registry = deps.registry;
+    const finalizationOrder: string[] = [];
+    deps.trajectoryWriter = {
+      append: async ({ event }) => {
+        if (event === "run_completed") finalizationOrder.push("trajectory");
+      },
+    };
+    deps.registry = {
+      upsert: (entry) => registry.upsert(entry),
+      updateStatus: async (runId, status, updatedAt) => {
+        if (status === "completed") {
+          finalizationOrder.push("registry");
+          throw new Error("registry unavailable");
+        }
+        await registry.updateStatus(runId, status, updatedAt);
+      },
+    };
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      stage: "finalizing",
+      recoverable: false,
+      message: "registry unavailable",
+    });
+    expect(finalizationOrder).toEqual(["trajectory", "registry"]);
+    await expect(registry.list()).resolves.toMatchObject([{ runId: "run-001" }]);
+  });
+
+  it("keeps incomplete metadata discoverable when final trajectory logging fails", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    const registry = deps.registry;
+    const updateStatus = vi.spyOn(registry, "updateStatus");
+    deps.trajectoryWriter = {
+      append: async ({ event }) => {
+        if (event === "run_completed") throw new Error("trajectory unavailable");
+      },
+    };
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("failed");
+    expect(state.failure).toMatchObject({
+      stage: "finalizing",
+      recoverable: false,
+      message: "trajectory unavailable",
+    });
+    expect(updateStatus).not.toHaveBeenCalledWith(
+      "run-001",
+      "completed",
+      expect.any(String),
+    );
+    await expect(registry.list()).resolves.toMatchObject([{ runId: "run-001" }]);
   });
 
   it("uses actual Git changes instead of a coding runtime report", async () => {

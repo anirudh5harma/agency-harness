@@ -178,6 +178,59 @@ describe("repository inspection", () => {
 });
 
 describe("Git baselines", () => {
+  it("captures the same index concurrently without taking an index lock", async () => {
+    const root = await initializedRepository();
+    const heldLock = join(root, ".git", "index.lock");
+    await writeFile(heldLock, "held by another read-only observer\n");
+
+    const baselines = await Promise.all(
+      Array.from({ length: 8 }, async () => await captureGitBaseline(root)),
+    );
+
+    expect(new Set(baselines.map((baseline) => baseline.indexTree))).toHaveLength(1);
+  });
+
+  it("keeps clean unaffected files out of the sparse identity snapshot", async () => {
+    const root = await initializedRepository();
+    const baseline = await captureGitBaseline(root);
+
+    expect(baseline.paths).not.toHaveProperty("kept.txt");
+    await writeFile(join(root, "added.txt"), "new\n");
+    await expect(getChangedFiles(baseline)).resolves.toEqual([
+      { path: "added.txt", status: "added" },
+    ]);
+    expect(baseline.paths).not.toHaveProperty("removed.txt");
+    expect(baseline).not.toHaveProperty("porcelain");
+  });
+
+  it("rejects index-only mutations after the baseline", async () => {
+    const root = await initializedRepository();
+    await writeFile(join(root, "kept.txt"), "staged before baseline\n");
+    await git(root, "add", "kept.txt");
+    const baseline = await captureGitBaseline(root);
+    expect(baseline.paths["kept.txt"]?.statusCode).toBe("M ");
+
+    await git(root, "reset", "--", "kept.txt");
+
+    await expect(getChangedFiles(baseline)).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "GIT_BASELINE_VIOLATED",
+    });
+  });
+
+  it("rejects commits created after the baseline even when the worktree is clean", async () => {
+    const root = await initializedRepository();
+    const baseline = await captureGitBaseline(root);
+    await writeFile(join(root, "kept.txt"), "committed by the agent\n");
+    await git(root, "add", "kept.txt");
+    await git(root, "commit", "-m", "unexpected agent commit");
+
+    await expect(getChangedFiles(baseline)).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "GIT_BASELINE_VIOLATED",
+    });
+  });
+
   it("excludes preexisting dirt and detects later changes to the same paths", async () => {
     const root = await initializedRepository();
     await writeFile(join(root, "kept.txt"), "dirty before baseline\n");

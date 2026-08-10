@@ -242,6 +242,9 @@ export class AgencyApplication implements ReplHandler {
       }
       await this.#recordTerminalState(state);
       this.#renderer.run(state);
+      if (state.failure?.stage !== "finalizing") {
+        await this.#pruneTerminalCheckpoint(state.threadId);
+      }
     } catch (error) {
       if (signal.aborted) this.#renderer.message("Cancelled.");
       else this.#renderer.error(error instanceof Error ? error.message : String(error));
@@ -273,48 +276,72 @@ export class AgencyApplication implements ReplHandler {
       }
     });
     try {
-    const inspections = await this.#inspectRecovery(this.#registry, this.#graph);
-    for (const inspection of inspections.filter(({ status }) => status !== "resumable")) {
-      this.#renderer.recovery(
-        `${inspection.entry.runId} cannot resume (${inspection.status.replaceAll("_", " ")}).`,
-      );
-    }
-    const candidate = inspections
-      .filter(
-        (inspection): inspection is Extract<IncompleteRunRecoveryInspection, { status: "resumable" }> =>
-          inspection.status === "resumable",
-      )
-      .sort((left, right) => right.entry.updatedAt.localeCompare(left.entry.updatedAt))[0];
-    if (candidate === undefined) return;
+      const inspections = await this.#inspectRecovery(this.#registry, this.#graph);
+      for (const inspection of inspections) {
+        if (inspection.status !== "terminal_checkpoint") continue;
+        try {
+          await this.#registry.updateStatus(
+            inspection.entry.runId,
+            inspection.terminalStatus,
+            new Date().toISOString(),
+          );
+        } catch (error) {
+          this.#renderer.recovery(
+            `Run ${inspection.entry.runId} reached a terminal checkpoint, but its recovery record could not be reconciled: ${error instanceof Error ? error.message : String(error)}.`,
+          );
+          continue;
+        }
+        this.#renderer.recovery(
+          `Run ${inspection.entry.runId} terminal checkpoint reconciled.`,
+        );
+        await this.#pruneTerminalCheckpoint(inspection.entry.threadId);
+      }
+      for (const inspection of inspections.filter(
+        ({ status }) => status !== "resumable" && status !== "terminal_checkpoint",
+      )) {
+        this.#renderer.recovery(
+          `${inspection.entry.runId} cannot resume (${inspection.status.replaceAll("_", " ")}).`,
+        );
+      }
+      const candidate = inspections
+        .filter(
+          (inspection): inspection is Extract<IncompleteRunRecoveryInspection, { status: "resumable" }> =>
+            inspection.status === "resumable",
+        )
+        .sort((left, right) => right.entry.updatedAt.localeCompare(left.entry.updatedAt))[0];
+      if (candidate === undefined) return;
 
-    while (true) {
-      const answer = await this.#io.readLine(
-        `Resume incomplete task “${candidate.entry.userIntent}”? [r/n] `,
-      );
-      if (answer === null) return;
-      const normalized = answer.trim().toLowerCase();
-      if (normalized === "r") {
-        activeController = new AbortController();
-        const state = await this.#graph.resume(candidate.entry.threadId, {
-          signal: activeController.signal,
-        });
-        if (activeController.signal.aborted) {
-          this.#renderer.message("Cancelled.");
+      while (true) {
+        const answer = await this.#io.readLine(
+          `Resume incomplete task “${candidate.entry.userIntent}”? [r/n] `,
+        );
+        if (answer === null) return;
+        const normalized = answer.trim().toLowerCase();
+        if (normalized === "r") {
+          activeController = new AbortController();
+          const state = await this.#graph.resume(candidate.entry.threadId, {
+            signal: activeController.signal,
+          });
+          if (activeController.signal.aborted) {
+            this.#renderer.message("Cancelled.");
+            return;
+          }
+          await this.#recordTerminalState(state);
+          this.#renderer.run(state);
+          if (state.failure?.stage !== "finalizing") {
+            await this.#pruneTerminalCheckpoint(state.threadId);
+          }
           return;
         }
-        await this.#recordTerminalState(state);
-        this.#renderer.run(state);
-        return;
+        if (normalized === "n") {
+          this.#session = await this.#sessionStore.createNew();
+          this.#renderer.recovery(
+            `Started session ${this.#session.sessionId}; recovery record ${candidate.entry.runId} was preserved.`,
+          );
+          return;
+        }
+        this.#renderer.message("Enter r to resume or n to start a fresh session.");
       }
-      if (normalized === "n") {
-        this.#session = await this.#sessionStore.createNew();
-        this.#renderer.recovery(
-          `Started session ${this.#session.sessionId}; recovery record ${candidate.entry.runId} was preserved.`,
-        );
-        return;
-      }
-      this.#renderer.message("Enter r to resume or n to start a fresh session.");
-    }
     } finally {
       detachInterrupt();
     }
@@ -322,6 +349,12 @@ export class AgencyApplication implements ReplHandler {
 
   async #recordTerminalState(state: CodingRunState): Promise<void> {
     if (state.status !== "completed" && state.status !== "failed") return;
+    if (state.sessionId !== this.#session.sessionId) {
+      this.#renderer.recovery(
+        `Run ${state.runId} belongs to session ${state.sessionId}; the current session was left unchanged.`,
+      );
+      return;
+    }
     this.#session = await this.#sessionStore.recordRunSummary({
       runId: state.runId,
       status: state.status,
@@ -330,5 +363,15 @@ export class AgencyApplication implements ReplHandler {
       ...(state.verification === null ? {} : { verification: state.verification }),
       changedFiles: state.changedFiles,
     });
+  }
+
+  async #pruneTerminalCheckpoint(threadId: string): Promise<void> {
+    try {
+      await this.#checkpoint.deleteThread(threadId);
+    } catch (error) {
+      this.#renderer.recovery(
+        `Warning: could not prune terminal checkpoint ${threadId}: ${error instanceof Error ? error.message : String(error)}. The terminal result was preserved.`,
+      );
+    }
   }
 }

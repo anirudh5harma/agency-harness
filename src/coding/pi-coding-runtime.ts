@@ -1,11 +1,16 @@
 import { resolve } from "node:path";
 
 import {
+  DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
+  createBashToolDefinition,
   createAgentSession,
+  getAgentDir,
   type AgentSessionEvent,
   type CreateAgentSessionOptions,
+  type ResourceLoader,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
@@ -47,21 +52,136 @@ export interface PiSession {
   dispose(): void;
 }
 
+type PiBashToolDefinition = ReturnType<typeof createBashToolDefinition>;
+
 export interface PiSdkBoundary {
   createModelRuntime(): Promise<ModelRuntime>;
   inMemorySessionManager(cwd: string): SessionManager;
   createSessionManager(cwd: string, sessionDir: string): SessionManager;
+  createResourceLoader(cwd: string): Promise<ResourceLoader>;
+  createBashTool(cwd: string): PiBashToolDefinition;
   createAgentSession(
     options: CreateAgentSessionOptions,
   ): Promise<{ session: PiSession }>;
+}
+
+export async function createSafeResourceLoader(cwd: string): Promise<ResourceLoader> {
+  const agentDir = getAgentDir();
+  const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    // Extensions are executable code. Agency never loads them from the target project.
+    noExtensions: true,
+    // Prompts already carry Agency's explicitly bounded repository instructions.
+    noContextFiles: true,
+  });
+  await loader.reload({ resolveProjectTrust: async () => false });
+  return loader;
 }
 
 const defaultSdk: PiSdkBoundary = {
   createModelRuntime: () => ModelRuntime.create(),
   inMemorySessionManager: (cwd) => SessionManager.inMemory(cwd),
   createSessionManager: (cwd, sessionDir) => SessionManager.create(cwd, sessionDir),
+  createResourceLoader: createSafeResourceLoader,
+  createBashTool: (cwd) => createBashToolDefinition(cwd),
   createAgentSession,
 };
+
+const SAFE_GIT_COMMANDS = new Set([
+  "cat-file", "describe", "diff", "for-each-ref", "log", "ls-files", "ls-tree",
+  "merge-base", "name-rev", "rev-list", "rev-parse", "show", "show-ref", "status",
+]);
+const CONCEALING_SHELL_COMMANDS = new Set([
+  "alias", "eval", "source", "bash", "dash", "ksh", "sh", "zsh",
+]);
+
+function shellWords(command: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let quote: "'" | '"' | undefined;
+  const finish = () => {
+    if (word !== "") words.push(word);
+    word = "";
+  };
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]!;
+    if (character === "\\" && quote !== "'") {
+      if (index + 1 < command.length) word += command[++index];
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      if (quote === undefined) quote = character;
+      else if (quote === character) quote = undefined;
+      else word += character;
+      continue;
+    }
+    if (/\s/.test(character) || ";|&()<>`".includes(character)) {
+      finish();
+      continue;
+    }
+    word += character;
+  }
+  finish();
+  return words;
+}
+
+function basename(command: string): string {
+  return command.slice(command.lastIndexOf("/") + 1).toLowerCase();
+}
+
+function isUnsafeGitInvocation(words: string[], gitIndex: number): boolean {
+  let index = gitIndex + 1;
+  while (index < words.length && words[index]!.startsWith("-")) {
+    const option = words[index]!.toLowerCase();
+    // Per-invocation configuration can redefine otherwise safe commands.
+    if (words[index] === "-c" || option.startsWith("-c=")) return true;
+    index += ["-C", "--git-dir", "--work-tree", "--namespace", "--config-env"]
+      .includes(words[index]!) ? 2 : 1;
+  }
+  const subcommand = words[index]?.toLowerCase();
+  return subcommand === undefined || !SAFE_GIT_COMMANDS.has(subcommand);
+}
+
+function assertAllowedBash(command: string): void {
+  const words = shellWords(command);
+  const lower = words.map((word) => word.toLowerCase());
+  const hasUnsafeGit = words.some(
+    (word, index) => basename(word) === "git" && isUnsafeGitInvocation(words, index),
+  );
+  const hasPrCreation = lower.some((word, index) => {
+    const remaining = lower.slice(index + 1);
+    const hasOrderedWords = (first: string, second: string) => {
+      const firstIndex = remaining.indexOf(first);
+      return firstIndex >= 0 && remaining.indexOf(second, firstIndex + 1) >= 0;
+    };
+    return (basename(word) === "gh" && hasOrderedWords("pr", "create")) ||
+      (basename(word) === "glab" && hasOrderedWords("mr", "create")) ||
+      (basename(word) === "hub" && remaining.includes("pull-request"));
+  });
+  const hasConcealedInvocation = words.some((word) => {
+    const name = basename(word);
+    return CONCEALING_SHELL_COMMANDS.has(name) ||
+      (/^(?:\.\.\/|\.\/|\/)/.test(word) && /(?:\.(?:ba)?sh|\/[^/]+)$/.test(word));
+  });
+  if (hasUnsafeGit || hasPrCreation || hasConcealedInvocation) {
+    throw new Error(
+      "Agency policy blocks Git staging, commits, pushes, and pull-request creation",
+    );
+  }
+}
+
+function protectedBashTool(delegate: PiBashToolDefinition): PiBashToolDefinition {
+  return {
+    ...delegate,
+    async execute(toolCallId, params, signal, onUpdate, context) {
+      assertAllowedBash(stringProperty(params, "command") ?? "");
+      return delegate.execute(toolCallId, params, signal, onUpdate, context);
+    },
+  };
+}
 
 interface ActiveCall {
   toolName: string;
@@ -77,17 +197,18 @@ export interface PiEventState {
   providerError: string | undefined;
 }
 
-function sanitizeProviderError(value: string): string {
-  return concise(
-    value
+function redactSensitiveText(value: string): string {
+  return value
       .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
       .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gi, "[REDACTED]")
       .replace(
-        /(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+        /(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,
         "$1[REDACTED]",
-      ),
-    MAX_PROVIDER_ERROR_CHARS,
-  );
+      );
+}
+
+function sanitizeProviderError(value: string): string {
+  return concise(redactSensitiveText(value), MAX_PROVIDER_ERROR_CHARS);
 }
 
 function knownPublicPiError(error: unknown): string | undefined {
@@ -114,7 +235,7 @@ function recordAssistantMessage(
     )
     .map((content) => content.text)
     .join("\n");
-  if (text.trim() !== "") state.finalMessage = concise(text);
+  if (text.trim() !== "") state.finalMessage = concise(redactSensitiveText(text));
 }
 
 function recordMessages(event: AgentSessionEvent, state: PiEventState): void {
@@ -142,11 +263,13 @@ export function normalizePiEvent(
   recordMessages(event, state);
 
   if (event.type === "tool_execution_start") {
-    const command = event.toolName === "bash" ? stringProperty(event.args, "command") : undefined;
-    const path =
+    const rawCommand = event.toolName === "bash" ? stringProperty(event.args, "command") : undefined;
+    const command = rawCommand === undefined ? undefined : redactSensitiveText(rawCommand);
+    const rawPath =
       event.toolName === "edit" || event.toolName === "write"
         ? stringProperty(event.args, "path")
         : undefined;
+    const path = rawPath === undefined ? undefined : redactSensitiveText(rawPath);
     state.calls.set(event.toolCallId, {
       toolName: event.toolName,
       startedAt: now,
@@ -245,13 +368,14 @@ function executorPrompt(input: ExecuteInput): string {
   ].join("\n\n");
 }
 
-function failureSummary(failure: FailureContext): string {
+function failureSummary(failure: FailureContext, changedFiles: string[]): string {
   return concise(
     JSON.stringify({
       stage: failure.stage,
       message: failure.message,
       cause: failure.cause,
       recoverable: failure.recoverable,
+      changedFiles: changedFiles.slice(0, 200),
       command:
         failure.command === undefined
           ? undefined
@@ -261,6 +385,7 @@ function failureSummary(failure: FailureContext): string {
               exitCode: failure.command.exitCode,
               signal: failure.command.signal,
               timedOut: failure.command.timedOut,
+              stdout: concise(failure.command.stdout, 500),
               stderr: concise(failure.command.stderr, 500),
             },
     }),
@@ -275,9 +400,11 @@ function repairPrompt(input: RepairInput): string {
     `Repository instructions: ${repositoryInstructions(input)}`,
     `Intent: ${concise(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
     `Validated plan: ${JSON.stringify(PlanSchema.parse(input.plan))}`,
-    `Repair attempt ${input.attempt}; bounded failure context: ${failureSummary(input.failure)}`,
+    `Repair attempt ${input.attempt}; bounded failure context: ${failureSummary(input.failure, input.changedFiles)}`,
     `Bounded prior context: ${sessionSummary(input.sessionContext)}`,
-    "Address only the observed failure. Do not commit, stage, push, or open a pull request.",
+    "Diagnose the failure before editing, then address only the observed failure.",
+    "Never weaken or delete tests, lint rules, typecheck settings, configuration, or scripts to make verification pass.",
+    "Do not commit, stage, push, or open a pull request.",
     "Stop when the repair is ready for independent verification. End with one concise summary, without hidden reasoning or raw output.",
   ].join("\n\n");
 }
@@ -352,7 +479,22 @@ function infrastructure(
 }
 
 function emit(sink: CodingEventSink | undefined, event: AgencyEvent): void {
-  sink?.(AgencyEventSchema.parse(event));
+  const sanitized = (() => {
+    switch (event.type) {
+      case "tool": return {
+        ...event,
+        tool: redactSensitiveText(event.tool),
+        ...(event.detail === undefined ? {} : { detail: redactSensitiveText(event.detail) }),
+      };
+      case "file_changed": return { ...event, path: redactSensitiveText(event.path) };
+      case "command_started":
+      case "command_finished": return { ...event, command: redactSensitiveText(event.command) };
+      case "message": return { ...event, content: redactSensitiveText(event.content) };
+      case "error": return { ...event, message: redactSensitiveText(event.message) };
+      default: return event;
+    }
+  })();
+  sink?.(AgencyEventSchema.parse(sanitized));
 }
 
 function abortError(): DOMException {
@@ -408,6 +550,7 @@ export class PiCodingRuntime implements CodingRuntime {
           cwd: input.repo.rootPath,
           modelRuntime: this.#modelRuntime,
           sessionManager: this.#sdk.inMemorySessionManager(input.repo.rootPath),
+          resourceLoader: await this.#sdk.createResourceLoader(input.repo.rootPath),
           tools: PLANNER_TOOLS,
           customTools: [tool],
         })
@@ -416,11 +559,12 @@ export class PiCodingRuntime implements CodingRuntime {
       throw infrastructure("PI_SESSION_CREATION_FAILED", "Failed to create Pi planner session", error);
     }
 
-    const state = this.#subscribe(planner, input.onEvent);
-    const detachAbort = this.#attachAbort(input.signal, planner);
     this.#activeSessions.add(planner);
-    emit(input.onEvent, { type: "phase", phase: "planning" });
+    const state = this.#subscribe(planner, input.onEvent);
+    const abortState = this.#attachAbort(input.signal, planner);
     try {
+      assertNotAborted(input.signal);
+      emit(input.onEvent, { type: "phase", phase: "planning" });
       try {
         await planner.prompt(plannerPrompt(input));
       } catch (error) {
@@ -450,7 +594,8 @@ export class PiCodingRuntime implements CodingRuntime {
       emit(input.onEvent, { type: "message", content: message });
       return { plan: submittedPlan, message };
     } finally {
-      detachAbort();
+      abortState.detach();
+      await abortState.completion();
       state.unsubscribe();
       this.#activeSessions.delete(planner);
       planner.dispose();
@@ -469,7 +614,11 @@ export class PiCodingRuntime implements CodingRuntime {
 
   async abort(): Promise<void> {
     const sessions = new Set([...this.#activeSessions, ...this.#executors.values()]);
+    const executors = new Set(this.#executors.values());
+    // An aborted Pi session is not safe to reuse for a later Agency turn.
+    this.#executors.clear();
     await Promise.allSettled([...sessions].map((session) => session.abort()));
+    for (const session of executors) session.dispose();
   }
 
   async dispose(): Promise<void> {
@@ -484,11 +633,15 @@ export class PiCodingRuntime implements CodingRuntime {
   async #runExecutor(input: ExecuteInput, prompt: string): Promise<CodingResult> {
     this.#assertUsable();
     assertNotAborted(input.signal);
-    const session = await this.#executor(input.repo);
+    const session = await this.#executor(input.repo, input.sessionId, input.signal);
     const state = this.#subscribe(session, input.onEvent);
-    const detachAbort = this.#attachAbort(input.signal, session);
     this.#activeSessions.add(session);
+    const executorKey = this.#executorKey(input.repo, input.sessionId);
+    const abortState = this.#attachAbort(input.signal, session, () => {
+      if (this.#executors.get(executorKey) === session) this.#executors.delete(executorKey);
+    });
     try {
+      assertNotAborted(input.signal);
       await session.prompt(prompt);
       assertNotAborted(input.signal);
       if (state.eventState.providerError !== undefined) {
@@ -508,14 +661,21 @@ export class PiCodingRuntime implements CodingRuntime {
       if (error instanceof DOMException && error.name === "AbortError") throw error;
       throw infrastructure("PI_PROVIDER_REQUEST_FAILED", "Pi execution request failed", error);
     } finally {
-      detachAbort();
+      abortState.detach();
+      await abortState.completion();
+      if (input.signal?.aborted === true) session.dispose();
       state.unsubscribe();
       this.#activeSessions.delete(session);
     }
   }
 
-  async #executor(repo: RepoContext): Promise<PiSession> {
-    const existing = this.#executors.get(repo.rootPath);
+  async #executor(
+    repo: RepoContext,
+    agencySessionId: string,
+    signal: AbortSignal | undefined,
+  ): Promise<PiSession> {
+    const executorKey = this.#executorKey(repo, agencySessionId);
+    const existing = this.#executors.get(executorKey);
     if (existing !== undefined) return existing;
     try {
       const sessionDir = resolve(repo.rootPath, ".devagency/pi-sessions");
@@ -523,11 +683,21 @@ export class PiCodingRuntime implements CodingRuntime {
         cwd: repo.rootPath,
         modelRuntime: this.#modelRuntime,
         sessionManager: this.#sdk.createSessionManager(repo.rootPath, sessionDir),
+        resourceLoader: await this.#sdk.createResourceLoader(repo.rootPath),
         tools: EXECUTOR_TOOLS,
+        customTools: [
+          protectedBashTool(this.#sdk.createBashTool(repo.rootPath)) as unknown as ToolDefinition,
+        ],
       });
-      this.#executors.set(repo.rootPath, session);
+      if (signal?.aborted === true) {
+        await session.abort();
+        session.dispose();
+        throw abortError();
+      }
+      this.#executors.set(executorKey, session);
       return session;
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
       throw infrastructure("PI_SESSION_CREATION_FAILED", "Failed to create Pi executor session", error);
     }
   }
@@ -548,13 +718,27 @@ export class PiCodingRuntime implements CodingRuntime {
     return { eventState, unsubscribe };
   }
 
-  #attachAbort(signal: AbortSignal | undefined, session: PiSession): () => void {
-    if (signal === undefined) return () => {};
+  #attachAbort(
+    signal: AbortSignal | undefined,
+    session: PiSession,
+    onAbort: () => void = () => {},
+  ): { detach: () => void; completion: () => Promise<void> } {
+    let completion: Promise<void> | undefined;
+    if (signal === undefined) return { detach: () => {}, completion: async () => {} };
     const abort = () => {
-      void session.abort();
+      onAbort();
+      completion ??= session.abort();
     };
     signal.addEventListener("abort", abort, { once: true });
-    return () => signal.removeEventListener("abort", abort);
+    if (signal.aborted) abort();
+    return {
+      detach: () => signal.removeEventListener("abort", abort),
+      completion: async () => { await completion?.catch(() => {}); },
+    };
+  }
+
+  #executorKey(repo: RepoContext, agencySessionId: string): string {
+    return `${repo.rootPath}\0${agencySessionId}`;
   }
 
   #assertUsable(): void {

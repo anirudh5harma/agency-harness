@@ -3,9 +3,9 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   AgencyEventSchema,
   CommandResultSchema,
+  FailureContextSchema,
   PlanSchema,
   RepoContextSchema,
-  RunStateSchema,
   SessionContextSchema,
   VerificationResultSchema,
   type AgencyEvent,
@@ -96,58 +96,7 @@ describe("runtime state contracts", () => {
     ).toEqual(verification);
   });
 
-  it("applies bounded session and run-state defaults", () => {
-    expect(
-      RunStateSchema.parse({
-        runId: "run-1",
-        threadId: "thread-1",
-        repoPath: "/workspace/agency",
-        sessionId: "session-1",
-        status: "planning",
-        userIntent: "Build contracts",
-      }),
-    ).toEqual({
-      runId: "run-1",
-      threadId: "thread-1",
-      repoPath: "/workspace/agency",
-      sessionId: "session-1",
-      status: "planning",
-      userIntent: "Build contracts",
-      attempt: 0,
-      changedFiles: [],
-      completedStepIds: [],
-      currentStepId: null,
-      failure: null,
-      maxRepairAttempts: 2,
-      plan: null,
-      repoContext: null,
-      summary: "",
-      verification: null,
-    });
-
-    const state = RunStateSchema.parse({
-      runId: "run-1",
-      threadId: "thread-1",
-      repoPath: "/workspace/agency",
-      sessionId: "session-1",
-      status: "executing",
-      userIntent: "Build contracts",
-    });
-    expect(RunStateSchema.parse(JSON.parse(JSON.stringify(state)))).toEqual(state);
-
-    expect(() =>
-      RunStateSchema.parse({
-        ...state,
-        attempt: -1,
-      }),
-    ).toThrow();
-    expect(() =>
-      RunStateSchema.parse({
-        ...state,
-        maxRepairAttempts: 0,
-      }),
-    ).toThrow();
-
+  it("applies bounded session defaults", () => {
     expect(SessionContextSchema.parse({ sessionId: "session-1" })).toEqual({
       sessionId: "session-1",
       recentTurns: [],
@@ -181,6 +130,15 @@ describe("runtime state contracts", () => {
         })),
       }),
     ).toThrow();
+  });
+
+  it("accepts finalization failures", () => {
+    expect(
+      FailureContextSchema.parse({
+        stage: "finalizing",
+        message: "Could not persist terminal state",
+      }),
+    ).toMatchObject({ stage: "finalizing" });
   });
 });
 

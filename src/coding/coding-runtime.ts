@@ -22,11 +22,15 @@ export type CreatePlanInput = CodingRuntimeInput;
 
 export interface ExecuteInput extends CodingRuntimeInput {
   plan: Plan;
+  /** Stable Agency conversation identity used to isolate persistent Pi executors. */
+  sessionId: string;
 }
 
 export interface RepairInput extends ExecuteInput {
   attempt: number;
   failure: FailureContext;
+  /** Git delta measured by Agency, not files self-reported by Pi. */
+  changedFiles: string[];
 }
 
 export interface CreatePlanResult {

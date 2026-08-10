@@ -16,6 +16,8 @@ export interface GitFileChange {
 
 export interface GitPathSnapshot {
   tracked: boolean;
+  /** The two-character porcelain v1 index/worktree state. */
+  statusCode: string;
   /** Null means Git tracks the path, but it was absent from the worktree. */
   identity: string | null;
 }
@@ -23,7 +25,8 @@ export interface GitPathSnapshot {
 export interface GitBaseline {
   rootPath: string;
   commit: string | null;
-  porcelain: string;
+  /** Stable SHA-256 identity of the staged index entries. */
+  indexTree: string;
   paths: Record<string, GitPathSnapshot>;
 }
 
@@ -73,8 +76,33 @@ async function pathIdentity(rootPath: string, path: string): Promise<string | nu
   return `file:${executableMode}:${stats.size}:${hash.digest("hex")}`;
 }
 
-function nullSeparatedPaths(output: string | null): string[] {
-  return (output ?? "").split("\0").filter(Boolean);
+interface StatusEntry {
+  path: string;
+  statusCode: string;
+  status: GitFileStatus;
+  tracked: boolean;
+}
+
+function parseStatus(output: string | null): StatusEntry[] {
+  return (output ?? "")
+    .split("\0")
+    .filter(Boolean)
+    .map((entry) => {
+      const code = entry.slice(0, 2);
+      return {
+        path: entry.slice(3),
+        statusCode: code,
+        status:
+          code === "??"
+            ? "added"
+            : code.includes("D")
+              ? "deleted"
+              : code.includes("A")
+                ? "added"
+                : "modified",
+        tracked: code !== "??",
+      };
+    });
 }
 
 async function mapWithConcurrency<Input, Output>(
@@ -96,25 +124,39 @@ async function mapWithConcurrency<Input, Output>(
   return outputs;
 }
 
-async function snapshotWorkingTree(
+async function statusEntries(rootPath: string): Promise<StatusEntry[]> {
+  return parseStatus(
+    await git(rootPath, [
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+      "--no-renames",
+    ]),
+  );
+}
+
+async function indexIdentity(rootPath: string): Promise<string> {
+  const stagedEntries = await git(rootPath, ["ls-files", "--stage", "-z"]);
+  return createHash("sha256").update(stagedEntries ?? "").digest("hex");
+}
+
+async function snapshotDirtyPaths(
   rootPath: string,
 ): Promise<Record<string, GitPathSnapshot>> {
-  const [trackedOutput, untrackedOutput] = await Promise.all([
-    git(rootPath, ["ls-files", "-z"]),
-    git(rootPath, ["ls-files", "--others", "--exclude-standard", "-z"]),
-  ]);
-  const tracked = nullSeparatedPaths(trackedOutput);
-  const trackedSet = new Set(tracked);
-  const paths = [...tracked, ...nullSeparatedPaths(untrackedOutput)].sort((left, right) =>
-    left.localeCompare(right),
-  );
-  const identities = await mapWithConcurrency(paths, 16, async (path) => ({
+  const entries = await statusEntries(rootPath);
+  const identities = await mapWithConcurrency(
+    entries,
+    16,
+    async ({ path, tracked, statusCode }) => ({
       path,
       snapshot: {
-        tracked: trackedSet.has(path),
+        tracked,
+        statusCode,
         identity: await pathIdentity(rootPath, path),
       },
-    }));
+    }),
+  );
   return Object.fromEntries(
     identities.map(({ path, snapshot }) => [path, snapshot]),
   );
@@ -122,15 +164,15 @@ async function snapshotWorkingTree(
 
 export async function captureGitBaseline(cwd: string): Promise<GitBaseline> {
   const rootPath = await findGitRoot(cwd);
-  const [commit, porcelain, paths] = await Promise.all([
+  const [commit, indexTree, paths] = await Promise.all([
     git(rootPath, ["rev-parse", "--verify", "HEAD"], true),
-    git(rootPath, ["status", "--porcelain=v1", "--untracked-files=all"]),
-    snapshotWorkingTree(rootPath),
+    indexIdentity(rootPath),
+    snapshotDirtyPaths(rootPath),
   ]);
   return {
     rootPath,
     commit: commit?.trim() || null,
-    porcelain: porcelain?.trimEnd() ?? "",
+    indexTree: indexTree?.trim() ?? "",
     paths,
   };
 }
@@ -138,34 +180,62 @@ export async function captureGitBaseline(cwd: string): Promise<GitBaseline> {
 export async function getChangedFiles(
   baseline: GitBaseline,
 ): Promise<GitFileChange[]> {
-  const currentPaths = await snapshotWorkingTree(baseline.rootPath);
-  const allPaths = new Set([
-    ...Object.keys(baseline.paths),
-    ...Object.keys(currentPaths),
+  const [currentCommit, currentIndexTree, currentEntries] = await Promise.all([
+    git(baseline.rootPath, ["rev-parse", "--verify", "HEAD"], true),
+    indexIdentity(baseline.rootPath),
+    statusEntries(baseline.rootPath),
   ]);
+  const normalizedCommit = currentCommit?.trim() || null;
+  const normalizedIndexTree = currentIndexTree?.trim() ?? "";
+  if (
+    normalizedCommit !== baseline.commit ||
+    normalizedIndexTree !== baseline.indexTree
+  ) {
+    const mutation =
+      normalizedCommit !== baseline.commit ? "HEAD commit" : "Git index";
+    throw new InfrastructureError(
+      "GIT_BASELINE_VIOLATED",
+      `${mutation} changed after Agency captured its baseline in ${baseline.rootPath}`,
+    );
+  }
+  const currentByPath = new Map(currentEntries.map((entry) => [entry.path, entry]));
   const changes: GitFileChange[] = [];
 
-  for (const path of allPaths) {
+  for (const { path, status } of currentEntries) {
     const before = baseline.paths[path];
-    const after = currentPaths[path];
-    if (before === undefined && after !== undefined) {
-      changes.push({ path, status: "added" });
-    } else if (before !== undefined && after === undefined) {
-      changes.push({ path, status: "deleted" });
-    } else if (
-      before !== undefined &&
-      after !== undefined &&
-      (before.identity !== after.identity || before.tracked !== after.tracked)
+    if (before === undefined) changes.push({ path, status });
+  }
+
+  const currentSnapshots = await mapWithConcurrency(
+    Object.entries(baseline.paths),
+    16,
+    async ([path, before]) => ({
+      path,
+      before,
+      identity: await pathIdentity(baseline.rootPath, path),
+    }),
+  );
+  for (const { path, before, identity } of currentSnapshots) {
+    const current = currentByPath.get(path);
+    if (
+      identity !== before.identity ||
+      current?.tracked !== before.tracked ||
+      current?.statusCode !== before.statusCode
     ) {
       changes.push({
         path,
         status:
-          before.identity !== null && after.identity === null
+          before.identity !== null && identity === null
             ? "deleted"
             : "modified",
       });
     }
   }
 
-  return changes.sort((left, right) => left.path.localeCompare(right.path));
+  return changes
+    .filter(
+      (change, index, all) =>
+        all.findIndex((candidate) => candidate.path === change.path) === index,
+    )
+    .sort((left, right) => left.path.localeCompare(right.path));
 }

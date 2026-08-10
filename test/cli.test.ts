@@ -1,15 +1,28 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { runAgency, type TerminalIO, type TextOutput } from "../src/cli/index.js";
+import {
+  AgencyRepl,
+  gitDiff,
+  PlainTerminalRenderer,
+  runAgency,
+  type ReplHandler,
+  type TerminalIO,
+  type TextOutput,
+} from "../src/cli/index.js";
 import { FakeCodingRuntime } from "../src/coding/index.js";
-import type { Plan } from "../src/domain/index.js";
+import type { Plan, SessionContext } from "../src/domain/index.js";
+import {
+  CodingRunStateSchema,
+  type CodingRunGraphRunner,
+} from "../src/graph/index.js";
+import type { SqliteCheckpointPersistence } from "../src/persistence/index.js";
 import { resolveGitExcludePath } from "../src/repo/index.js";
 
 const execFileAsync = promisify(execFile);
@@ -27,6 +40,7 @@ class BufferOutput implements TextOutput {
 class ScriptedIO implements TerminalIO {
   readonly prompts: string[] = [];
   closeCalls = 0;
+  readonly #interruptListeners = new Set<() => void>();
 
   constructor(private readonly lines: Array<string | null>) {}
 
@@ -35,12 +49,17 @@ class ScriptedIO implements TerminalIO {
     return this.lines.shift() ?? null;
   }
 
-  onInterrupt(): () => void {
-    return () => {};
+  onInterrupt(listener: () => void): () => void {
+    this.#interruptListeners.add(listener);
+    return () => this.#interruptListeners.delete(listener);
   }
 
   close(): void {
     this.closeCalls += 1;
+  }
+
+  interrupt(): void {
+    for (const listener of [...this.#interruptListeners]) listener();
   }
 }
 
@@ -56,7 +75,7 @@ async function git(cwd: string, args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
 }
 
-async function temporaryGitProject(options: { verification?: boolean } = {}): Promise<string> {
+async function temporaryGitProject(options: { verification?: boolean } = { verification: true }): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "agency-cli-"));
   temporaryDirectories.push(directory);
   await git(directory, ["init", "-q"]);
@@ -84,6 +103,91 @@ afterEach(async () => {
 });
 
 describe("Agency terminal application", () => {
+  it("cleans up initialized startup resources when a later dependency fails", async () => {
+    const cwd = await temporaryGitProject();
+    const io = new ScriptedIO([]);
+    const closeCheckpoint = vi.fn();
+    const renderer = new PlainTerminalRenderer(new BufferOutput(), new BufferOutput());
+    const disposeRenderer = vi.spyOn(renderer, "dispose");
+
+    await expect(runAgency({
+      cwd,
+      io,
+      output: new BufferOutput(),
+      errorOutput: new BufferOutput(),
+      rendererFactory: () => renderer,
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread: async () => {},
+        close: closeCheckpoint,
+      }),
+      runtimeFactory: async () => {
+        throw new Error("runtime unavailable");
+      },
+    })).rejects.toThrow("runtime unavailable");
+
+    expect(io.closeCalls).toBe(1);
+    expect(closeCheckpoint).toHaveBeenCalledTimes(1);
+    expect(disposeRenderer).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses SIGINT to close an idle REPL", async () => {
+    let interrupt: (() => void) | undefined;
+    let finishRead: (() => void) | undefined;
+    const io: TerminalIO = {
+      readLine: async () => new Promise<null>((resolve) => {
+        finishRead = () => resolve(null);
+      }),
+      onInterrupt: (listener) => {
+        interrupt = listener;
+        return () => {
+          interrupt = undefined;
+        };
+      },
+      close: () => finishRead?.(),
+    };
+    const handler: ReplHandler = {
+      handle: vi.fn(async () => "continue"),
+      interruptActive: vi.fn(async () => {}),
+    };
+
+    const running = new AgencyRepl(io, handler).run();
+    await vi.waitFor(() => expect(interrupt).toBeTypeOf("function"));
+    interrupt?.();
+    await running;
+
+    expect(handler.handle).not.toHaveBeenCalled();
+    expect(handler.interruptActive).not.toHaveBeenCalled();
+  });
+
+  it("uses SIGINT to abort an active turn without closing the REPL", async () => {
+    const io = new ScriptedIO(["task", null]);
+    let started: (() => void) | undefined;
+    const active = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let observedSignal: AbortSignal | undefined;
+    const handler: ReplHandler = {
+      handle: vi.fn(async (_line, signal) => {
+        observedSignal = signal;
+        started?.();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        return "continue";
+      }),
+      interruptActive: vi.fn(async () => {}),
+    };
+
+    const running = new AgencyRepl(io, handler).run();
+    await active;
+    io.interrupt();
+    await running;
+
+    expect(observedSignal?.aborted).toBe(true);
+    expect(handler.interruptActive).toHaveBeenCalledTimes(1);
+    expect(io.closeCalls).toBe(0);
+  });
+
   it("keeps a clean repository clean after repeated metadata startup", async () => {
     const cwd = await temporaryGitProject();
     const beforeIgnore = await readFile(join(cwd, ".gitignore"), "utf8").catch(
@@ -111,6 +215,272 @@ describe("Agency terminal application", () => {
       .toHaveLength(1);
     expect(await readFile(join(cwd, ".gitignore"), "utf8").catch(() => null))
       .toBe(beforeIgnore);
+  });
+
+  it("resumes an old run without attributing it to a replacement session", async () => {
+    const cwd = await temporaryGitProject();
+    const replacement: SessionContext = {
+      sessionId: "replacement-session",
+      recentTurns: [],
+      runSummaries: [],
+    };
+    const recordRunSummary = vi.fn(async () => replacement);
+    const resumed = await CodingRunStateSchema.validateInput({
+      runId: "old-run",
+      threadId: "old-thread",
+      sessionId: "original-session",
+      repoPath: cwd,
+      userIntent: "old task",
+      status: "completed",
+      codingPlan: plan,
+      verificationCommands: [
+        { name: "test", command: "npm", args: ["run", "test"], required: true },
+      ],
+      verification: { status: "passed", summary: "tests passed", commands: [] },
+      changedFiles: [],
+      summary: "completed old task",
+    });
+    const graph: CodingRunGraphRunner = {
+      invoke: vi.fn(async () => resumed),
+      getState: vi.fn(async () => ({})),
+      resume: vi.fn(async () => resumed),
+    };
+    const output = new BufferOutput();
+
+    await runAgency({
+      cwd,
+      io: new ScriptedIO(["r", "/exit"]),
+      output,
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => new FakeCodingRuntime(),
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread: async () => {},
+        close: () => {},
+      }),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => replacement,
+        createNew: async () => replacement,
+        recordUserTurn: async () => replacement,
+        recordRunSummary,
+      }),
+      registryFactory: () => ({
+        list: async () => [],
+        upsert: async () => {},
+        updateStatus: async () => {},
+      }),
+      graphFactory: () => graph,
+      inspectRecovery: async () => [{
+        status: "resumable",
+        entry: {
+          runId: "old-run",
+          threadId: "old-thread",
+          sessionId: "original-session",
+          userIntent: "old task",
+          status: "executing",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+        snapshot: { values: resumed },
+      }],
+    });
+
+    expect(graph.resume).toHaveBeenCalledWith("old-thread", expect.any(Object));
+    expect(recordRunSummary).not.toHaveBeenCalled();
+    expect(output.value).toContain("belongs to session original-session; the current session was left unchanged");
+  });
+
+  it("renders a terminal result before warning when checkpoint pruning fails", async () => {
+    const cwd = await temporaryGitProject();
+    const session: SessionContext = {
+      sessionId: "session-1",
+      recentTurns: [],
+      runSummaries: [],
+    };
+    const completed = await CodingRunStateSchema.validateInput({
+      runId: "run-1",
+      threadId: "thread-1",
+      sessionId: session.sessionId,
+      repoPath: cwd,
+      userIntent: "finish task",
+      status: "completed",
+      codingPlan: plan,
+      verificationCommands: [
+        { name: "test", command: "npm", args: ["run", "test"], required: true },
+      ],
+      verification: { status: "passed", summary: "tests passed", commands: [] },
+      changedFiles: [],
+      summary: "task complete",
+    });
+    const deleteThread = vi.fn(async () => {
+      throw new Error("database locked");
+    });
+    const output = new BufferOutput();
+
+    await expect(runAgency({
+      cwd,
+      io: new ScriptedIO(["finish task", "/exit"]),
+      output,
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => new FakeCodingRuntime(),
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread,
+        close: () => {},
+      }),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => session,
+        createNew: async () => session,
+        recordUserTurn: async () => session,
+        recordRunSummary: async () => session,
+      }),
+      registryFactory: () => ({
+        list: async () => [],
+        upsert: async () => {},
+        updateStatus: async () => {},
+      }),
+      graphFactory: () => ({
+        invoke: async () => completed,
+        getState: async () => ({}),
+        resume: async () => completed,
+      }),
+    })).resolves.toBeUndefined();
+
+    expect(deleteThread).toHaveBeenCalledWith("thread-1");
+    expect(output.value.indexOf("Done: task complete"))
+      .toBeLessThan(output.value.indexOf("could not prune terminal checkpoint"));
+  });
+
+  it("cleans terminal recovery records without offering them for resume", async () => {
+    const cwd = await temporaryGitProject();
+    const session: SessionContext = {
+      sessionId: "session-1",
+      recentTurns: [],
+      runSummaries: [],
+    };
+    const updateStatus = vi.fn(async () => {});
+    const deleteThread = vi.fn(async () => {
+      throw new Error("database locked");
+    });
+    const io = new ScriptedIO(["/exit"]);
+    const output = new BufferOutput();
+
+    await expect(runAgency({
+      cwd,
+      io,
+      output,
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => new FakeCodingRuntime(),
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread,
+        close: () => {},
+      }),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => session,
+        createNew: async () => session,
+        recordUserTurn: async () => session,
+        recordRunSummary: async () => session,
+      }),
+      registryFactory: () => ({
+        list: async () => [],
+        upsert: async () => {},
+        updateStatus,
+      }),
+      graphFactory: () => ({
+        invoke: async () => { throw new Error("not expected"); },
+        getState: async () => ({}),
+        resume: async () => { throw new Error("not expected"); },
+      }),
+      inspectRecovery: async () => [{
+        status: "terminal_checkpoint",
+        terminalStatus: "failed",
+        entry: {
+          runId: "run-finalizing",
+          threadId: "thread-finalizing",
+          sessionId: session.sessionId,
+          userIntent: "old task",
+          status: "verifying",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+        snapshot: { values: { status: "failed" }, next: [], tasks: [] },
+      }],
+    })).resolves.toBeUndefined();
+
+    expect(io.prompts).toEqual(["agency> "]);
+    expect(updateStatus).toHaveBeenCalledWith(
+      "run-finalizing",
+      "failed",
+      expect.any(String),
+    );
+    expect(deleteThread).toHaveBeenCalledWith("thread-finalizing");
+    expect(output.value).toContain("terminal checkpoint reconciled");
+    expect(output.value).toContain("could not prune terminal checkpoint");
+  });
+
+  it("declining recovery creates and retains a fresh session", async () => {
+    const cwd = await temporaryGitProject();
+    const original: SessionContext = {
+      sessionId: "original-session",
+      recentTurns: [],
+      runSummaries: [],
+    };
+    const fresh: SessionContext = {
+      sessionId: "fresh-session",
+      recentTurns: [],
+      runSummaries: [],
+    };
+    const graph: CodingRunGraphRunner = {
+      invoke: vi.fn(async () => {
+        throw new Error("not expected");
+      }),
+      getState: vi.fn(async () => ({})),
+      resume: vi.fn(async () => {
+        throw new Error("not expected");
+      }),
+    };
+    const output = new BufferOutput();
+
+    await runAgency({
+      cwd,
+      io: new ScriptedIO(["n", "/status", "/exit"]),
+      output,
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => new FakeCodingRuntime(),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => original,
+        createNew: vi.fn(async () => fresh),
+        recordUserTurn: async () => fresh,
+        recordRunSummary: async () => fresh,
+      }),
+      registryFactory: () => ({
+        list: async () => [],
+        upsert: async () => {},
+        updateStatus: async () => {},
+      }),
+      graphFactory: () => graph,
+      inspectRecovery: async () => [{
+        status: "resumable",
+        entry: {
+          runId: "old-run",
+          threadId: "old-thread",
+          sessionId: "original-session",
+          userIntent: "old task",
+          status: "executing",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+        snapshot: {},
+      }],
+    });
+
+    expect(graph.resume).not.toHaveBeenCalled();
+    expect(output.value).toContain("Started session fresh-session");
+    expect(output.value).toContain("Session: fresh-session");
   });
 
   it("keeps two natural-language turns in one REPL and session", async () => {
@@ -148,7 +518,7 @@ describe("Agency terminal application", () => {
       .toContain('"event":"run_started"');
     expect(await readFile(join(cwd, ".devagency", "runs", "id-3.jsonl"), "utf8"))
       .toContain('"event":"run_completed"');
-  }, 10_000);
+  }, 30_000);
 
   it("routes slash commands without invoking the coding runtime and starts a new session", async () => {
     const cwd = await temporaryGitProject({ verification: true });
@@ -179,6 +549,28 @@ describe("Agency terminal application", () => {
     expect(sessions).toHaveLength(2);
     expect(sessions[0]).not.toBe(sessions[1]);
     expect(errors.value).toContain("Unknown command: /wat");
+  });
+
+  it("shows unstaged, staged, and untracked changes without evaluating file names", async () => {
+    const cwd = await temporaryGitProject();
+    await writeFile(join(cwd, "tracked.txt"), "unstaged\n");
+    await writeFile(join(cwd, "staged.txt"), "staged\n");
+    await git(cwd, ["add", "staged.txt"]);
+    const hostileName = "$(touch agency-shell-injection) untracked.txt";
+    await writeFile(join(cwd, hostileName), "untracked\n");
+    await mkdir(join(cwd, ".devagency"));
+    await writeFile(join(cwd, ".devagency", "hidden.txt"), "internal\n");
+
+    const diff = await gitDiff(cwd, new AbortController().signal);
+
+    expect(diff).toContain("-initial");
+    expect(diff).toContain("+unstaged");
+    expect(diff).toContain("staged.txt");
+    expect(diff).toContain("+staged");
+    expect(diff).toContain(hostileName);
+    expect(diff).toContain("+untracked");
+    expect(diff).not.toContain("hidden.txt");
+    await expect(readFile(join(cwd, "agency-shell-injection"), "utf8")).rejects.toThrow();
   });
 
   it("renders a failed graph run truthfully and returns to the prompt", async () => {

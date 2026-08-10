@@ -1,4 +1,4 @@
-import type { AgencyEvent, RunState, SessionContext } from "../domain/index.js";
+import type { AgencyEvent, SessionContext, VerificationResult } from "../domain/index.js";
 import type { EventBus } from "../events/index.js";
 import type { CodingRunState } from "../graph/index.js";
 import type { RepositoryInspection } from "../repo/index.js";
@@ -17,7 +17,7 @@ export interface TerminalRenderer {
     changedFiles: readonly string[];
   }): void;
   diff(text: string): void;
-  verification(result: NonNullable<RunState["verification"]>): void;
+  verification(result: VerificationResult): void;
   recovery(message: string): void;
   message(message: string): void;
   error(message: string): void;
@@ -125,7 +125,7 @@ export class PlainTerminalRenderer implements TerminalRenderer {
     line(this.#output, text.trim() === "" ? "No Git diff." : text.trimEnd());
   }
 
-  verification(result: NonNullable<RunState["verification"]>): void {
+  verification(result: VerificationResult): void {
     line(this.#output, `Verification: ${result.status} — ${result.summary}`);
     for (const command of result.commands) {
       line(

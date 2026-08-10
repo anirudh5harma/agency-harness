@@ -9,6 +9,7 @@ import { InfrastructureError } from "../process/infrastructure-error.js";
 export interface SqliteCheckpointPersistence {
   readonly path: string;
   readonly checkpointer: BaseCheckpointSaver;
+  deleteThread(threadId: string): Promise<void>;
   close(): void;
 }
 
@@ -32,6 +33,17 @@ export async function createSqliteCheckpointPersistence(
   return {
     path,
     checkpointer: saver,
+    async deleteThread(threadId) {
+      try {
+        await saver.deleteThread(threadId);
+      } catch (cause) {
+        throw new InfrastructureError(
+          "CHECKPOINT_DELETE_FAILED",
+          `Could not delete checkpoint thread ${threadId} at ${path}`,
+          { cause },
+        );
+      }
+    },
     close() {
       if (closed) return;
       try {

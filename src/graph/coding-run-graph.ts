@@ -6,7 +6,7 @@ import {
   type BaseCheckpointSaver,
 } from "@langchain/langgraph";
 import { readFile } from "node:fs/promises";
-import { relative, sep } from "node:path";
+import { join, relative, sep } from "node:path";
 import { z } from "zod";
 
 import type { CodingRuntime } from "../coding/index.js";
@@ -94,14 +94,28 @@ const BoundedVerificationSchema = z.strictObject({
 const GitBaselineSchema = z.strictObject({
   rootPath: z.string().trim().min(1),
   commit: z.string().nullable(),
-  porcelain: TextSchema,
+  indexTree: z.string().max(128),
   paths: z
     .record(
       z.string(),
-      z.strictObject({ tracked: z.boolean(), identity: z.string().nullable() }),
+      z.strictObject({
+        tracked: z.boolean(),
+        statusCode: z.string().max(2),
+        identity: z.string().nullable(),
+      }),
     )
     .refine((paths) => Object.keys(paths).length <= MAX_BASELINE_PATHS),
 });
+const VerificationCommandSchema = z.strictObject({
+  name: z.string().trim().min(1).max(1_000),
+  command: z.string().trim().min(1).max(1_000),
+  args: z.array(z.string().max(2_000)).max(100),
+  required: z.boolean(),
+});
+const VerificationScriptsSchema = z.record(
+  z.string().trim().min(1).max(1_000),
+  z.string().max(MAX_TEXT),
+);
 
 export const CodingRunStateSchema = new StateSchema({
   runId: IdentifierSchema,
@@ -126,6 +140,11 @@ export const CodingRunStateSchema = new StateSchema({
   sessionContext: SessionContextSchema.nullable().default(null),
   codingPlan: BoundedPlanSchema.nullable().default(null),
   baseline: GitBaselineSchema.nullable().default(null),
+  verificationCommands: z
+    .array(VerificationCommandSchema)
+    .max(MAX_COMMANDS)
+    .default([]),
+  verificationScripts: VerificationScriptsSchema.default({}),
   attempt: z.number().int().nonnegative().max(20).default(0),
   maxRepairAttempts: z.number().int().positive().max(20).default(2),
   changedFiles: z.array(z.string().trim().min(1)).max(MAX_CHANGED_FILES).default([]),
@@ -296,6 +315,32 @@ function isInternalMetadataPath(path: string): boolean {
   return normalized === ".devagency" || normalized.startsWith(".devagency/");
 }
 
+async function verificationScripts(
+  rootPath: string,
+  commands: readonly VerificationCommand[],
+): Promise<Record<string, string>> {
+  const scriptNames = commands
+    .filter(({ command, args }) =>
+      ["npm", "pnpm", "yarn", "bun"].includes(command) && args[0] === "run" && args[1] !== undefined)
+    .map(({ args }) => args[1] as string);
+  if (scriptNames.length === 0) return {};
+
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(await readFile(join(rootPath, "package.json"), "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+  const scripts = typeof manifest === "object" && manifest !== null
+    && "scripts" in manifest && typeof manifest.scripts === "object" && manifest.scripts !== null
+    ? manifest.scripts as Record<string, unknown>
+    : {};
+  return VerificationScriptsSchema.parse(Object.fromEntries(
+    scriptNames.flatMap((name) => typeof scripts[name] === "string" ? [[name, scripts[name]]] : []),
+  ));
+}
+
 export function routeAfterVerification(
   state: CodingRunState,
 ): "repair" | "summarize" {
@@ -327,6 +372,13 @@ export function createCodingRunGraph(
   const now = dependencies.now ?? (() => new Date());
   const ensureMetadataIgnored =
     dependencies.ensureMetadataIgnored ?? ensureAgencyMetadataIgnored;
+  const forwardRuntimeEvent = dependencies.eventBus === undefined
+    ? undefined
+    : (event: Parameters<EventBus["emit"]>[0]) => {
+        // Graph lifecycle owns phase events. Forwarding the runtime's duplicate
+        // phase notification would render every model phase twice.
+        if (event.type !== "phase") dependencies.eventBus?.emit(event);
+      };
 
   async function recordTrajectory(
     state: Pick<CodingRunState, "runId" | "sessionId">,
@@ -434,13 +486,47 @@ export function createCodingRunGraph(
         inspection.instructionFiles,
       );
       const baseline = await captureBaseline(inspection.rootPath);
+      const verificationCommands = z
+        .array(VerificationCommandSchema)
+        .max(MAX_COMMANDS)
+        .parse(await detectCommands(inspection.rootPath));
+      const preparedVerificationScripts = await verificationScripts(
+        inspection.rootPath,
+        verificationCommands,
+      );
       await recordTrajectory(state, "prepare_completed", { startedAt });
+      if (verificationCommands.length === 0) {
+        const message = "No verification commands detected before model execution";
+        return {
+          status: "failed",
+          repoPath: inspection.rootPath,
+          repoContext: repositoryContext(inspection),
+          repoInstructions,
+          baseline,
+          verificationCommands,
+          verificationScripts: preparedVerificationScripts,
+          verification: {
+            status: "skipped",
+            summary: message,
+            commands: [],
+          },
+          failure: {
+            stage: "verifying",
+            message,
+            recoverable: false,
+          },
+          createdAt,
+          updatedAt: now().toISOString(),
+        };
+      }
       return {
         status: "preparing",
         repoPath: inspection.rootPath,
         repoContext: repositoryContext(inspection),
         repoInstructions,
         baseline,
+        verificationCommands,
+        verificationScripts: preparedVerificationScripts,
         createdAt,
         updatedAt: createdAt,
       };
@@ -478,6 +564,7 @@ export function createCodingRunGraph(
         repoInstructions: state.repoInstructions,
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
+        ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
       const codingPlan = BoundedPlanSchema.parse(result.plan);
       await recordTrajectory(state, "plan_completed", {
@@ -505,8 +592,10 @@ export function createCodingRunGraph(
         repo: state.repoContext,
         repoInstructions: state.repoInstructions,
         plan: state.codingPlan,
+        sessionId: state.sessionId,
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
+        ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
       const changedFiles = await actualChangedFiles(state.baseline);
       await recordTrajectory(state, "execution_completed", {
@@ -530,7 +619,35 @@ export function createCodingRunGraph(
     const boundary = await enterPhase(state, "verifying", "verification");
     if (boundary.result.status === "failed") return boundary.result;
     try {
-      const commands = await detectCommands(state.repoPath);
+      const commands = state.verificationCommands.map((command) => ({
+        ...command,
+        args: [...command.args],
+      }));
+      const currentVerificationScripts = await verificationScripts(state.repoPath, commands);
+      if (
+        JSON.stringify(currentVerificationScripts)
+        !== JSON.stringify(state.verificationScripts)
+      ) {
+        const summary = "Verification scripts changed after preparation; refusing to verify modified gates";
+        const verification = boundedVerification({
+          status: "failed",
+          summary,
+          commands: [],
+        });
+        await recordTrajectory(state, "verification_failed");
+        await recordTrajectory(state, "verification_completed", {
+          startedAt: boundary.startedAt,
+        });
+        return {
+          ...boundary.result,
+          verification,
+          failure: {
+            stage: "verifying",
+            message: summary,
+            recoverable: false,
+          },
+        };
+      }
       const verification = boundedVerification(
         await runVerification(
           commands,
@@ -538,7 +655,7 @@ export function createCodingRunGraph(
           runtime.signal ?? new AbortController().signal,
         ),
       );
-      if (verification.status === "failed") {
+      if (verification.status !== "passed") {
         await recordTrajectory(state, "verification_failed");
         await recordTrajectory(state, "verification_completed", {
           startedAt: boundary.startedAt,
@@ -549,7 +666,7 @@ export function createCodingRunGraph(
           failure: {
             stage: "verifying",
             message: verification.summary,
-            recoverable: true,
+            recoverable: verification.status === "failed",
             ...(verification.commands.at(-1) === undefined
               ? {}
               : { command: verification.commands.at(-1) }),
@@ -587,10 +704,13 @@ export function createCodingRunGraph(
         repo: state.repoContext,
         repoInstructions: state.repoInstructions,
         plan: state.codingPlan,
+        sessionId: state.sessionId,
         attempt,
         failure: state.failure,
+        changedFiles: [...state.changedFiles],
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
+        ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
       const changedFiles = await actualChangedFiles(state.baseline);
       await recordTrajectory(state, "repair_completed", {
@@ -611,7 +731,7 @@ export function createCodingRunGraph(
   };
 
   const summarize: typeof CodingRunStateSchema.Node = async (state) => {
-    const completed = state.failure === null && state.verification?.status !== "failed";
+    const completed = state.failure === null && state.verification?.status === "passed";
     let status: "completed" | "failed" = completed ? "completed" : "failed";
     let summary = completed
       ? `${state.verification?.summary ?? "Run completed"}. ${state.changedFiles.length} file${state.changedFiles.length === 1 ? "" : "s"} changed.`
@@ -619,7 +739,6 @@ export function createCodingRunGraph(
         ? `${state.failure.message}; exhausted ${state.maxRepairAttempts} repair attempts.`
         : `Run failed: ${state.failure?.message ?? "unknown failure"}.`;
     try {
-      await dependencies.registry.updateStatus(state.runId, status, now().toISOString());
       await recordTrajectory(state, "run_completed", {
         metadata: {
           status,
@@ -627,13 +746,14 @@ export function createCodingRunGraph(
           changedFileCount: state.changedFiles.length,
         },
       });
+      await dependencies.registry.updateStatus(state.runId, status, now().toISOString());
     } catch (error) {
       status = "failed";
       summary = `Run failed while finalizing incomplete-run metadata: ${errorMessage(error)}.`;
       return {
         status,
         summary: concise(summary),
-        failure: infrastructureFailure("verifying", error),
+        failure: infrastructureFailure("finalizing", error),
         updatedAt: now().toISOString(),
       };
     }

@@ -59,7 +59,14 @@ export const VerificationResultSchema = z.strictObject({
 export type VerificationResult = z.infer<typeof VerificationResultSchema>;
 
 export const FailureContextSchema = z.strictObject({
-  stage: z.enum(["preparing", "planning", "executing", "verifying", "repairing"]),
+  stage: z.enum([
+    "preparing",
+    "planning",
+    "executing",
+    "verifying",
+    "repairing",
+    "finalizing",
+  ]),
   message: NonEmptyStringSchema,
   cause: z.string().optional(),
   recoverable: z.boolean().default(false),
@@ -78,26 +85,6 @@ export const RunStatusSchema = z.enum([
   "cancelled",
 ]);
 export type RunStatus = z.infer<typeof RunStatusSchema>;
-
-export const RunStateSchema = z.strictObject({
-  runId: NonEmptyStringSchema,
-  threadId: NonEmptyStringSchema,
-  repoPath: NonEmptyStringSchema,
-  sessionId: NonEmptyStringSchema,
-  status: RunStatusSchema,
-  userIntent: NonEmptyStringSchema,
-  repoContext: RepoContextSchema.nullable().default(null),
-  plan: PlanSchema.nullable().default(null),
-  currentStepId: NonEmptyStringSchema.nullable().default(null),
-  completedStepIds: z.array(NonEmptyStringSchema).default([]),
-  attempt: z.number().int().nonnegative().default(0),
-  maxRepairAttempts: z.number().int().positive().default(2),
-  changedFiles: z.array(NonEmptyStringSchema).default([]),
-  verification: VerificationResultSchema.nullable().default(null),
-  failure: FailureContextSchema.nullable().default(null),
-  summary: z.string().default(""),
-});
-export type RunState = z.infer<typeof RunStateSchema>;
 
 export const MAX_SESSION_TURNS = 20;
 export const MAX_SESSION_RUN_SUMMARIES = 10;

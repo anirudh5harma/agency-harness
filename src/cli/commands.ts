@@ -24,18 +24,41 @@ function userChangedFiles(porcelain: string): string[] {
 }
 
 export async function gitDiff(cwd: string, signal: AbortSignal): Promise<string> {
-  const result = await runCommand({
+  const runGit = (args: string[]) => runCommand({
     command: "git",
-    args: ["diff", "--no-ext-diff", "--"],
+    args,
     cwd,
     signal,
     timeoutMs: 30_000,
     maxOutputBytes: 512 * 1024,
   });
-  if (result.exitCode !== 0) {
-    throw new Error(result.stderr.trim() || "git diff failed");
+  const [unstaged, staged, untrackedResult] = await Promise.all([
+    runGit(["diff", "--no-ext-diff", "--"]),
+    runGit(["diff", "--cached", "--no-ext-diff", "--"]),
+    runGit(["ls-files", "--others", "--exclude-standard", "-z", "--"]),
+  ]);
+  for (const result of [unstaged, staged, untrackedResult]) {
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr.trim() || "git diff failed");
+    }
   }
-  return result.stdout;
+
+  const untrackedPaths = untrackedResult.stdout
+    .split("\0")
+    .filter(Boolean)
+    .filter((path) => path !== ".devagency" && !path.startsWith(".devagency/"));
+  const untrackedDiffs: string[] = [];
+  for (const path of untrackedPaths) {
+    const result = await runGit(["diff", "--no-index", "--", "/dev/null", path]);
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      throw new Error(result.stderr.trim() || `git diff failed for untracked file ${path}`);
+    }
+    untrackedDiffs.push(`Untracked file: ${JSON.stringify(path)}\n${result.stdout}`);
+  }
+
+  return [unstaged.stdout, staged.stdout, ...untrackedDiffs]
+    .filter((section) => section !== "")
+    .join("\n");
 }
 
 export async function verifyProject(

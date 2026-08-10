@@ -127,12 +127,26 @@ export function boundedAgencyDiagnostic(message, result) {
 
 export function validateAgencyTranscript(result) {
   const failures = [];
-  const doneCount = result.stdout.match(/Done:/gu)?.length ?? 0;
+  const stdout = normalizedAgencyOutput(result.stdout);
+  const lines = stdout.split("\n");
+  const runVerification = [];
+  let verificationPassed = false;
+  for (const line of lines) {
+    if (/^Verification:\s+passed\b/u.test(line)) verificationPassed = true;
+    if (/^Done:/u.test(line)) {
+      runVerification.push(verificationPassed);
+      verificationPassed = false;
+    }
+  }
+  const doneCount = runVerification.length;
   if (result.stderr.trim() !== "") failures.push("stderr was not empty");
   if (doneCount !== 2) failures.push(`expected exactly two completed runs, observed ${doneCount}`);
-  if (/Status:\s+failed\b/gu.test(result.stdout)) failures.push("/status reported failed");
-  if (!/Status:\s+completed\b/gu.test(result.stdout)) failures.push("completed /status missing");
-  if (!/Verification:\s+passed\b/gu.test(result.stdout)) {
+  if (/^Status:\s+failed\b/gmu.test(stdout)) failures.push("/status reported failed");
+  if (!/^Status:\s+completed\b/mu.test(stdout)) failures.push("completed /status missing");
+  if (runVerification.some((passed) => !passed)) {
+    failures.push("expected each completed run to report Verification: passed");
+  }
+  if (!/^Verification:\s+passed\b/mu.test(stdout)) {
     failures.push("passed verification missing");
   }
   if (failures.length > 0) {
