@@ -4,7 +4,13 @@ export type InfrastructureErrorCode =
   | "PACKAGE_METADATA_INVALID"
   | "METADATA_READ_FAILED"
   | "METADATA_WRITE_FAILED"
-  | "METADATA_INVALID";
+  | "METADATA_INVALID"
+  | "CODING_RUNTIME_RESULT_UNAVAILABLE"
+  | "PI_RUNTIME_INITIALIZATION_FAILED"
+  | "PI_SESSION_CREATION_FAILED"
+  | "PI_PROVIDER_REQUEST_FAILED"
+  | "PI_PLAN_INVALID"
+  | "PI_PLAN_MISSING";
 
 export class InfrastructureError extends Error {
   readonly code: InfrastructureErrorCode;
