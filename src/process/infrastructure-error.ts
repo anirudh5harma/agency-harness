@@ -1,7 +1,10 @@
 export type InfrastructureErrorCode =
   | "NOT_GIT_REPOSITORY"
   | "GIT_COMMAND_FAILED"
-  | "PACKAGE_METADATA_INVALID";
+  | "PACKAGE_METADATA_INVALID"
+  | "METADATA_READ_FAILED"
+  | "METADATA_WRITE_FAILED"
+  | "METADATA_INVALID";
 
 export class InfrastructureError extends Error {
   readonly code: InfrastructureErrorCode;

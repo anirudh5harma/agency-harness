@@ -99,6 +99,9 @@ export const RunStateSchema = z.strictObject({
 });
 export type RunState = z.infer<typeof RunStateSchema>;
 
+export const MAX_SESSION_TURNS = 20;
+export const MAX_SESSION_RUN_SUMMARIES = 10;
+
 export const SessionTurnSchema = z.strictObject({
   role: z.enum(["user", "assistant"]),
   content: NonEmptyStringSchema,
@@ -115,8 +118,14 @@ export type RunSummary = z.infer<typeof RunSummarySchema>;
 
 export const SessionContextSchema = z.strictObject({
   sessionId: NonEmptyStringSchema,
-  recentTurns: z.array(SessionTurnSchema).max(20).default([]),
-  runSummaries: z.array(RunSummarySchema).max(10).default([]),
+  recentTurns: z
+    .array(SessionTurnSchema)
+    .max(MAX_SESSION_TURNS)
+    .default([]),
+  runSummaries: z
+    .array(RunSummarySchema)
+    .max(MAX_SESSION_RUN_SUMMARIES)
+    .default([]),
 });
 export type SessionContext = z.infer<typeof SessionContextSchema>;
 
