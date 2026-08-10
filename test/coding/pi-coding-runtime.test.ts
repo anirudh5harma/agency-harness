@@ -296,15 +296,16 @@ describe("PiCodingRuntime", () => {
     expect(boundary.sessions[0]?.dispose).toHaveBeenCalledOnce();
   });
 
-  it("surfaces sanitized bounded provider errors from planner and executor events", async () => {
+  it("surfaces safe provider errors from thrown planner failures and executor events", async () => {
     const secret = "sk-provider-secret";
     const longTail = "x".repeat(4_000);
     const providerError =
       `No API key found for the selected model. Bearer bearer-secret token=${secret} ${longTail}`;
     const boundary = createBoundary({
-      plannerPrompt: async (session) => {
-        session.emit(providerErrorMessage(providerError));
-        throw new Error("provider request rejected after emitting its public error");
+      plannerPrompt: async () => {
+        throw new Error(
+          "No API key found for the selected model.\n\nUse /login or set a provider API key.",
+        );
       },
       executorPrompt: async (session) => {
         const messageEvent = providerErrorMessage(providerError);
@@ -320,6 +321,8 @@ describe("PiCodingRuntime", () => {
     const planningError = await runtime.createPlan({ intent: "Build", repo }).catch((error) => error);
     const executionError = await runtime.execute({ intent: "Build", repo, plan }).catch((error) => error);
 
+    expect(planningError.message).not.toContain("Use /login");
+
     for (const [error, prefix] of [
       [planningError, "Pi planning request failed: No API key found for the selected model."],
       [executionError, "Pi execution request failed: No API key found for the selected model."],
@@ -334,6 +337,20 @@ describe("PiCodingRuntime", () => {
       expect(error.message).not.toContain("hidden provider response");
       expect(error.message).not.toContain(longTail);
     }
+  });
+
+  it("keeps arbitrary thrown planner errors private", async () => {
+    const boundary = createBoundary({
+      plannerPrompt: async () => {
+        throw new Error("internal prompt and tool output must stay private");
+      },
+    });
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+
+    await expect(runtime.createPlan({ intent: "Build", repo })).rejects.toMatchObject({
+      code: "PI_PROVIDER_REQUEST_FAILED",
+      message: "Pi planning request failed",
+    });
   });
 });
 

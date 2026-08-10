@@ -37,6 +37,7 @@ const MAX_CONTEXT_ITEM_CHARS = 800;
 const MAX_FAILURE_CHARS = 1_500;
 const MAX_MESSAGE_CHARS = 2_000;
 const MAX_PROVIDER_ERROR_CHARS = 500;
+const PI_NO_API_KEY_ERROR = "No API key found for the selected model.";
 
 export interface PiSession {
   readonly sessionId: string;
@@ -87,6 +88,13 @@ function sanitizeProviderError(value: string): string {
       ),
     MAX_PROVIDER_ERROR_CHARS,
   );
+}
+
+function knownPublicPiError(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !error.message.trimStart().startsWith(PI_NO_API_KEY_ERROR)) {
+    return undefined;
+  }
+  return sanitizeProviderError(PI_NO_API_KEY_ERROR);
 }
 
 function recordAssistantMessage(
@@ -422,11 +430,12 @@ export class PiCodingRuntime implements CodingRuntime {
       } catch (error) {
         if (submittedPlan === undefined && submittedError === undefined) {
           assertNotAborted(input.signal);
+          const providerError = state.eventState.providerError ?? knownPublicPiError(error);
           throw infrastructure(
             "PI_PROVIDER_REQUEST_FAILED",
-            state.eventState.providerError === undefined
+            providerError === undefined
               ? "Pi planning request failed"
-              : `Pi planning request failed: ${state.eventState.providerError}`,
+              : `Pi planning request failed: ${providerError}`,
             error,
           );
         }
