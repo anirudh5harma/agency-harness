@@ -36,6 +36,7 @@ const MAX_CONTEXT_ITEMS = 6;
 const MAX_CONTEXT_ITEM_CHARS = 800;
 const MAX_FAILURE_CHARS = 1_500;
 const MAX_MESSAGE_CHARS = 2_000;
+const MAX_PROVIDER_ERROR_CHARS = 500;
 
 export interface PiSession {
   readonly sessionId: string;
@@ -72,17 +73,49 @@ export interface PiEventState {
   calls: Map<string, ActiveCall>;
   changedFiles: Set<string>;
   finalMessage: string;
+  providerError: string | undefined;
 }
 
-function recordText(message: AgentSessionEvent, state: PiEventState): void {
-  if (message.type !== "message_end" || message.message.role !== "assistant") return;
-  const text = message.message.content
+function sanitizeProviderError(value: string): string {
+  return concise(
+    value
+      .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
+      .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gi, "[REDACTED]")
+      .replace(
+        /(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+        "$1[REDACTED]",
+      ),
+    MAX_PROVIDER_ERROR_CHARS,
+  );
+}
+
+function recordAssistantMessage(
+  message: Extract<AgentSessionEvent, { type: "message_end" }>["message"],
+  state: PiEventState,
+): void {
+  if (message.role !== "assistant") return;
+  if (message.stopReason === "error" && message.errorMessage?.trim()) {
+    state.providerError = sanitizeProviderError(message.errorMessage);
+    return;
+  }
+
+  state.providerError = undefined;
+  const text = message.content
     .filter((content): content is Extract<typeof content, { type: "text" }> =>
       content.type === "text",
     )
     .map((content) => content.text)
     .join("\n");
   if (text.trim() !== "") state.finalMessage = concise(text);
+}
+
+function recordMessages(event: AgentSessionEvent, state: PiEventState): void {
+  if (event.type === "message_end") {
+    recordAssistantMessage(event.message, state);
+    return;
+  }
+  if (event.type !== "agent_end" || event.willRetry) return;
+  for (const message of event.messages) recordAssistantMessage(message, state);
 }
 
 function stringProperty(value: unknown, key: string): string | undefined {
@@ -98,7 +131,7 @@ export function normalizePiEvent(
   state: PiEventState,
   now = Date.now(),
 ): AgencyEvent[] {
-  recordText(event, state);
+  recordMessages(event, state);
 
   if (event.type === "tool_execution_start") {
     const command = event.toolName === "bash" ? stringProperty(event.args, "command") : undefined;
@@ -393,6 +426,12 @@ export class PiCodingRuntime implements CodingRuntime {
         }
       }
       if (submittedError !== undefined) throw submittedError;
+      if (submittedPlan === undefined && state.eventState.providerError !== undefined) {
+        throw infrastructure(
+          "PI_PROVIDER_REQUEST_FAILED",
+          `Pi planning request failed: ${state.eventState.providerError}`,
+        );
+      }
       if (submittedPlan === undefined) {
         throw infrastructure("PI_PLAN_MISSING", "Pi planner stopped without submitting a plan");
       }
@@ -441,6 +480,12 @@ export class PiCodingRuntime implements CodingRuntime {
     try {
       await session.prompt(prompt);
       assertNotAborted(input.signal);
+      if (state.eventState.providerError !== undefined) {
+        throw infrastructure(
+          "PI_PROVIDER_REQUEST_FAILED",
+          `Pi execution request failed: ${state.eventState.providerError}`,
+        );
+      }
       const message = state.eventState.finalMessage || "Implementation is ready for independent verification.";
       emit(input.onEvent, { type: "message", content: message });
       return {
@@ -484,6 +529,7 @@ export class PiCodingRuntime implements CodingRuntime {
       calls: new Map(),
       changedFiles: new Set(),
       finalMessage: "",
+      providerError: undefined,
     };
     const unsubscribe = session.subscribe((event) => {
       for (const normalized of normalizePiEvent(event, eventState)) emit(sink, normalized);

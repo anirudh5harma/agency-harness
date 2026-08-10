@@ -63,6 +63,21 @@ function assistantMessage(content: string): AgentSessionEvent {
   } as AgentSessionEvent;
 }
 
+function providerErrorMessage(errorMessage: string): Extract<AgentSessionEvent, { type: "message_end" }> {
+  const event = assistantMessage("hidden provider response") as Extract<
+    AgentSessionEvent,
+    { type: "message_end" }
+  >;
+  return {
+    ...event,
+    message: {
+      ...event.message,
+      stopReason: "error",
+      errorMessage,
+    },
+  };
+}
+
 class StubSession implements PiSession {
   readonly abort = vi.fn(async () => {});
   readonly dispose = vi.fn(() => {});
@@ -91,6 +106,7 @@ class StubSession implements PiSession {
 
 function createBoundary(options: {
   executorPrompt?: (session: StubSession, prompt: string) => Promise<void>;
+  plannerPrompt?: (session: StubSession, prompt: string) => Promise<void>;
   plannerValue?: unknown;
 }) {
   const sessionOptions: CreateAgentSessionOptions[] = [];
@@ -109,7 +125,7 @@ function createBoundary(options: {
       const session = new StubSession(
         isPlanner ? "planner" : "executor",
         isPlanner
-          ? async (planner) => {
+          ? (options.plannerPrompt ?? (async (planner) => {
               const submit = sessionOptionsInput.customTools?.[0] as ToolDefinition;
               planner.emit({
                 type: "tool_execution_start",
@@ -133,7 +149,7 @@ function createBoundary(options: {
                 result: { content: [{ type: "text", text: "accepted" }] },
                 isError: false,
               });
-            }
+            }))
           : (options.executorPrompt ?? (async () => {})),
       );
       sessions.push(session);
@@ -279,11 +295,55 @@ describe("PiCodingRuntime", () => {
     expect(boundary.sessions[0]?.abort).toHaveBeenCalled();
     expect(boundary.sessions[0]?.dispose).toHaveBeenCalledOnce();
   });
+
+  it("surfaces sanitized bounded provider errors from planner and executor events", async () => {
+    const secret = "sk-provider-secret";
+    const longTail = "x".repeat(4_000);
+    const providerError =
+      `No API key found for the selected model. Bearer bearer-secret token=${secret} ${longTail}`;
+    const boundary = createBoundary({
+      plannerPrompt: async (session) => {
+        session.emit(providerErrorMessage(providerError));
+      },
+      executorPrompt: async (session) => {
+        const messageEvent = providerErrorMessage(providerError);
+        session.emit({
+          type: "agent_end",
+          messages: [messageEvent.message],
+          willRetry: false,
+        });
+      },
+    });
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+
+    const planningError = await runtime.createPlan({ intent: "Build", repo }).catch((error) => error);
+    const executionError = await runtime.execute({ intent: "Build", repo, plan }).catch((error) => error);
+
+    for (const [error, prefix] of [
+      [planningError, "Pi planning request failed: No API key found for the selected model."],
+      [executionError, "Pi execution request failed: No API key found for the selected model."],
+    ] as const) {
+      expect(error).toBeInstanceOf(InfrastructureError);
+      expect(error).toMatchObject({ code: "PI_PROVIDER_REQUEST_FAILED" });
+      expect(error.message).toContain(prefix);
+      expect(error.message.length).toBeLessThan(600);
+      expect(error.message).not.toContain("bearer-secret");
+      expect(error.message).not.toContain(secret);
+      expect(error.message).not.toContain("private reasoning");
+      expect(error.message).not.toContain("hidden provider response");
+      expect(error.message).not.toContain(longTail);
+    }
+  });
 });
 
 describe("normalizePiEvent", () => {
   it("emits only exact safe AgencyEvent variants and never thinking or raw output", () => {
-    const state = { calls: new Map(), changedFiles: new Set<string>(), finalMessage: "" };
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
     const events = [
       ...normalizePiEvent(
         {
