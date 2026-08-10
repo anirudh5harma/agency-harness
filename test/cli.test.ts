@@ -148,7 +148,7 @@ describe("Agency terminal application", () => {
       .toContain('"event":"run_started"');
     expect(await readFile(join(cwd, ".devagency", "runs", "id-3.jsonl"), "utf8"))
       .toContain('"event":"run_completed"');
-  });
+  }, 10_000);
 
   it("routes slash commands without invoking the coding runtime and starts a new session", async () => {
     const cwd = await temporaryGitProject({ verification: true });

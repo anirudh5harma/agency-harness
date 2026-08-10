@@ -13,6 +13,7 @@
     "node": ">=22.19"
   },
   "scripts": {
+    "acceptance:real-pi": "node scripts/acceptance/real-pi-divide.mjs",
     "build": "tsc",
     "lint": "eslint .",
     "test": "vitest run",
