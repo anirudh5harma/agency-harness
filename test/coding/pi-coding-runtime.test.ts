@@ -304,6 +304,7 @@ describe("PiCodingRuntime", () => {
     const boundary = createBoundary({
       plannerPrompt: async (session) => {
         session.emit(providerErrorMessage(providerError));
+        throw new Error("provider request rejected after emitting its public error");
       },
       executorPrompt: async (session) => {
         const messageEvent = providerErrorMessage(providerError);

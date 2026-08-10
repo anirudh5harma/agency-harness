@@ -422,7 +422,13 @@ export class PiCodingRuntime implements CodingRuntime {
       } catch (error) {
         if (submittedPlan === undefined && submittedError === undefined) {
           assertNotAborted(input.signal);
-          throw infrastructure("PI_PROVIDER_REQUEST_FAILED", "Pi planning request failed", error);
+          throw infrastructure(
+            "PI_PROVIDER_REQUEST_FAILED",
+            state.eventState.providerError === undefined
+              ? "Pi planning request failed"
+              : `Pi planning request failed: ${state.eventState.providerError}`,
+            error,
+          );
         }
       }
       if (submittedError !== undefined) throw submittedError;
