@@ -3,11 +3,11 @@
 import { execFile, spawn } from "node:child_process";
 import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { clearTimeout, setTimeout } from "node:timers";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { promisify, stripVTControlCharacters } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -15,6 +15,7 @@ const projectRoot = join(scriptDirectory, "..", "..");
 const fixtureRoot = join(projectRoot, "fixtures", "divide");
 const builtCli = join(projectRoot, "dist", "cli", "index.js");
 const timeoutMs = Number.parseInt(process.env.AGENCY_REAL_PI_TIMEOUT_MS ?? "300000", 10);
+const MAX_DIAGNOSTIC_CHARS = 8_000;
 
 function help() {
   process.stdout.write(`Real-Pi divide acceptance\n\nUsage:\n  npm run acceptance:real-pi\n\nBuilds Agency, copies fixtures/divide to a temporary Git repository, installs the\nfixture dependencies, and sends exactly two conversational turns through the normal\nconfigured Pi provider/model. Configure Pi exactly as for ordinary Agency use; this\nscript contains and reads no embedded credentials.\n\nOptional environment:\n  AGENCY_REAL_PI_TIMEOUT_MS  Total Agency subprocess timeout (default: 300000)\n`);
@@ -102,6 +103,52 @@ function requireMatch(value, pattern, message) {
   if (!pattern.test(value)) throw new Error(message);
 }
 
+function normalizedAgencyOutput(value) {
+  return stripVTControlCharacters(value)
+    .replace(/\r\n?/gu, "\n")
+    .replace(/\b(Bearer)\s+\S+/giu, "$1 <redacted>")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, "<redacted>")
+    .replace(
+      /\b((?:api[_-]?key|authorization|password|token)\s*[:=]\s*)\S+/giu,
+      "$1<redacted>",
+    )
+    .trimEnd();
+}
+
+export function boundedAgencyDiagnostic(message, result) {
+  const heading = `${message}\n\nAgency transcript (tail):\n`;
+  const transcript = [
+    `[stdout]\n${normalizedAgencyOutput(result.stdout) || "<empty>"}`,
+    `[stderr]\n${normalizedAgencyOutput(result.stderr) || "<empty>"}`,
+  ].join("\n\n");
+  const remaining = Math.max(0, MAX_DIAGNOSTIC_CHARS - heading.length);
+  return `${heading}${transcript.slice(-remaining)}`.slice(0, MAX_DIAGNOSTIC_CHARS);
+}
+
+export function validateAgencyTranscript(result) {
+  const failures = [];
+  const doneCount = result.stdout.match(/Done:/gu)?.length ?? 0;
+  if (result.stderr.trim() !== "") failures.push("stderr was not empty");
+  if (doneCount !== 2) failures.push(`expected exactly two completed runs, observed ${doneCount}`);
+  if (/Status:\s+failed\b/gu.test(result.stdout)) failures.push("/status reported failed");
+  if (!/Status:\s+completed\b/gu.test(result.stdout)) failures.push("completed /status missing");
+  if (!/Verification:\s+passed\b/gu.test(result.stdout)) {
+    failures.push("passed verification missing");
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      boundedAgencyDiagnostic(`Agency run validation failed: ${failures.join("; ")}`, result),
+    );
+  }
+}
+
+export function postRunDiagnostic(error, result) {
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const message = normalizedAgencyOutput(rawMessage).split("\n", 1)[0]?.slice(0, 500)
+    || "unknown artifact validation failure";
+  return new Error(boundedAgencyDiagnostic(`Post-run validation failed: ${message}`, result));
+}
+
 async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     help();
@@ -124,25 +171,24 @@ async function main() {
     await command("git", ["commit", "-qm", "fixture baseline"], fixture);
 
     const result = await runAgency(fixture);
-    const source = await readFile(join(fixture, "src", "divide.ts"), "utf8");
-    const tests = await readFile(join(fixture, "test", "divide.test.ts"), "utf8");
-    const diff = (await command(
-      "git",
-      ["diff", "--", "src/divide.ts", "test/divide.test.ts"],
-      fixture,
-    )).stdout;
+    validateAgencyTranscript(result);
+    try {
+      const source = await readFile(join(fixture, "src", "divide.ts"), "utf8");
+      const tests = await readFile(join(fixture, "test", "divide.test.ts"), "utf8");
+      const diff = (await command(
+        "git",
+        ["diff", "--", "src/divide.ts", "test/divide.test.ts"],
+        fixture,
+      )).stdout;
 
-    requireMatch(source, /export\s+class\s+DivisionByZeroError\s+extends\s+Error/, "custom error class missing");
-    requireMatch(source, /throw\s+new\s+DivisionByZeroError\b/, "divide does not throw the custom error");
-    if (/throw\s+new\s+Error\b/.test(source)) throw new Error("generic Error throw remains");
-    requireMatch(tests, /DivisionByZeroError/, "custom error test missing");
-    requireMatch(diff, /DivisionByZeroError/, "expected Git diff missing");
-    requireMatch(result.stdout, /Status: completed/, "/status did not report a completed run");
-    requireMatch(result.stdout, /Verification: passed/, "/status did not report passed verification");
-    if ((result.stdout.match(/Done:/g) ?? []).length !== 2) {
-      throw new Error("Agency did not complete exactly two conversational runs");
+      requireMatch(source, /export\s+class\s+DivisionByZeroError\s+extends\s+Error/, "custom error class missing");
+      requireMatch(source, /throw\s+new\s+DivisionByZeroError\b/, "divide does not throw the custom error");
+      if (/throw\s+new\s+Error\b/.test(source)) throw new Error("generic Error throw remains");
+      requireMatch(tests, /DivisionByZeroError/, "custom error test missing");
+      requireMatch(diff, /DivisionByZeroError/, "expected Git diff missing");
+    } catch (error) {
+      throw postRunDiagnostic(error, result);
     }
-    if (result.stderr.trim() !== "") throw new Error(`Agency wrote errors:\n${result.stderr}`);
 
     await command("npm", ["test"], fixture);
     await command("npm", ["run", "typecheck"], fixture);
@@ -152,7 +198,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`Real-Pi divide acceptance failed: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+const entry = process.argv[1];
+if (entry !== undefined && resolve(entry) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`Real-Pi divide acceptance failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}
