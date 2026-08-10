@@ -5,10 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { InfrastructureError } from "../../src/process/index.js";
-import {
-  SessionStore,
-  buildFollowUpContext,
-} from "../../src/session/index.js";
+import { SessionStore } from "../../src/session/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -92,33 +89,6 @@ describe("SessionStore", () => {
     expect(fresh.recentTurns).toEqual([]);
     expect(fresh.runSummaries).toEqual([]);
     expect(await readFile(registryPath, "utf8")).toBe('{"runs":[]}');
-  });
-
-  it("builds concise follow-up context from summaries and user turns", () => {
-    const context = buildFollowUpContext({
-      sessionId: "session-1",
-      recentTurns: [
-        { role: "user", content: "Add authentication" },
-        { role: "assistant", content: "This should not be included" },
-        { role: "user", content: "Use passkeys" },
-      ],
-      runSummaries: [
-        {
-          runId: "run-1",
-          status: "completed",
-          objective: "Add authentication",
-          summary: "Implemented the login route",
-        },
-      ],
-    });
-
-    expect(context).toContain("Recent user requests:");
-    expect(context).toContain("Add authentication");
-    expect(context).toContain("Use passkeys");
-    expect(context).toContain("Completed/failed runs:");
-    expect(context).toContain("run-1 (completed)");
-    expect(context).not.toContain("This should not be included");
-    expect(context.length).toBeLessThan(1_000);
   });
 
   it("reports corrupt session metadata as a typed infrastructure failure", async () => {

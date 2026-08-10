@@ -20,7 +20,7 @@ const PersistedSessionSchema = SessionContextSchema.extend({
 export class SessionStore {
   readonly path: string;
 
-  constructor(private readonly projectRoot: string) {
+  constructor(projectRoot: string) {
     this.path = join(projectRoot, ".devagency", "session.json");
   }
 
@@ -49,9 +49,6 @@ export class SessionStore {
   async recordRunSummary(summary: RunSummary): Promise<SessionContext> {
     const session = await this.loadOrCreate();
     const parsedSummary = RunSummarySchema.parse(summary);
-    if (!(["completed", "failed"] as const).includes(parsedSummary.status as never)) {
-      throw new TypeError("Session run summaries must be completed or failed");
-    }
     const updated = SessionContextSchema.parse({
       ...session,
       runSummaries: [...session.runSummaries, parsedSummary].slice(

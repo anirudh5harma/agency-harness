@@ -56,6 +56,7 @@ export interface TrajectoryWriter {
 
 export class JsonlTrajectoryWriter implements TrajectoryWriter {
   readonly runsPath: string;
+  private initialization: Promise<string | undefined> | undefined;
 
   constructor(projectRoot: string) {
     this.runsPath = join(projectRoot, ".devagency", "runs");
@@ -69,7 +70,8 @@ export class JsonlTrajectoryWriter implements TrajectoryWriter {
     let parsed: TrajectoryEvent;
     try {
       parsed = TrajectoryEventSchema.parse(event);
-      await mkdir(this.runsPath, { recursive: true });
+      this.initialization ??= mkdir(this.runsPath, { recursive: true });
+      await this.initialization;
       await appendFile(
         this.pathFor(parsed.runId),
         `${JSON.stringify(parsed)}\n`,

@@ -101,6 +101,35 @@ describe("IncompleteRunRegistry", () => {
     ]);
   });
 
+  it("preserves registry ordering when updating an incomplete status", async () => {
+    const projectRoot = await temporaryProject();
+    const registry = new IncompleteRunRegistry(projectRoot);
+    await registry.upsert(entry);
+    await registry.upsert({ ...entry, runId: "run-2" });
+
+    await registry.updateStatus(
+      entry.runId,
+      "verifying",
+      "2026-08-10T10:02:00.000Z",
+    );
+
+    expect((await registry.list()).map(({ runId }) => runId)).toEqual([
+      "run-2",
+      "run-1",
+    ]);
+  });
+
+  it("preserves typed validation errors for incomplete updates", async () => {
+    const projectRoot = await temporaryProject();
+    const registry = new IncompleteRunRegistry(projectRoot);
+    await registry.upsert(entry);
+
+    await expect(
+      registry.updateStatus(entry.runId, "verifying", "not-a-date"),
+    ).rejects.toMatchObject({ code: "METADATA_INVALID" });
+    expect(await registry.list()).toEqual([entry]);
+  });
+
   it("turns corrupt recovery metadata into a typed safe-discovery failure", async () => {
     const projectRoot = await temporaryProject();
     const metadataDirectory = join(projectRoot, ".devagency");

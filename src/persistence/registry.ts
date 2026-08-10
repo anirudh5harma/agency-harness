@@ -83,10 +83,22 @@ export class IncompleteRunRegistry {
       return;
     }
 
-    await this.upsert({
-      ...existing,
-      status: IncompleteRunStatusSchema.parse(parsedStatus),
-      updatedAt: z.iso.datetime().parse(updatedAt),
+    let updated: IncompleteRunEntry;
+    try {
+      updated = IncompleteRunEntrySchema.parse({
+        ...existing,
+        status: IncompleteRunStatusSchema.parse(parsedStatus),
+        updatedAt: z.iso.datetime().parse(updatedAt),
+      });
+    } catch (cause) {
+      throw new InfrastructureError(
+        "METADATA_INVALID",
+        "Invalid incomplete run discovery metadata",
+        { cause },
+      );
+    }
+    await writeJsonFileAtomic(this.path, {
+      runs: [...runs.filter(({ runId: id }) => id !== runId), updated],
     });
   }
 }

@@ -60,7 +60,7 @@ const defaultSdk: PiSdkBoundary = {
   createModelRuntime: () => ModelRuntime.create(),
   inMemorySessionManager: (cwd) => SessionManager.inMemory(cwd),
   createSessionManager: (cwd, sessionDir) => SessionManager.create(cwd, sessionDir),
-  createAgentSession: async (options) => createAgentSession(options),
+  createAgentSession,
 };
 
 interface ActiveCall {
@@ -189,10 +189,6 @@ function concise(value: string, maxChars = MAX_MESSAGE_CHARS): string {
   return `${normalized.slice(0, maxChars - 1).trimEnd()}…`;
 }
 
-function bounded(value: string, maxChars: number): string {
-  return concise(value, maxChars);
-}
-
 function repositorySummary(repo: RepoContext): string {
   return JSON.stringify({
     rootPath: repo.rootPath,
@@ -206,13 +202,13 @@ function sessionSummary(context: SessionContext | undefined): string {
   if (context === undefined) return "None.";
   const turns = context.recentTurns.slice(-MAX_CONTEXT_ITEMS).map((turn) => ({
     role: turn.role,
-    content: bounded(turn.content, MAX_CONTEXT_ITEM_CHARS),
+    content: concise(turn.content, MAX_CONTEXT_ITEM_CHARS),
   }));
   const runs = context.runSummaries.slice(-MAX_CONTEXT_ITEMS).map((run) => ({
     runId: run.runId,
     status: run.status,
-    objective: bounded(run.objective, MAX_CONTEXT_ITEM_CHARS),
-    summary: bounded(run.summary, MAX_CONTEXT_ITEM_CHARS),
+    objective: concise(run.objective, MAX_CONTEXT_ITEM_CHARS),
+    summary: concise(run.summary, MAX_CONTEXT_ITEM_CHARS),
   }));
   return JSON.stringify({ turns, runs });
 }
@@ -220,7 +216,7 @@ function sessionSummary(context: SessionContext | undefined): string {
 function repositoryInstructions(input: { repoInstructions?: string }): string {
   return input.repoInstructions === undefined
     ? "Follow repository-local instructions discovered with read-only tools."
-    : bounded(input.repoInstructions, MAX_INSTRUCTIONS_CHARS);
+    : concise(input.repoInstructions, MAX_INSTRUCTIONS_CHARS);
 }
 
 function plannerPrompt(input: CreatePlanInput): string {
@@ -228,7 +224,7 @@ function plannerPrompt(input: CreatePlanInput): string {
     "Create a small, executable implementation plan for the stated intent.",
     `Repository: ${repositorySummary(input.repo)}`,
     `Repository instructions: ${repositoryInstructions(input)}`,
-    `Intent: ${bounded(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
+    `Intent: ${concise(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
     `Bounded prior context: ${sessionSummary(input.sessionContext)}`,
     "Inspect only as needed. You have no shell or mutation tools.",
     "Finish by calling submit_plan exactly once with the structured plan; do not print the plan or continue afterward.",
@@ -240,7 +236,7 @@ function executorPrompt(input: ExecuteInput): string {
     "Implement the validated plan in the repository.",
     `Repository: ${repositorySummary(input.repo)}`,
     `Repository instructions: ${repositoryInstructions(input)}`,
-    `Intent: ${bounded(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
+    `Intent: ${concise(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
     `Validated plan: ${JSON.stringify(PlanSchema.parse(input.plan))}`,
     `Bounded prior context: ${sessionSummary(input.sessionContext)}`,
     "Stay within the plan. Do not commit, stage, push, or open a pull request.",
@@ -250,7 +246,7 @@ function executorPrompt(input: ExecuteInput): string {
 }
 
 function failureSummary(failure: FailureContext): string {
-  return bounded(
+  return concise(
     JSON.stringify({
       stage: failure.stage,
       message: failure.message,
@@ -265,7 +261,7 @@ function failureSummary(failure: FailureContext): string {
               exitCode: failure.command.exitCode,
               signal: failure.command.signal,
               timedOut: failure.command.timedOut,
-              stderr: bounded(failure.command.stderr, 500),
+              stderr: concise(failure.command.stderr, 500),
             },
     }),
     MAX_FAILURE_CHARS,
@@ -277,7 +273,7 @@ function repairPrompt(input: RepairInput): string {
     "Repair the existing implementation in this same executor session.",
     `Repository: ${repositorySummary(input.repo)}`,
     `Repository instructions: ${repositoryInstructions(input)}`,
-    `Intent: ${bounded(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
+    `Intent: ${concise(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
     `Validated plan: ${JSON.stringify(PlanSchema.parse(input.plan))}`,
     `Repair attempt ${input.attempt}; bounded failure context: ${failureSummary(input.failure)}`,
     `Bounded prior context: ${sessionSummary(input.sessionContext)}`,

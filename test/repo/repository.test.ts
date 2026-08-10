@@ -141,6 +141,40 @@ describe("repository inspection", () => {
     ]);
     expect(inspection.porcelain).toContain("?? AGENTS.md");
   });
+
+  it("treats a missing package manifest as absent", async () => {
+    const root = await initializedRepository();
+
+    const inspection = await inspectRepository(root);
+
+    expect(inspection.packageJsonPath).toBeNull();
+    expect(inspection.project.languages).toEqual([]);
+  });
+
+  it("reports an existing invalid package manifest", async () => {
+    const root = await initializedRepository();
+    await writeFile(join(root, "package.json"), "not json", "utf8");
+
+    await expect(inspectRepository(root)).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "PACKAGE_METADATA_INVALID",
+    });
+  });
+
+  it("preserves lockfile package-manager precedence", async () => {
+    const root = await initializedRepository();
+    await Promise.all([
+      writeFile(join(root, "package.json"), "{}", "utf8"),
+      writeFile(join(root, "pnpm-lock.yaml"), "", "utf8"),
+      writeFile(join(root, "yarn.lock"), "", "utf8"),
+      writeFile(join(root, "bun.lock"), "", "utf8"),
+      writeFile(join(root, "package-lock.json"), "", "utf8"),
+    ]);
+
+    const inspection = await inspectRepository(root);
+
+    expect(inspection.project.packageManager).toBe("pnpm");
+  });
 });
 
 describe("Git baselines", () => {

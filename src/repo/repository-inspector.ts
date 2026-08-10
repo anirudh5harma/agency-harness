@@ -51,10 +51,13 @@ async function readProjectMetadata(rootPath: string): Promise<{
 }> {
   const packageJsonPath = join(rootPath, "package.json");
   let manifest: PackageManifest = {};
-  if (await exists(packageJsonPath)) {
-    try {
-      manifest = JSON.parse(await readFile(packageJsonPath, "utf8")) as PackageManifest;
-    } catch (cause) {
+  let hasPackageJson = true;
+  try {
+    manifest = JSON.parse(await readFile(packageJsonPath, "utf8")) as PackageManifest;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") {
+      hasPackageJson = false;
+    } else {
       throw new InfrastructureError(
         "PACKAGE_METADATA_INVALID",
         `Invalid package metadata at ${packageJsonPath}`,
@@ -75,23 +78,26 @@ async function readProjectMetadata(rootPath: string): Promise<{
   );
   const languages: string[] = [];
   if (await exists(join(rootPath, "tsconfig.json"))) languages.push("TypeScript");
-  else if (packageJsonPath !== null && (await exists(packageJsonPath))) {
-    languages.push("JavaScript");
-  }
+  else if (hasPackageJson) languages.push("JavaScript");
 
   let packageManager =
     typeof manifest.packageManager === "string" && manifest.packageManager.trim() !== ""
       ? manifest.packageManager
       : undefined;
   if (packageManager === undefined) {
-    if (await exists(join(rootPath, "pnpm-lock.yaml"))) packageManager = "pnpm";
-    else if (await exists(join(rootPath, "yarn.lock"))) packageManager = "yarn";
-    else if (await exists(join(rootPath, "bun.lock"))) packageManager = "bun";
-    else if (await exists(join(rootPath, "package-lock.json"))) packageManager = "npm";
+    const lockfiles = await Promise.all([
+      exists(join(rootPath, "pnpm-lock.yaml")),
+      exists(join(rootPath, "yarn.lock")),
+      exists(join(rootPath, "bun.lock")),
+      exists(join(rootPath, "package-lock.json")),
+    ]);
+    packageManager = (["pnpm", "yarn", "bun", "npm"] as const).find(
+      (_, index) => lockfiles[index],
+    );
   }
 
   return {
-    packageJsonPath: (await exists(packageJsonPath)) ? packageJsonPath : null,
+    packageJsonPath: hasPackageJson ? packageJsonPath : null,
     project: {
       name:
         typeof manifest.name === "string" && manifest.name.trim() !== ""

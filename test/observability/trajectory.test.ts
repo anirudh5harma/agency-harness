@@ -62,6 +62,19 @@ describe("JSONL trajectory writer", () => {
     });
   });
 
+  it("shares directory initialization across concurrent appends", async () => {
+    const root = await temporaryRoot();
+    const writer = new JsonlTrajectoryWriter(root);
+
+    await Promise.all([
+      writer.append(event),
+      writer.append({ ...event, event: "verification_started" }),
+    ]);
+
+    const contents = await readFile(writer.pathFor(event.runId), "utf8");
+    expect(contents.trim().split("\n")).toHaveLength(2);
+  });
+
   it("rejects run identifiers that could escape the runs directory", async () => {
     const root = await temporaryRoot();
     await mkdir(join(root, ".devagency"));

@@ -108,9 +108,12 @@ export const SessionTurnSchema = z.strictObject({
 });
 export type SessionTurn = z.infer<typeof SessionTurnSchema>;
 
+export const RunSummaryStatusSchema = z.enum(["completed", "failed"]);
+export type RunSummaryStatus = z.infer<typeof RunSummaryStatusSchema>;
+
 export const RunSummarySchema = z.strictObject({
   runId: NonEmptyStringSchema,
-  status: RunStatusSchema,
+  status: RunSummaryStatusSchema,
   objective: NonEmptyStringSchema,
   summary: z.string(),
   verification: VerificationResultSchema.optional(),

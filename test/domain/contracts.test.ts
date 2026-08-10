@@ -153,6 +153,24 @@ describe("runtime state contracts", () => {
       recentTurns: [],
       runSummaries: [],
     });
+    const persistedSummary = {
+      runId: "run-1",
+      status: "completed",
+      objective: "Build the feature",
+      summary: "Feature built",
+    };
+    expect(
+      SessionContextSchema.parse({
+        sessionId: "session-1",
+        runSummaries: [persistedSummary],
+      }).runSummaries,
+    ).toEqual([persistedSummary]);
+    expect(() =>
+      SessionContextSchema.parse({
+        sessionId: "session-1",
+        runSummaries: [{ ...persistedSummary, status: "cancelled" }],
+      }),
+    ).toThrow();
 
     expect(() =>
       SessionContextSchema.parse({
