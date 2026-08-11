@@ -267,12 +267,16 @@ describe("Agency terminal application", () => {
     };
     const resume = vi.fn(async () => interrupted);
     const runtime = new FakeCodingRuntime();
+    const output = new BufferOutput();
+    const renderer = new PlainTerminalRenderer(output, new BufferOutput());
+    const setRunStatus = vi.spyOn(renderer, "setRunStatus");
 
     await runAgency({
       cwd,
       io,
-      output: new BufferOutput(),
+      output,
       errorOutput: new BufferOutput(),
+      rendererFactory: () => renderer,
       runtimeFactory: async () => runtime,
       checkpointFactory: async () => ({
         path: join(cwd, ".devagency", "state.db"),
@@ -296,6 +300,7 @@ describe("Agency terminal application", () => {
 
     expect(resume).not.toHaveBeenCalled();
     expect(runtime.abortCalls).toBe(1);
+    expect(setRunStatus).toHaveBeenLastCalledWith("cancelled");
     expect(closeCalls).toBe(1);
   });
 
@@ -351,18 +356,25 @@ describe("Agency terminal application", () => {
       changedFiles: [],
       summary: "completed old task",
     });
+    const output = new BufferOutput();
+    const renderer = new PlainTerminalRenderer(output, new BufferOutput());
+    const setRunStatus = vi.spyOn(renderer, "setRunStatus");
+    const resume = vi.fn(async () => {
+      expect(setRunStatus).toHaveBeenLastCalledWith("running");
+      return resumed;
+    });
     const graph: CodingRunGraphRunner = {
       invoke: vi.fn(async () => resumed),
       getState: vi.fn(async () => ({})),
-      resume: vi.fn(async () => resumed),
+      resume,
     };
-    const output = new BufferOutput();
 
     await runAgency({
       cwd,
       io: new ScriptedIO(["r", "/exit"]),
       output,
       errorOutput: new BufferOutput(),
+      rendererFactory: () => renderer,
       runtimeFactory: async () => new FakeCodingRuntime(),
       checkpointFactory: async () => ({
         path: join(cwd, ".devagency", "state.db"),
@@ -746,8 +758,17 @@ describe("Agency terminal application", () => {
     ]);
     const output = new BufferOutput();
     const errors = new BufferOutput();
+    const renderer = new PlainTerminalRenderer(output, errors);
+    const setRunStatus = vi.spyOn(renderer, "setRunStatus");
 
-    await runAgency({ cwd, io, output, errorOutput: errors, runtimeFactory: async () => runtime });
+    await runAgency({
+      cwd,
+      io,
+      output,
+      errorOutput: errors,
+      rendererFactory: () => renderer,
+      runtimeFactory: async () => runtime,
+    });
 
     expect(runtime.calls.createPlan).toHaveLength(0);
     expect(runtime.calls.execute).toHaveLength(0);
@@ -758,6 +779,7 @@ describe("Agency terminal application", () => {
     const sessions = [...output.value.matchAll(/Session: ([^\n]+)/g)].map((match) => match[1]);
     expect(sessions).toHaveLength(2);
     expect(sessions[0]).not.toBe(sessions[1]);
+    expect(setRunStatus).toHaveBeenLastCalledWith("idle");
     expect(errors.value).toContain("Unknown command: /wat");
   });
 

@@ -285,6 +285,168 @@ export interface PiEventState {
   changedFiles: Set<string>;
   finalMessage: string;
   providerError: string | undefined;
+  assistantStream?: IncrementalSecretRedactor;
+  assistantTextContentIndex?: number;
+  finalMessageStreamed?: boolean;
+}
+
+const MAX_STREAM_REDACTOR_PENDING = 64;
+const SENSITIVE_ASSIGNMENT_NAMES = [
+  "apikey",
+  "accesstoken",
+  "refreshtoken",
+  "token",
+  "password",
+] as const;
+const SENSITIVE_PREFIX_PATTERN = /\b(?:Bearer\s+|sk-|(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password)\b\s*[:=]\s*)/iu;
+
+function uncertainSensitiveSuffixStart(value: string): number {
+  for (let index = 0; index < value.length; index += 1) {
+    if (index > 0 && /[A-Za-z0-9_]/u.test(value[index - 1] ?? "")) continue;
+    const suffix = value.slice(index).toLowerCase();
+    if ("bearer".startsWith(suffix.trimEnd()) || "sk-".startsWith(suffix)) return index;
+
+    const operator = suffix.search(/[:=]/u);
+    const rawName = operator === -1 ? suffix.trimEnd() : suffix.slice(0, operator).trimEnd();
+    const name = rawName.replace(/[ _-]/gu, "");
+    if (name === "") continue;
+    if (!SENSITIVE_ASSIGNMENT_NAMES.some((candidate) => candidate.startsWith(name))) continue;
+    if (operator === -1 || /^[:=]\s*$/u.test(suffix.slice(operator))) return index;
+  }
+  return value.length;
+}
+
+/**
+ * Redacts streaming secrets without releasing an uncertain prefix or active value.
+ * Pending state is capped; active secret bytes are discarded rather than buffered.
+ */
+class IncrementalSecretRedactor {
+  #pending = "";
+  #sensitivePrefix: string | null = null;
+  #quote: "\"" | "'" | null | undefined;
+  #awaitingValue = false;
+  #escaped = false;
+
+  push(chunk: string, done = false): string {
+    let output = "";
+    let remaining = chunk;
+    while (remaining !== "") {
+      if (this.#sensitivePrefix !== null) {
+        const consumed = this.#consumeSensitive(remaining);
+        output += consumed.output;
+        remaining = consumed.remaining;
+        if (consumed.waiting) break;
+        continue;
+      }
+
+      this.#pending += remaining;
+      remaining = "";
+      const match = SENSITIVE_PREFIX_PATTERN.exec(this.#pending);
+      if (match !== null) {
+        output += redactSecrets(this.#pending.slice(0, match.index));
+        this.#sensitivePrefix = match[0].toLowerCase().startsWith("sk-") ? "" : match[0];
+        remaining = this.#pending.slice(match.index + match[0].length);
+        this.#pending = "";
+        this.#quote = undefined;
+        this.#awaitingValue = true;
+        this.#escaped = false;
+        continue;
+      }
+
+      const uncertainAt = uncertainSensitiveSuffixStart(this.#pending);
+      output += redactSecrets(this.#pending.slice(0, uncertainAt));
+      this.#pending = this.#pending.slice(uncertainAt);
+      if (this.#pending.length > MAX_STREAM_REDACTOR_PENDING) {
+        this.#pending = "";
+        this.#sensitivePrefix = "";
+        this.#quote = null;
+        this.#awaitingValue = false;
+      }
+    }
+
+    if (!done) return output;
+    if (this.#sensitivePrefix !== null) {
+      output += `${this.#sensitivePrefix}[REDACTED]`;
+    } else {
+      output += redactSecrets(this.#pending);
+    }
+    this.#pending = "";
+    this.#sensitivePrefix = null;
+    this.#quote = undefined;
+    this.#awaitingValue = false;
+    this.#escaped = false;
+    return output;
+  }
+
+  #consumeSensitive(value: string): { output: string; remaining: string; waiting: boolean } {
+    let input = value;
+    if (this.#awaitingValue) {
+      let valueAt = 0;
+      while (valueAt < input.length && /\s/u.test(input[valueAt] ?? "")) valueAt += 1;
+      input = input.slice(valueAt);
+      if (input === "") return { output: "", remaining: "", waiting: true };
+      this.#awaitingValue = false;
+    }
+    if (this.#quote === undefined) {
+      if (input === "") return { output: "", remaining: "", waiting: true };
+      const first = input[0];
+      if (first === "\"" || first === "'") {
+        this.#quote = first;
+        input = input.slice(1);
+        this.#escaped = false;
+      } else {
+        this.#quote = null;
+      }
+    }
+
+    let delimiterAt = -1;
+    if (this.#quote === null) {
+      delimiterAt = input.search(/[\s,;&]/u);
+    } else {
+      for (let index = 0; index < input.length; index += 1) {
+        const character = input[index] ?? "";
+        if (this.#escaped) {
+          this.#escaped = false;
+        } else if (character === "\\") {
+          this.#escaped = true;
+        } else if (character === this.#quote) {
+          delimiterAt = index;
+          break;
+        }
+      }
+    }
+    if (delimiterAt === -1) return { output: "", remaining: "", waiting: true };
+
+    const delimiter = input[delimiterAt] ?? "";
+    const remaining = input.slice(delimiterAt + 1);
+    const output = `${this.#sensitivePrefix ?? ""}[REDACTED]${this.#quote === null ? delimiter : ""}`;
+    this.#sensitivePrefix = null;
+    this.#quote = undefined;
+    this.#awaitingValue = false;
+    this.#escaped = false;
+    return { output, remaining, waiting: false };
+  }
+}
+
+function assistantDeltaEvents(delta: string, done: boolean): AgencyEvent[] {
+  if (delta === "") {
+    return done ? [{ type: "assistant_text_delta", delta: "", done: true }] : [];
+  }
+  const events: AgencyEvent[] = [];
+  let offset = 0;
+  while (offset < delta.length) {
+    let end = Math.min(offset + 65_536, delta.length);
+    const finalCodeUnit = delta.charCodeAt(end - 1);
+    if (end < delta.length && finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) end -= 1;
+    const slice = delta.slice(offset, end);
+    events.push({
+      type: "assistant_text_delta",
+      delta: slice,
+      done: done && end === delta.length,
+    });
+    offset = end;
+  }
+  return events;
 }
 
 function sanitizeProviderError(value: string): string {
@@ -301,11 +463,11 @@ function knownPublicPiError(error: unknown): string | undefined {
 function recordAssistantMessage(
   message: Extract<AgentSessionEvent, { type: "message_end" }>["message"],
   state: PiEventState,
-): void {
-  if (message.role !== "assistant") return;
+): boolean {
+  if (message.role !== "assistant") return false;
   if (message.stopReason === "error" && message.errorMessage?.trim()) {
     state.providerError = sanitizeProviderError(message.errorMessage);
-    return;
+    return false;
   }
 
   state.providerError = undefined;
@@ -315,12 +477,15 @@ function recordAssistantMessage(
     )
     .map((content) => content.text)
     .join("\n");
-  if (text.trim() !== "") state.finalMessage = concise(redactSecrets(text));
+  if (text.trim() === "") return false;
+  state.finalMessage = concise(redactSecrets(text));
+  return true;
 }
 
 function recordMessages(event: AgentSessionEvent, state: PiEventState): void {
   if (event.type === "message_end") {
-    recordAssistantMessage(event.message, state);
+    const recorded = recordAssistantMessage(event.message, state);
+    if (recorded) state.finalMessageStreamed = state.assistantStream !== undefined;
     return;
   }
   if (event.type !== "agent_end" || event.willRetry) return;
@@ -341,6 +506,25 @@ export function normalizePiEvent(
   now = Date.now(),
 ): AgencyEvent[] {
   recordMessages(event, state);
+
+  if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+    state.assistantStream ??= new IncrementalSecretRedactor();
+    const contentIndex = event.assistantMessageEvent.contentIndex;
+    const separator = state.assistantTextContentIndex !== undefined &&
+        state.assistantTextContentIndex !== contentIndex
+      ? "\n"
+      : "";
+    state.assistantTextContentIndex = contentIndex;
+    const delta = state.assistantStream.push(`${separator}${event.assistantMessageEvent.delta}`);
+    return assistantDeltaEvents(delta, false);
+  }
+
+  if (event.type === "message_end" && state.assistantStream !== undefined) {
+    const delta = state.assistantStream.push("", true);
+    delete state.assistantStream;
+    delete state.assistantTextContentIndex;
+    return assistantDeltaEvents(delta, true);
+  }
 
   if (event.type === "tool_execution_start") {
     const rawCommand = event.toolName === "bash" ? stringProperty(event.args, "command") : undefined;
@@ -679,6 +863,7 @@ function emit(sink: CodingEventSink | undefined, event: AgencyEvent): void {
       case "command_started":
       case "command_finished": return { ...event, command: redactSecrets(event.command) };
       case "message": return { ...event, content: redactSecrets(event.content) };
+      case "assistant_text_delta": return { ...event, delta: redactSecrets(event.delta) };
       case "error": return { ...event, message: redactSecrets(event.message) };
       default: return event;
     }
@@ -913,7 +1098,9 @@ export class PiCodingRuntime implements CodingRuntime {
         );
       }
       const message = state.eventState.finalMessage || "Implementation is ready for independent verification.";
-      emit(input.onEvent, { type: "message", content: message });
+      if (state.eventState.finalMessageStreamed !== true) {
+        emit(input.onEvent, { type: "message", content: message });
+      }
       return {
         message,
         changedFiles: [...state.eventState.changedFiles],

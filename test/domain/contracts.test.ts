@@ -264,6 +264,8 @@ describe("AgencyEventSchema", () => {
       durationMs: 50,
     },
     { type: "message", content: "Verification complete" },
+    { type: "assistant_text_delta", delta: "Working", done: false },
+    { type: "assistant_text_delta", delta: "", done: true },
     { type: "error", message: "Verification failed" },
   ];
 

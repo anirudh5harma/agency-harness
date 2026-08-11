@@ -38,7 +38,7 @@ import type { SessionCompactionResult } from "../session/index.js";
 import { SlashCommandRouter, type SlashCommandDependencies } from "./commands.js";
 import { AgencyRepl, type ReplHandler, type TerminalIO } from "./repl.js";
 import {
-  PlainTerminalRenderer,
+  createTerminalRenderer,
   type TerminalRenderer,
   type TextOutput,
 } from "./renderer.js";
@@ -136,6 +136,8 @@ export class AgencyApplication implements ReplHandler {
       getSession: () => this.#session,
       createNewSession: async () => {
         this.#session = await this.#sessionStore.createNew();
+        this.#renderer.setSession(this.#session);
+        this.#renderer.setRunStatus("idle");
         return this.#session;
       },
       compactSession: async () => {
@@ -169,7 +171,7 @@ export class AgencyApplication implements ReplHandler {
         dependencies.output,
         dependencies.errorOutput,
         eventBus,
-      ) ?? new PlainTerminalRenderer(dependencies.output, dependencies.errorOutput, eventBus);
+      ) ?? createTerminalRenderer(dependencies.output, dependencies.errorOutput, eventBus);
     let checkpoint: SqliteCheckpointPersistence | undefined;
     let runtime: CodingRuntime | undefined;
     try {
@@ -221,7 +223,7 @@ export class AgencyApplication implements ReplHandler {
   }
 
   async run(): Promise<void> {
-    this.#renderer.header(this.#inspection);
+    this.#renderer.header(this.#inspection, this.#session);
     await this.#offerRecovery();
     await new AgencyRepl(this.#io, this).run();
   }
@@ -231,8 +233,12 @@ export class AgencyApplication implements ReplHandler {
       try {
         return await this.#commands.execute(line, signal);
       } catch (error) {
-        if (signal.aborted) this.#renderer.message("Cancelled.");
-        else this.#renderer.error(error instanceof Error ? error.message : String(error));
+        if (signal.aborted) {
+          this.#renderer.setRunStatus("cancelled");
+          this.#renderer.message("Cancelled.");
+        } else {
+          this.#renderer.error(error instanceof Error ? error.message : String(error));
+        }
         return "continue";
       }
     }
@@ -242,6 +248,7 @@ export class AgencyApplication implements ReplHandler {
     this.#session = sessionContext;
     const runId = this.#createId();
     const threadId = this.#createId();
+    this.#renderer.setRunStatus("running");
     try {
       let state = await this.#graph.invoke(
         {
@@ -255,24 +262,39 @@ export class AgencyApplication implements ReplHandler {
         { threadId, signal },
       );
       if (signal.aborted) {
+        this.#renderer.setRunStatus("cancelled");
         this.#renderer.message("Cancelled.");
         return "continue";
       }
       state = await this.#resolveHumanInput(state, signal);
       if (signal.aborted) {
+        this.#renderer.setRunStatus("cancelled");
         this.#renderer.message("Cancelled.");
         return "continue";
       }
       await this.#handleTerminalRun(state);
     } catch (error) {
-      if (signal.aborted) this.#renderer.message("Cancelled.");
-      else this.#renderer.error(error instanceof Error ? error.message : String(error));
+      if (signal.aborted) {
+        this.#renderer.setRunStatus("cancelled");
+        this.#renderer.message("Cancelled.");
+      } else {
+        this.#renderer.setRunStatus("failed");
+        this.#renderer.error(error instanceof Error ? error.message : String(error));
+      }
     }
     return "continue";
   }
 
   async interruptActive(): Promise<void> {
     await this.#runtime.abort();
+  }
+
+  beforeInput(): void {
+    this.#renderer.beforeInput();
+  }
+
+  redraw(): void {
+    this.#renderer.redraw();
   }
 
   async dispose(): Promise<void> {
@@ -334,7 +356,11 @@ export class AgencyApplication implements ReplHandler {
       if (pendingRequest !== null) {
         activeController = new AbortController();
         const response = await this.#promptHumanDecision(pendingRequest, activeController.signal);
-        if (response === null || activeController.signal.aborted) return;
+        if (response === null || activeController.signal.aborted) {
+          this.#renderer.setRunStatus(activeController.signal.aborted ? "cancelled" : "idle");
+          return;
+        }
+        this.#renderer.setRunStatus("running");
         let state = await this.#graph.resume(
           candidate.entry.threadId,
           response,
@@ -342,6 +368,7 @@ export class AgencyApplication implements ReplHandler {
         );
         state = await this.#resolveHumanInput(state, activeController.signal);
         if (activeController.signal.aborted) {
+          this.#renderer.setRunStatus("cancelled");
           this.#renderer.message("Cancelled.");
           return;
         }
@@ -350,26 +377,39 @@ export class AgencyApplication implements ReplHandler {
       }
 
       while (true) {
+        this.#renderer.beforeInput();
         const answer = await this.#io.readLine(
           `Resume incomplete task “${candidate.entry.userIntent}”? [r/n] `,
         );
-        if (answer === null) return;
+        if (answer === null) {
+          this.#renderer.setRunStatus("idle");
+          return;
+        }
         const normalized = answer.trim().toLowerCase();
         if (normalized === "r") {
           activeController = new AbortController();
+          this.#renderer.setRunStatus("running");
           let state = await this.#graph.resume(candidate.entry.threadId, undefined, {
             signal: activeController.signal,
           });
           if (activeController.signal.aborted) {
+            this.#renderer.setRunStatus("cancelled");
             this.#renderer.message("Cancelled.");
             return;
           }
           state = await this.#resolveHumanInput(state, activeController.signal);
+          if (activeController.signal.aborted) {
+            this.#renderer.setRunStatus("cancelled");
+            this.#renderer.message("Cancelled.");
+            return;
+          }
           await this.#handleTerminalRun(state);
           return;
         }
         if (normalized === "n") {
           this.#session = await this.#sessionStore.createNew();
+          this.#renderer.setSession(this.#session);
+          this.#renderer.setRunStatus("idle");
           this.#renderer.recovery(
             `Started session ${this.#session.sessionId}; recovery record ${candidate.entry.runId} was preserved.`,
           );
@@ -377,6 +417,13 @@ export class AgencyApplication implements ReplHandler {
         }
         this.#renderer.message("Enter r to resume or n to start a fresh session.");
       }
+    } catch (error) {
+      if (activeController?.signal.aborted === true) {
+        this.#renderer.setRunStatus("cancelled");
+        this.#renderer.message("Cancelled.");
+        return;
+      }
+      throw error;
     } finally {
       detachInterrupt();
     }
@@ -408,6 +455,7 @@ export class AgencyApplication implements ReplHandler {
     request: HumanDecisionRequest,
     signal: AbortSignal,
   ): Promise<HumanDecisionResponse | null> {
+    this.#renderer.setRunStatus("waiting");
     this.#renderer.message(request.question);
     if (request.context !== undefined) this.#renderer.message(`Context: ${request.context}`);
     if (request.risk !== undefined) this.#renderer.message(`Risk: ${request.risk}`);
@@ -426,7 +474,10 @@ export class AgencyApplication implements ReplHandler {
           : "Choose an option number or enter a custom response: ",
         signal,
       );
-      if (answer === null) return null;
+      if (answer === null) {
+        this.#renderer.setRunStatus(signal.aborted ? "cancelled" : "idle");
+        return null;
+      }
       const value = answer.trim();
       const shortcut = request.kind === "approval"
         ? ({ a: "approve", r: "reject", e: "edit" } as Record<string, string>)[value.toLowerCase()]
@@ -437,16 +488,22 @@ export class AgencyApplication implements ReplHandler {
       )?.id;
       if (optionId === "edit") {
         const edited = await this.#readLineUntilAbort("Edited instruction: ", signal);
-        if (edited === null) return null;
+        if (edited === null) {
+          this.#renderer.setRunStatus(signal.aborted ? "cancelled" : "idle");
+          return null;
+        }
         if (edited.trim() !== "" && request.allowCustom) {
+          this.#renderer.setRunStatus("running");
           return HumanDecisionResponseSchema.forRequest(request).parse({
             requestId: request.id,
             customText: edited.trim(),
           });
         }
       } else if (optionId !== undefined) {
+        this.#renderer.setRunStatus("running");
         return HumanDecisionResponseSchema.forRequest(request).parse({ requestId: request.id, optionId });
       } else if (value !== "" && request.allowCustom) {
+        this.#renderer.setRunStatus("running");
         return HumanDecisionResponseSchema.forRequest(request).parse({
           requestId: request.id,
           customText: value,
@@ -457,7 +514,11 @@ export class AgencyApplication implements ReplHandler {
   }
 
   async #readLineUntilAbort(prompt: string, signal: AbortSignal): Promise<string | null> {
-    if (signal.aborted) return null;
+    if (signal.aborted) {
+      this.#renderer.setRunStatus("cancelled");
+      return null;
+    }
+    this.#renderer.beforeInput();
     return this.#io.readLine(prompt, { signal });
   }
 

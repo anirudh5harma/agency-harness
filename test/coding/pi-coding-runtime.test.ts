@@ -67,6 +67,32 @@ function assistantMessage(content: string): AgentSessionEvent {
   } as AgentSessionEvent;
 }
 
+function assistantTextDelta(delta: string, contentIndex = 0): AgentSessionEvent {
+  return {
+    type: "message_update",
+    message: { role: "assistant", content: [] },
+    assistantMessageEvent: {
+      type: "text_delta",
+      contentIndex,
+      delta,
+      partial: { role: "assistant", content: [] },
+    },
+  } as AgentSessionEvent;
+}
+
+function assistantThinkingDelta(delta: string): AgentSessionEvent {
+  return {
+    type: "message_update",
+    message: { role: "assistant", content: [] },
+    assistantMessageEvent: {
+      type: "thinking_delta",
+      contentIndex: 0,
+      delta,
+      partial: { role: "assistant", content: [] },
+    },
+  } as AgentSessionEvent;
+}
+
 function providerErrorMessage(errorMessage: string): Extract<AgentSessionEvent, { type: "message_end" }> {
   const event = assistantMessage("hidden provider response") as Extract<
     AgentSessionEvent,
@@ -625,6 +651,34 @@ describe("PiCodingRuntime", () => {
     expect(boundary.sessions[0]?.prompts[1]?.length).toBeLessThan(10_000);
   });
 
+  it("streams assistant text while returning the final message without duplicating it", async () => {
+    const boundary = createBoundary({
+      executorPrompt: async (session) => {
+        session.emit(assistantTextDelta("Implemented "));
+        session.emit(assistantTextDelta("safely."));
+        session.emit(assistantMessage("Implemented safely."));
+      },
+    });
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    const events: AgencyEvent[] = [];
+
+    const result = await runtime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-stream",
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(result).toMatchObject({ message: "Implemented safely." });
+    expect(events.filter(({ type }) => type === "assistant_text_delta")).toEqual([
+      { type: "assistant_text_delta", delta: "Implemented ", done: false },
+      { type: "assistant_text_delta", delta: "safely.", done: false },
+      { type: "assistant_text_delta", delta: "", done: true },
+    ]);
+    expect(events).not.toContainEqual({ type: "message", content: "Implemented safely." });
+  });
+
   it("isolates executor sessions by Agency session while reusing execute-to-repair", async () => {
     const boundary = createBoundary({});
     const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
@@ -935,5 +989,129 @@ describe("normalizePiEvent", () => {
     expect(JSON.stringify(events)).not.toContain("bearer-secret");
     expect(JSON.stringify(events)).not.toContain("hunter2");
     expect(JSON.stringify(events)).not.toContain("sk-secret123");
+  });
+
+  it("streams only text deltas and flushes at message end", () => {
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+
+    expect(normalizePiEvent(assistantThinkingDelta("private chain of thought"), state)).toEqual([]);
+    expect(normalizePiEvent(assistantTextDelta("Visible "), state)).toEqual([
+      { type: "assistant_text_delta", delta: "Visible ", done: false },
+    ]);
+    expect(normalizePiEvent(assistantTextDelta("answer"), state)).toEqual([
+      { type: "assistant_text_delta", delta: "answer", done: false },
+    ]);
+    expect(normalizePiEvent(assistantMessage("Visible answer"), state)).toEqual([
+      { type: "assistant_text_delta", delta: "", done: true },
+    ]);
+  });
+
+  it.each([
+    [["Key: s", "k-secret123", " done"], "Key: [REDACTED] done"],
+    [["Auth: Bear", "er bearer-secret", "\nnext"], "Auth: Bearer [REDACTED]\nnext"],
+    [["token=", "hunter", "2 done"], "token=[REDACTED] done"],
+  ])("redacts secrets split across assistant deltas", (parts, expected) => {
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    const events = parts.flatMap((part) => normalizePiEvent(assistantTextDelta(part), state));
+    events.push(...normalizePiEvent(assistantMessage(parts.join("")), state));
+    const rendered = events
+      .filter((event): event is Extract<AgencyEvent, { type: "assistant_text_delta" }> =>
+        event.type === "assistant_text_delta",
+      )
+      .map(({ delta }) => delta)
+      .join("");
+
+    expect(rendered).toBe(expected);
+    expect(rendered).not.toContain("secret123");
+    expect(rendered).not.toContain("bearer-secret");
+    expect(rendered).not.toContain("hunter2");
+  });
+
+  it("keeps assignment values sensitive across whitespace and escaped quote chunks", () => {
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    const events = [
+      ...normalizePiEvent(assistantTextDelta("token="), state),
+      ...normalizePiEvent(assistantTextDelta(`${" ".repeat(1_024)}"sec\\`), state),
+      ...normalizePiEvent(assistantTextDelta("\"ret\" done"), state),
+      ...normalizePiEvent(assistantMessage("token=   \"sec\\\"ret\" done"), state),
+    ];
+    const rendered = events
+      .filter((event): event is Extract<AgencyEvent, { type: "assistant_text_delta" }> =>
+        event.type === "assistant_text_delta",
+      )
+      .map(({ delta }) => delta)
+      .join("");
+
+    expect(rendered).toBe("token=[REDACTED] done");
+    expect(rendered).not.toContain("sec");
+    expect(rendered).not.toContain("ret");
+  });
+
+  it("inserts final-assembly newlines between streamed text content blocks", () => {
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    const events = [
+      ...normalizePiEvent(assistantTextDelta("First block", 0), state),
+      ...normalizePiEvent(assistantTextDelta("Second block", 2), state),
+      ...normalizePiEvent(assistantMessage("First block\nSecond block"), state),
+    ];
+
+    expect(events).toEqual([
+      { type: "assistant_text_delta", delta: "First block", done: false },
+      { type: "assistant_text_delta", delta: "\nSecond block", done: false },
+      { type: "assistant_text_delta", delta: "", done: true },
+    ]);
+
+    expect(normalizePiEvent(assistantTextDelta("Next message", 7), state)).toEqual([
+      { type: "assistant_text_delta", delta: "Next message", done: false },
+    ]);
+  });
+
+  it("caps normalized stream chunks and marks only the final flush slice done", () => {
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    const text = "x".repeat(65_541);
+    const deltas = normalizePiEvent(assistantTextDelta(text), state);
+    const end = normalizePiEvent(assistantMessage(text), state);
+
+    expect(deltas.map((event) => event.type === "assistant_text_delta" && [event.delta.length, event.done]))
+      .toEqual([[65_536, false], [5, false]]);
+    expect(end).toEqual([{ type: "assistant_text_delta", delta: "", done: true }]);
+
+    const pendingState = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    expect(normalizePiEvent(assistantTextDelta("ending s"), pendingState)).toEqual([
+      { type: "assistant_text_delta", delta: "ending ", done: false },
+    ]);
+    expect(normalizePiEvent(assistantMessage("ending s"), pendingState)).toEqual([
+      { type: "assistant_text_delta", delta: "s", done: true },
+    ]);
   });
 });

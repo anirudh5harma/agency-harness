@@ -306,6 +306,13 @@ export const AgencyEventSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({ type: z.literal("message"), content: NonEmptyStringSchema }),
   z.strictObject({
+    type: z.literal("assistant_text_delta"),
+    delta: z.string().max(65_536),
+    done: z.boolean(),
+  }).refine(({ delta, done }) => done || delta.length > 0, {
+    message: "assistant text deltas must contain text unless ending the message",
+  }),
+  z.strictObject({
     type: z.literal("context_compacted"),
     beforeTurns: z.number().int().nonnegative(),
     afterTurns: z.number().int().nonnegative(),

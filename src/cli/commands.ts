@@ -95,6 +95,7 @@ export class SlashCommandRouter {
             "  /compact Compact older session context",
             "  /diff    Show the current Git diff",
             "  /verify  Run project verification",
+            "  /tools   Collapse or expand tool activity (TTY)",
             "  /new     Start a fresh conversational session",
             "  /exit    Exit Agency",
           ].join("\n"),
@@ -133,6 +134,9 @@ export class SlashCommandRouter {
         );
         return "continue";
       }
+      case "/tools":
+        this.#dependencies.renderer.toggleToolActivity();
+        return "continue";
       case "/new": {
         const session = await this.#dependencies.createNewSession();
         this.#dependencies.renderer.message(`New session: ${session.sessionId}`);

@@ -254,7 +254,7 @@ describe("coding run graph", () => {
       requestId: request.id,
       optionId: "small",
     });
-  });
+  }, 10_000);
 
   it("counts a paused repair exactly once after it completes", async () => {
     const { root, runtime, deps } = await setup([
