@@ -1,28 +1,26 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { ProjectKnowledgeEntrySchema, ProjectKnowledgeSchema, type ProjectKnowledge, type ProjectKnowledgeEntry } from "../domain/index.js";
+import {
+  projectKnowledgeKey,
+  ProjectKnowledgeEntrySchema,
+  ProjectKnowledgeSchema,
+  type ProjectKnowledge,
+  type ProjectKnowledgeEntry,
+} from "../domain/index.js";
 import { InfrastructureError } from "../process/index.js";
+import { isMissingFile } from "./json-file.js";
 
 const MAX_FILE_BYTES = 64 * 1024;
 const MAX_ENTRIES = 100;
 const categories = ["architecture", "decision", "learning"] as const;
 const titles = { architecture: "Architecture", decision: "Decisions", learning: "Learnings" };
 const filename = (category: typeof categories[number]) => category === "architecture" ? "architecture.md" : `${category}s.md`;
-const missing = (error: unknown) => error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
-const key = (entry: ProjectKnowledgeEntry) => `${entry.category}:${entry.text.toLocaleLowerCase()}`;
 
 function renderFile(category: typeof categories[number], entries: readonly ProjectKnowledgeEntry[]): string {
   const body = entries.map(({ text }) => `- ${text}`).join("\n");
   return `# ${titles[category]}\n\n${body}${body === "" ? "" : "\n"}`;
-}
-
-function renderContext(entries: readonly ProjectKnowledgeEntry[]): string {
-  if (entries.length === 0) return "None.";
-  return categories.map((category) => {
-    const lines = entries.filter((entry) => entry.category === category).map(({ text }) => `- ${text}`);
-    return lines.length === 0 ? "" : `${titles[category]}:\n${lines.join("\n")}`;
-  }).filter(Boolean).join("\n\n").slice(0, 12_000);
 }
 
 function parseFile(category: typeof categories[number], path: string, contents: string): ProjectKnowledgeEntry[] {
@@ -45,6 +43,30 @@ function parseFile(category: typeof categories[number], path: string, contents: 
     return bullets.map((line) => ProjectKnowledgeEntrySchema.parse({ category, text: line.slice(2) }));
   } catch (cause) {
     throw new InfrastructureError("METADATA_INVALID", `Invalid project knowledge at ${path}`, { cause });
+  }
+}
+
+async function readBoundedFile(path: string): Promise<string | null> {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (cause) {
+    if (isMissingFile(cause)) return null;
+    if (cause instanceof Error && "code" in cause && (cause as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new InfrastructureError("METADATA_INVALID", `Project knowledge file must not be a symbolic link: ${path}`, { cause });
+    }
+    throw new InfrastructureError("METADATA_READ_FAILED", `Could not read project knowledge at ${path}`, { cause });
+  }
+  try {
+    if ((await handle.stat()).size > MAX_FILE_BYTES) {
+      throw new InfrastructureError("METADATA_INVALID", `Invalid project knowledge at ${path}`);
+    }
+    return await handle.readFile("utf8");
+  } catch (cause) {
+    if (cause instanceof InfrastructureError) throw cause;
+    throw new InfrastructureError("METADATA_READ_FAILED", `Could not read project knowledge at ${path}`, { cause });
+  } finally {
+    await handle.close();
   }
 }
 
@@ -78,7 +100,7 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
           if (target !== this.#root && !target.startsWith(`${this.#root}${sep}`)) throw new InfrastructureError("METADATA_INVALID", "Knowledge path escapes the repository");
         }
       } catch (error) {
-        if (!missing(error)) throw error;
+        if (!isMissingFile(error)) throw error;
       }
     }
   }
@@ -90,17 +112,13 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
       const path = join(this.directory, filename(category));
       try {
         if ((await lstat(path)).isSymbolicLink()) throw new InfrastructureError("METADATA_INVALID", `Project knowledge file must not be a symbolic link: ${path}`);
-      } catch (error) { if (!missing(error)) throw error; }
-      let contents: string;
-      try { contents = await readFile(path, "utf8"); }
-      catch (cause) {
-        if (missing(cause)) continue;
-        throw new InfrastructureError("METADATA_READ_FAILED", `Could not read project knowledge at ${path}`, { cause });
-      }
+      } catch (error) { if (!isMissingFile(error)) throw error; }
+      const contents = await readBoundedFile(path);
+      if (contents === null) continue;
       entries.push(...parseFile(category, path, contents));
     }
-    const deduped = [...new Map(entries.map((entry) => [key(entry), entry])).values()];
-    return ProjectKnowledgeSchema.parse({ entries: deduped, renderedContext: renderContext(deduped) });
+    const deduped = [...new Map(entries.map((entry) => [projectKnowledgeKey(entry), entry])).values()];
+    return ProjectKnowledgeSchema.parse({ entries: deduped });
   }
 
   async append(proposals: readonly ProjectKnowledgeEntry[]): Promise<ProjectKnowledge> {
@@ -112,8 +130,9 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
   async #append(proposals: readonly ProjectKnowledgeEntry[]): Promise<ProjectKnowledge> {
     const current = await this.load();
     const parsed = proposals.map((entry) => ProjectKnowledgeEntrySchema.parse(entry));
-    const merged = [...new Map([...current.entries, ...parsed].map((entry) => [key(entry), entry])).values()];
+    const merged = [...new Map([...current.entries, ...parsed].map((entry) => [projectKnowledgeKey(entry), entry])).values()];
     if (categories.some((category) => merged.filter((entry) => entry.category === category).length > MAX_ENTRIES)) throw new InfrastructureError("METADATA_WRITE_FAILED", "Project knowledge exceeds bounded entry count");
+    if (merged.length === current.entries.length) return current;
     await this.#assertContained();
     const temporaryPaths = new Set<string>();
     const replacements: Array<{
@@ -128,16 +147,12 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
         const path = join(this.directory, filename(category));
         try {
           if ((await lstat(path)).isSymbolicLink()) throw new InfrastructureError("METADATA_INVALID", `Project knowledge file must not be a symbolic link: ${path}`);
-        } catch (error) { if (!missing(error)) throw error; }
-        let original: string | null;
-        try { original = await readFile(path, "utf8"); }
-        catch (error) {
-          if (!missing(error)) throw error;
-          original = null;
-        }
+        } catch (error) { if (!isMissingFile(error)) throw error; }
+        const original = await readBoundedFile(path);
+        const contents = renderFile(category, merged.filter((entry) => entry.category === category));
+        if (original === contents) continue;
         const temporary = join(this.directory, `.${basename(path)}.${randomUUID()}.tmp`);
         temporaryPaths.add(temporary);
-        const contents = renderFile(category, merged.filter((entry) => entry.category === category));
         await writeFile(temporary, contents, { flag: "wx" });
         const written = await readFile(temporary, "utf8");
         parseFile(category, temporary, written);
@@ -147,7 +162,7 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
       for (const replacement of replacements) {
         try {
           if ((await lstat(replacement.path)).isSymbolicLink()) throw new InfrastructureError("METADATA_INVALID", `Project knowledge file must not be a symbolic link: ${replacement.path}`);
-        } catch (error) { if (!missing(error)) throw error; }
+        } catch (error) { if (!isMissingFile(error)) throw error; }
         await this.#rename(replacement.temporary, replacement.path);
         temporaryPaths.delete(replacement.temporary);
         replaced.push(replacement);
@@ -169,7 +184,7 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
           rollbackCause ??= error;
         }
       }
-      await Promise.all([...temporaryPaths].map((path) => rm(path, { force: true }).catch(() => undefined)));
+      await Promise.allSettled([...temporaryPaths].map((path) => rm(path, { force: true })));
       if (cause instanceof InfrastructureError && rollbackCause === undefined) throw cause;
       throw new InfrastructureError(
         "METADATA_WRITE_FAILED",
@@ -179,6 +194,6 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
         { cause: rollbackCause ?? cause },
       );
     }
-    return ProjectKnowledgeSchema.parse({ entries: merged, renderedContext: renderContext(merged) });
+    return ProjectKnowledgeSchema.parse({ entries: merged });
   }
 }

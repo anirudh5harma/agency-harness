@@ -35,7 +35,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function checkpointValues(snapshot: unknown): Record<string, unknown> | null {
+export function checkpointValues(snapshot: unknown): Record<string, unknown> | null {
   if (!isRecord(snapshot) || !isRecord(snapshot.values)) return null;
   return Object.keys(snapshot.values).length === 0 ? null : snapshot.values;
 }

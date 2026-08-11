@@ -22,6 +22,7 @@ import {
 } from "../observability/index.js";
 import {
   createSqliteCheckpointPersistence,
+  checkpointValues,
   IncompleteRunRegistry,
   inspectIncompleteRunRecovery,
   type IncompleteRunRecoveryInspection,
@@ -262,11 +263,7 @@ export class AgencyApplication implements ReplHandler {
         this.#renderer.message("Cancelled.");
         return "continue";
       }
-      await this.#recordTerminalState(state);
-      if (state.pendingHumanDecision == null) this.#renderer.run(state);
-      if (state.pendingHumanDecision == null && state.failure?.stage !== "finalizing") {
-        await this.#pruneTerminalCheckpoint(state.threadId);
-      }
+      await this.#handleTerminalRun(state);
     } catch (error) {
       if (signal.aborted) this.#renderer.message("Cancelled.");
       else this.#renderer.error(error instanceof Error ? error.message : String(error));
@@ -348,11 +345,7 @@ export class AgencyApplication implements ReplHandler {
           this.#renderer.message("Cancelled.");
           return;
         }
-        await this.#recordTerminalState(state);
-        if (state.pendingHumanDecision == null) this.#renderer.run(state);
-        if (state.pendingHumanDecision == null && state.failure?.stage !== "finalizing") {
-          await this.#pruneTerminalCheckpoint(state.threadId);
-        }
+        await this.#handleTerminalRun(state);
         return;
       }
 
@@ -372,11 +365,7 @@ export class AgencyApplication implements ReplHandler {
             return;
           }
           state = await this.#resolveHumanInput(state, activeController.signal);
-          await this.#recordTerminalState(state);
-          if (state.pendingHumanDecision == null) this.#renderer.run(state);
-          if (state.pendingHumanDecision == null && state.failure?.stage !== "finalizing") {
-            await this.#pruneTerminalCheckpoint(state.threadId);
-          }
+          await this.#handleTerminalRun(state);
           return;
         }
         if (normalized === "n") {
@@ -394,11 +383,10 @@ export class AgencyApplication implements ReplHandler {
   }
 
   #pendingRequest(snapshot: unknown): HumanDecisionRequest | null {
-    if (typeof snapshot !== "object" || snapshot === null || !("values" in snapshot)) return null;
-    const values = (snapshot as { values?: unknown }).values;
-    if (typeof values !== "object" || values === null || !("pendingHumanDecision" in values)) return null;
+    const values = checkpointValues(snapshot);
+    if (values === null) return null;
     const parsed = HumanDecisionRequestSchema.safeParse(
-      (values as { pendingHumanDecision?: unknown }).pendingHumanDecision,
+      values.pendingHumanDecision,
     );
     return parsed.success ? parsed.data : null;
   }
@@ -489,6 +477,15 @@ export class AgencyApplication implements ReplHandler {
       ...(state.verification === null ? {} : { verification: state.verification }),
       changedFiles: state.changedFiles,
     });
+  }
+
+  async #handleTerminalRun(state: CodingRunState): Promise<void> {
+    await this.#recordTerminalState(state);
+    if (state.pendingHumanDecision != null) return;
+    this.#renderer.run(state);
+    if (state.failure?.stage !== "finalizing") {
+      await this.#pruneTerminalCheckpoint(state.threadId);
+    }
   }
 
   async #pruneTerminalCheckpoint(threadId: string): Promise<void> {

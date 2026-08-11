@@ -7,7 +7,9 @@ import {
   HumanDecisionRequestSchema,
   HumanDecisionResponseSchema,
   PlanSchema,
+  projectKnowledgeKey,
   ProjectKnowledgeEntrySchema,
+  renderProjectKnowledge,
   RepoContextSchema,
   SessionContextSchema,
   VerificationResultSchema,
@@ -20,6 +22,18 @@ describe("project knowledge contracts", () => {
     for (const text of ["one\ntwo", "one\rtwo", "one\r\ntwo"]) {
       expect(() => ProjectKnowledgeEntrySchema.parse({ category: "learning", text })).toThrow();
     }
+  });
+
+  it("renders and keys validated entries from the entries source of truth", () => {
+    const entries = [
+      { category: "architecture" as const, text: "The graph owns verification." },
+      { category: "decision" as const, text: "Keep checkpoints local." },
+    ];
+    expect(projectKnowledgeKey(entries[0]!)).toBe("architecture:the graph owns verification.");
+    expect(renderProjectKnowledge(entries)).toBe(
+      "Architecture:\n- The graph owns verification.\n\nDecisions:\n- Keep checkpoints local.",
+    );
+    expect(renderProjectKnowledge([])).toBe("None.");
   });
 });
 

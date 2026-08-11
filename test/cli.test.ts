@@ -245,7 +245,6 @@ describe("Agency terminal application", () => {
       status: "executing",
       codingPlan: plan,
       pendingHumanDecision: request,
-      humanDecisionOrigin: "executing",
     });
     const listeners = new Set<() => void>();
     let reads = 0;
@@ -436,13 +435,11 @@ describe("Agency terminal application", () => {
         { name: "test", command: "npm", args: ["run", "test"], required: true },
       ],
       pendingHumanDecision: request,
-      humanDecisionOrigin: "executing",
     });
     const completed = {
       ...interrupted,
       status: "completed" as const,
       pendingHumanDecision: null,
-      humanDecisionOrigin: null,
       verification: { status: "passed" as const, summary: "tests passed", commands: [] },
       summary: "migration guidance applied",
     };

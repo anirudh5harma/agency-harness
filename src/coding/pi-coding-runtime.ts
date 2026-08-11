@@ -20,6 +20,8 @@ import {
   HumanDecisionRequestSchema,
   PlanSchema,
   ProjectKnowledgeEntrySchema,
+  redactSecrets,
+  renderProjectKnowledge,
   type AgencyEvent,
   type FailureContext,
   type HumanDecisionRequest,
@@ -60,8 +62,11 @@ export interface PiSession {
   dispose(): void;
 }
 
+const exclusiveHumanRequestAgents = new WeakSet<NonNullable<PiSession["agent"]>>();
+
 function enforceExclusiveHumanRequest(session: PiSession): void {
   if (session.agent === undefined) return;
+  if (exclusiveHumanRequestAgents.has(session.agent)) return;
   const previous = session.agent.beforeToolCall;
   session.agent.beforeToolCall = async (context, signal) => {
     const hasHumanRequest = context.assistantMessage.content.some(
@@ -76,6 +81,7 @@ function enforceExclusiveHumanRequest(session: PiSession): void {
     }
     return previous?.(context, signal);
   };
+  exclusiveHumanRequestAgents.add(session.agent);
 }
 
 function sessionDirectory(repo: RepoContext, role: RuntimeContinuation["role"]): string {
@@ -107,7 +113,6 @@ type PiBashToolDefinition = ReturnType<typeof createBashToolDefinition>;
 
 export interface PiSdkBoundary {
   createModelRuntime(): Promise<ModelRuntime>;
-  inMemorySessionManager(cwd: string): SessionManager;
   createSessionManager(cwd: string, sessionDir: string): SessionManager;
   openSessionManager(cwd: string, sessionDir: string, sessionFile: string): SessionManager;
   createResourceLoader(cwd: string): Promise<ResourceLoader>;
@@ -135,7 +140,6 @@ export async function createSafeResourceLoader(cwd: string): Promise<ResourceLoa
 
 const defaultSdk: PiSdkBoundary = {
   createModelRuntime: () => ModelRuntime.create(),
-  inMemorySessionManager: (cwd) => SessionManager.inMemory(cwd),
   createSessionManager: (cwd, sessionDir) => SessionManager.create(cwd, sessionDir),
   openSessionManager: (cwd, sessionDir, sessionFile) =>
     SessionManager.open(sessionFile, sessionDir, cwd),
@@ -283,18 +287,8 @@ export interface PiEventState {
   providerError: string | undefined;
 }
 
-function redactSensitiveText(value: string): string {
-  return value
-      .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
-      .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gi, "[REDACTED]")
-      .replace(
-        /(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,
-        "$1[REDACTED]",
-      );
-}
-
 function sanitizeProviderError(value: string): string {
-  return concise(redactSensitiveText(value), MAX_PROVIDER_ERROR_CHARS);
+  return concise(redactSecrets(value), MAX_PROVIDER_ERROR_CHARS);
 }
 
 function knownPublicPiError(error: unknown): string | undefined {
@@ -321,7 +315,7 @@ function recordAssistantMessage(
     )
     .map((content) => content.text)
     .join("\n");
-  if (text.trim() !== "") state.finalMessage = concise(redactSensitiveText(text));
+  if (text.trim() !== "") state.finalMessage = concise(redactSecrets(text));
 }
 
 function recordMessages(event: AgentSessionEvent, state: PiEventState): void {
@@ -350,12 +344,12 @@ export function normalizePiEvent(
 
   if (event.type === "tool_execution_start") {
     const rawCommand = event.toolName === "bash" ? stringProperty(event.args, "command") : undefined;
-    const command = rawCommand === undefined ? undefined : redactSensitiveText(rawCommand);
+    const command = rawCommand === undefined ? undefined : redactSecrets(rawCommand);
     const rawPath =
       event.toolName === "edit" || event.toolName === "write"
         ? stringProperty(event.args, "path")
         : undefined;
-    const path = rawPath === undefined ? undefined : redactSensitiveText(rawPath);
+    const path = rawPath === undefined ? undefined : redactSecrets(rawPath);
     state.calls.set(event.toolCallId, {
       toolName: event.toolName,
       startedAt: now,
@@ -427,8 +421,8 @@ function sessionSummary(context: SessionContext | undefined): string {
   ].join("\n");
 }
 
-function knowledgeSummary(input: { projectKnowledge?: { renderedContext: string } }): string {
-  return input.projectKnowledge?.renderedContext ?? "None.";
+function knowledgeSummary(input: { projectKnowledge?: { entries: readonly ProjectKnowledgeEntry[] } }): string {
+  return renderProjectKnowledge(input.projectKnowledge?.entries ?? []);
 }
 
 function repositoryInstructions(input: { repoInstructions?: string }): string {
@@ -678,14 +672,14 @@ function emit(sink: CodingEventSink | undefined, event: AgencyEvent): void {
     switch (event.type) {
       case "tool": return {
         ...event,
-        tool: redactSensitiveText(event.tool),
-        ...(event.detail === undefined ? {} : { detail: redactSensitiveText(event.detail) }),
+        tool: redactSecrets(event.tool),
+        ...(event.detail === undefined ? {} : { detail: redactSecrets(event.detail) }),
       };
-      case "file_changed": return { ...event, path: redactSensitiveText(event.path) };
+      case "file_changed": return { ...event, path: redactSecrets(event.path) };
       case "command_started":
-      case "command_finished": return { ...event, command: redactSensitiveText(event.command) };
-      case "message": return { ...event, content: redactSensitiveText(event.content) };
-      case "error": return { ...event, message: redactSensitiveText(event.message) };
+      case "command_finished": return { ...event, command: redactSecrets(event.command) };
+      case "message": return { ...event, content: redactSecrets(event.content) };
+      case "error": return { ...event, message: redactSecrets(event.message) };
       default: return event;
     }
   })();
@@ -937,6 +931,7 @@ export class PiCodingRuntime implements CodingRuntime {
       this.#activeSessions.delete(session);
       this.#humanRequestHandlers.delete(executorKey);
       this.#knowledgeHandlers.delete(executorKey);
+      this.#approvedActions.delete(executorKey);
     }
   }
 

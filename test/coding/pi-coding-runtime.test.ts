@@ -125,7 +125,6 @@ function createBoundary(options: {
   const sessions: StubSession[] = [];
   const submitResults: unknown[] = [];
   const modelRuntime = { runtime: true };
-  const inMemoryManager = { manager: "memory" };
   const persistentManager = { manager: "persistent" };
   const resourceLoader = { loader: "safe" };
   const bashTool: ToolDefinition = {
@@ -139,7 +138,6 @@ function createBoundary(options: {
   };
   const sdk: PiSdkBoundary = {
     createModelRuntime: vi.fn(async () => modelRuntime as never),
-    inMemorySessionManager: vi.fn(() => inMemoryManager as never),
     createSessionManager: vi.fn(() => persistentManager as never),
     openSessionManager: vi.fn(() => persistentManager as never),
     createResourceLoader: vi.fn(async () => resourceLoader as never),
@@ -190,7 +188,6 @@ function createBoundary(options: {
     sessions,
     submitResults,
     modelRuntime,
-    inMemoryManager,
     persistentManager,
     resourceLoader,
   };
@@ -225,7 +222,6 @@ describe("PiCodingRuntime", () => {
       },
       projectKnowledge: {
         entries: [{ category: "architecture", text: "The graph owns verification." }],
-        renderedContext: "Architecture:\n- The graph owns verification.",
       },
     });
     expect(result).toMatchObject({ proposedKnowledge: [{ category: "architecture", text: "token=[REDACTED]" }] });
@@ -265,6 +261,7 @@ describe("PiCodingRuntime", () => {
       sessionId: "agency-1",
     });
     expect(paused).toMatchObject({ decisionRequest: { id: "storage-choice" } });
+    const humanRequestHook = boundary.sessions[0]?.agent.beforeToolCall;
 
     await expect(runtime.createPlan({
       intent: "Build",
@@ -277,6 +274,7 @@ describe("PiCodingRuntime", () => {
     })).resolves.toEqual({ plan, message: "Plan ready for execution." });
 
     expect(boundary.sessions).toHaveLength(1);
+    expect(boundary.sessions[0]?.agent.beforeToolCall).toBe(humanRequestHook);
     expect(boundary.sessions[0]?.prompts[1]).toContain('"optionId":"sqlite"');
     expect(boundary.sessions[0]?.dispose).toHaveBeenCalledOnce();
   });

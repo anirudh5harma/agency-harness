@@ -13,11 +13,12 @@ describe("ProjectKnowledgeStore", () => {
   it("treats missing files as empty and creates human-editable Markdown on first append", async () => {
     const project = await root();
     const store = new ProjectKnowledgeStore(project);
-    await expect(store.load()).resolves.toMatchObject({ entries: [], renderedContext: "None." });
+    await expect(store.load()).resolves.toMatchObject({ entries: [] });
     await store.append([{ category: "architecture", text: "Commands route through the graph." }]);
     expect(await readFile(join(project, ".devagency/knowledge/architecture.md"), "utf8"))
       .toBe("# Architecture\n\n- Commands route through the graph.\n");
     await expect(readFile(join(project, ".devagency/knowledge/decisions.md"), "utf8")).resolves.toBe("# Decisions\n\n");
+    await expect(readFile(join(project, ".devagency/knowledge/learnings.md"), "utf8")).resolves.toBe("# Learnings\n\n");
   });
 
   it("loads human edits, deduplicates, and redacts secrets", async () => {
@@ -30,9 +31,9 @@ describe("ProjectKnowledgeStore", () => {
       { category: "learning", text: "Bearer hidden-token must not leak" },
     ]);
     expect(result.entries.filter(({ category }) => category === "decision")).toHaveLength(1);
-    expect(result.renderedContext).not.toContain("supersecret");
-    expect(result.renderedContext).not.toContain("hidden-token");
-    expect(result.renderedContext).toContain("[REDACTED]");
+    expect(result.entries).not.toContainEqual(expect.objectContaining({ text: expect.stringContaining("supersecret") }));
+    expect(result.entries).not.toContainEqual(expect.objectContaining({ text: expect.stringContaining("hidden-token") }));
+    expect(result.entries).toContainEqual(expect.objectContaining({ text: expect.stringContaining("[REDACTED]") }));
   });
 
   it("rejects a multiline proposal without creating or poisoning extra entries", async () => {
@@ -131,6 +132,38 @@ describe("ProjectKnowledgeStore", () => {
         { category: "decision", text: "First concurrent fact." },
         { category: "decision", text: "Second concurrent fact." },
       ],
+    });
+  });
+
+  it("does not replace unchanged files or write a duplicate-only no-op", async () => {
+    const project = await root();
+    const replacements: string[] = [];
+    const store = new ProjectKnowledgeStore(project, {
+      rename: async (from, to) => {
+        replacements.push(to);
+        await rename(from, to);
+      },
+    });
+
+    await store.append([{ category: "architecture", text: "Stable architecture." }]);
+    replacements.length = 0;
+    await store.append([{ category: "architecture", text: "stable architecture." }]);
+    expect(replacements).toEqual([]);
+
+    await store.append([{ category: "decision", text: "A new decision." }]);
+    expect(replacements).toEqual([join(project, ".devagency/knowledge/decisions.md")]);
+  });
+
+  it("rejects oversized knowledge before reading its contents", async () => {
+    const project = await root();
+    await mkdir(join(project, ".devagency/knowledge"), { recursive: true });
+    await writeFile(
+      join(project, ".devagency/knowledge/learnings.md"),
+      `# Learnings\n\n- ${"x".repeat(64 * 1024)}\n`,
+    );
+
+    await expect(new ProjectKnowledgeStore(project).load()).rejects.toMatchObject({
+      code: "METADATA_INVALID",
     });
   });
 

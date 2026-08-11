@@ -18,6 +18,7 @@ import {
   HumanDecisionResolutionSchema,
   HumanDecisionResponseSchema,
   PlanSchema,
+  projectKnowledgeKey,
   ProjectKnowledgeEntrySchema,
   ProjectKnowledgeSchema,
   RepoContextSchema,
@@ -166,7 +167,6 @@ export const CodingRunStateSchema = new StateSchema({
   verification: BoundedVerificationSchema.nullable().default(null),
   pendingHumanDecision: HumanDecisionRequestSchema.nullable().default(null),
   humanDecision: HumanDecisionResolutionSchema.nullable().default(null),
-  humanDecisionOrigin: z.enum(["planning", "executing", "repairing"]).nullable().default(null),
   runtimeContinuation: RuntimeContinuationSchema.nullable().default(null),
   failure: FailureContextSchema.nullable().default(null),
   executionMessage: TextSchema.default(""),
@@ -462,7 +462,7 @@ export function createCodingRunGraph(
     const merged = new Map<string, ProjectKnowledgeEntry>();
     for (const raw of [...current, ...(proposed ?? [])]) {
       const entry = ProjectKnowledgeEntrySchema.parse(raw);
-      const identity = `${entry.category}:${entry.text.toLocaleLowerCase()}`;
+      const identity = projectKnowledgeKey(entry);
       if (!merged.has(identity)) merged.set(identity, entry);
     }
     return [...merged.values()].slice(0, 300);
@@ -643,7 +643,6 @@ export function createCodingRunGraph(
           ...boundary.result,
           pendingHumanDecision: decisionRequest,
           humanDecision: null,
-          humanDecisionOrigin: "planning",
           runtimeContinuation: result.runtimeContinuation ?? null,
           executionMessage: concise(result.message),
         };
@@ -657,7 +656,6 @@ export function createCodingRunGraph(
         codingPlan,
         pendingHumanDecision: null,
         humanDecision: null,
-        humanDecisionOrigin: null,
         runtimeContinuation: null,
         executionMessage: concise(result.message),
       };
@@ -697,7 +695,6 @@ export function createCodingRunGraph(
           ...boundary.result,
           pendingHumanDecision: decisionRequest,
           humanDecision: null,
-          humanDecisionOrigin: "executing",
           runtimeContinuation: result.runtimeContinuation ?? null,
           executionMessage: concise(result.message),
           proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
@@ -720,7 +717,6 @@ export function createCodingRunGraph(
         failure: null,
         pendingHumanDecision: null,
         humanDecision: null,
-        humanDecisionOrigin: null,
         runtimeContinuation: null,
       };
     } catch (error) {
@@ -837,7 +833,6 @@ export function createCodingRunGraph(
           ...boundary.result,
           pendingHumanDecision: decisionRequest,
           humanDecision: null,
-          humanDecisionOrigin: "repairing",
           runtimeContinuation: result.runtimeContinuation ?? null,
           executionMessage: concise(result.message),
           proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
@@ -862,7 +857,6 @@ export function createCodingRunGraph(
         failure: null,
         pendingHumanDecision: null,
         humanDecision: null,
-        humanDecisionOrigin: null,
         runtimeContinuation: null,
       };
     } catch (error) {
@@ -872,7 +866,7 @@ export function createCodingRunGraph(
   };
 
   const requestHumanInput: typeof CodingRunStateSchema.Node = async (state) => {
-    if (state.pendingHumanDecision === null || state.humanDecisionOrigin === null) {
+    if (state.pendingHumanDecision === null) {
       throw new Error("Human decision state is incomplete");
     }
     const request = HumanDecisionRequestSchema.parse(state.pendingHumanDecision);
@@ -900,9 +894,12 @@ export function createCodingRunGraph(
   const routeAfterRuntime = (state: CodingRunState): "human" | "continue" =>
     state.pendingHumanDecision === null ? "continue" : "human";
   const routeAfterHuman = (state: CodingRunState): "plan" | "execute" | "repair" => {
-    if (state.humanDecisionOrigin === "planning") return "plan";
-    if (state.humanDecisionOrigin === "repairing") return "repair";
-    return "execute";
+    switch (state.status) {
+      case "planning": return "plan";
+      case "executing": return "execute";
+      case "repairing": return "repair";
+      default: throw new Error(`Cannot route human response from ${state.status} status`);
+    }
   };
 
   const summarize: typeof CodingRunStateSchema.Node = async (state) => {

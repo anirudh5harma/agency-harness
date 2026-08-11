@@ -6,7 +6,7 @@ import type { ZodType } from "zod";
 
 import { InfrastructureError } from "../process/infrastructure-error.js";
 
-function isMissingFile(cause: unknown): boolean {
+export function isMissingFile(cause: unknown): boolean {
   return (
     cause instanceof Error &&
     "code" in cause &&

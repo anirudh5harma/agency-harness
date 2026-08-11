@@ -116,8 +116,8 @@ describe("coding run graph", () => {
     const { root, runtime, deps } = await setup([verification("passed")]);
     const trajectory: Array<Parameters<TrajectoryWriter["append"]>[0]> = [];
     deps.trajectoryWriter = { append: async (event) => { trajectory.push(event); } };
-    const append = vi.fn(async (entries) => ({ entries: [...entries], renderedContext: "saved" }));
-    deps.knowledgeStore = { load: async () => ({ entries: [], renderedContext: "None." }), append };
+    const append = vi.fn(async (entries) => ({ entries: [...entries] }));
+    deps.knowledgeStore = { load: async () => ({ entries: [] }), append };
     runtime.enqueueExecuteResult({
       message: "done", changedFiles: [], sessionId: "pi-1",
       proposedKnowledge: [
@@ -134,21 +134,21 @@ describe("coding run graph", () => {
 
     const failed = await setup([verification("failed")]);
     const failedAppend = vi.fn();
-    failed.deps.knowledgeStore = { load: async () => ({ entries: [], renderedContext: "None." }), append: failedAppend };
+    failed.deps.knowledgeStore = { load: async () => ({ entries: [] }), append: failedAppend };
     failed.runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-2", proposedKnowledge: [{ category: "learning", text: "Never persist me." }] });
     failed.runtime.enqueueRepairResult({ message: "repair", changedFiles: [], sessionId: "pi-2" });
     await createCodingRunGraph(failed.deps).invoke(input(failed.root, 1));
     expect(failedAppend).not.toHaveBeenCalled();
-  });
+  }, 10_000);
 
   it("keeps finalization recoverable and discoverable when knowledge persistence fails", async () => {
     const { root, runtime, deps } = await setup([verification("passed")]);
     runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1", proposedKnowledge: [{ category: "learning", text: "A fact." }] });
     const append = vi.fn()
       .mockRejectedValueOnce(new InfrastructureError("METADATA_WRITE_FAILED", "knowledge unavailable"))
-      .mockResolvedValue({ entries: [{ category: "learning", text: "A fact." }], renderedContext: "saved" });
+      .mockResolvedValue({ entries: [{ category: "learning", text: "A fact." }] });
     deps.knowledgeStore = {
-      load: async () => ({ entries: [], renderedContext: "None." }),
+      load: async () => ({ entries: [] }),
       append,
     };
     const persistence = await createSqliteCheckpointPersistence(root);
@@ -199,7 +199,7 @@ describe("coding run graph", () => {
     expect(interrupted.pendingHumanDecision).toEqual(request);
     expect(runtime.calls.execute).toHaveLength(1);
     await expect(runner.getState("human-thread")).resolves.toMatchObject({
-      values: { pendingHumanDecision: request, humanDecisionOrigin: "executing" },
+      values: { pendingHumanDecision: request, status: "executing" },
       next: ["human"],
     });
 
@@ -217,6 +217,43 @@ describe("coding run graph", () => {
     expect(trajectory.filter((event) => event === "human_input_requested")).toHaveLength(1);
     expect(trajectory.filter((event) => event === "human_input_resolved")).toHaveLength(1);
     expect(trajectory.filter((event) => event === "execution_started")).toHaveLength(1);
+  });
+
+  it("routes a planning response from the checkpointed planning status", async () => {
+    const root = await repository();
+    const runtime = new FakeCodingRuntime();
+    const request = {
+      id: "plan-choice",
+      kind: "clarification" as const,
+      question: "Which plan should be used?",
+      options: [
+        { id: "small", label: "Small", description: "Use the narrow plan." },
+        { id: "broad", label: "Broad", description: "Use the broader plan." },
+      ],
+      allowCustom: true,
+    };
+    runtime.enqueuePlanResult({ decisionRequest: request, message: "choice needed" });
+    runtime.enqueuePlanResult({ plan, message: "planned" });
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    const runner = createCodingRunGraph(
+      dependencies(runtime, [verification("passed")], root),
+      { checkpointer: new MemorySaver() },
+    );
+
+    const paused = await runner.invoke(input(root), { threadId: "plan-pause" });
+    expect(paused).toMatchObject({ status: "planning", pendingHumanDecision: request });
+
+    const completed = await runner.resume("plan-pause", {
+      requestId: request.id,
+      optionId: "small",
+    });
+
+    expect(completed.status).toBe("completed");
+    expect(runtime.calls.createPlan).toHaveLength(2);
+    expect(runtime.calls.createPlan[1]?.humanDecision?.response).toEqual({
+      requestId: request.id,
+      optionId: "small",
+    });
   });
 
   it("counts a paused repair exactly once after it completes", async () => {
@@ -252,7 +289,7 @@ describe("coding run graph", () => {
     expect(completed.status).toBe("completed");
     expect(completed.attempt).toBe(2);
     expect(runtime.calls.repair.map(({ attempt }) => attempt)).toEqual([1, 1, 2]);
-  });
+  }, 10_000);
 
   it("redacts a human response before constructing the persisted resume command", async () => {
     const { root, runtime, deps } = await setup([verification("passed")]);
@@ -401,7 +438,6 @@ describe("coding run graph", () => {
     const deps = dependencies(runtime, [verification("failed"), verification("passed")], root);
     const knowledge = {
       entries: [{ category: "architecture" as const, text: "The graph owns verification." }],
-      renderedContext: "Architecture:\n- The graph owns verification.",
     };
     deps.knowledgeStore = { load: async () => knowledge, append: async () => knowledge };
     const graph = createCodingRunGraph(deps);

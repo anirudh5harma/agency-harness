@@ -208,9 +208,37 @@ export const ProjectKnowledgeEntrySchema = z.strictObject({
 });
 export type ProjectKnowledgeEntry = z.infer<typeof ProjectKnowledgeEntrySchema>;
 
+const projectKnowledgeCategories = ["architecture", "decision", "learning"] as const;
+const projectKnowledgeTitles = {
+  architecture: "Architecture",
+  decision: "Decisions",
+  learning: "Learnings",
+} as const;
+
+export function projectKnowledgeKey(entry: ProjectKnowledgeEntry): string {
+  return `${entry.category}:${entry.text.toLocaleLowerCase()}`;
+}
+
+export function renderProjectKnowledge(
+  entries: readonly ProjectKnowledgeEntry[],
+): string {
+  if (entries.length === 0) return "None.";
+  return projectKnowledgeCategories
+    .map((category) => {
+      const lines = entries
+        .filter((entry) => entry.category === category)
+        .map(({ text }) => `- ${text}`);
+      return lines.length === 0
+        ? ""
+        : `${projectKnowledgeTitles[category]}:\n${lines.join("\n")}`;
+    })
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 12_000);
+}
+
 export const ProjectKnowledgeSchema = z.strictObject({
   entries: z.array(ProjectKnowledgeEntrySchema).max(300).default([]),
-  renderedContext: z.string().max(12_000).default("None."),
 });
 export type ProjectKnowledge = z.infer<typeof ProjectKnowledgeSchema>;
 
