@@ -13,6 +13,7 @@ import type { AgencyEvent, Plan, RepoContext } from "../../src/domain/index.js";
 import { InfrastructureError } from "../../src/process/index.js";
 import {
   PiCodingRuntime,
+  bashApprovalAction,
   createSafeResourceLoader,
   normalizePiEvent,
   type PiSdkBoundary,
@@ -162,11 +163,32 @@ function createBoundary(options: {
       return { content: [{ type: "text", text: "allowed" }], details: {} };
     },
   };
+  const fileTool = (name: string): ToolDefinition => ({
+    name,
+    label: name,
+    description: `${name} through test boundary`,
+    parameters: { type: "object" } as never,
+    async execute() {
+      return { content: [{ type: "text", text: "allowed" }], details: {} };
+    },
+  });
   const sdk: PiSdkBoundary = {
     createModelRuntime: vi.fn(async () => modelRuntime as never),
     createSessionManager: vi.fn(() => persistentManager as never),
     openSessionManager: vi.fn(() => persistentManager as never),
     createResourceLoader: vi.fn(async () => resourceLoader as never),
+    detectVerificationCommands: vi.fn(async () => [
+      { name: "test", command: "npm", args: ["run", "test"], required: true },
+      { name: "typecheck", command: "npm", args: ["run", "typecheck"], required: true },
+      { name: "lint", command: "npm", args: ["run", "lint"], required: true },
+      { name: "build", command: "npm", args: ["run", "build"], required: true },
+    ]),
+    createReadTool: vi.fn(() => fileTool("read") as never),
+    createGrepTool: vi.fn(() => fileTool("grep") as never),
+    createFindTool: vi.fn(() => fileTool("find") as never),
+    createLsTool: vi.fn(() => fileTool("ls") as never),
+    createEditTool: vi.fn(() => fileTool("edit") as never),
+    createWriteTool: vi.fn(() => fileTool("write") as never),
     createBashTool: vi.fn(() => bashTool as never),
     createAgentSession: vi.fn(async (sessionOptionsInput) => {
       const createDefault = async () => {
@@ -366,7 +388,8 @@ describe("PiCodingRuntime", () => {
   });
 
   it("scopes consequential shell approval to the exact command for one use", async () => {
-    const action = "rm -rf build";
+    const command = "rm -rf build";
+    const action = bashApprovalAction(["rm", "-rf", "build"]);
     let prompts = 0;
     let firstRun: unknown;
     let secondError: unknown;
@@ -394,15 +417,15 @@ describe("PiCodingRuntime", () => {
         }
         const bash = tools.find(({ name }) => name === "bash")!;
         if (prompts === 2) {
-          firstRun = await bash.execute("bash-1", { command: action }, undefined, undefined, {} as never);
+          firstRun = await bash.execute("bash-1", { command }, undefined, undefined, {} as never);
           try {
-            await bash.execute("bash-2", { command: action }, undefined, undefined, {} as never);
+            await bash.execute("bash-2", { command }, undefined, undefined, {} as never);
           } catch (error) {
             secondError = error;
           }
         } else {
           try {
-            await bash.execute("bash-3", { command: action }, undefined, undefined, {} as never);
+            await bash.execute("bash-3", { command }, undefined, undefined, {} as never);
           } catch (error) {
             rejectedError = error;
           }
@@ -535,6 +558,9 @@ describe("PiCodingRuntime", () => {
     );
     expect(boundary.sdk.createResourceLoader).toHaveBeenCalledWith(repo.rootPath);
     expect(boundary.sessionOptions[0]?.customTools?.[0]?.name).toBe("submit_plan");
+    expect(boundary.sessionOptions[0]?.customTools?.map(({ name }) => name)).toEqual([
+      "submit_plan", "read", "grep", "find", "ls", "request_human_input",
+    ]);
     type StrictObjectSchema = {
       additionalProperties: boolean;
       required: string[];
@@ -628,9 +654,16 @@ describe("PiCodingRuntime", () => {
       cwd: repo.rootPath,
       modelRuntime: boundary.modelRuntime,
       sessionManager: boundary.persistentManager,
-      tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "request_human_input"],
+      tools: [
+        "read", "grep", "find", "ls", "edit", "write", "bash",
+        "request_human_input", "record_project_knowledge",
+      ],
       resourceLoader: boundary.resourceLoader,
     });
+    expect(boundary.sessionOptions[0]?.customTools?.map(({ name }) => name)).toEqual([
+      "read", "grep", "find", "ls", "edit", "write", "bash",
+      "request_human_input", "record_project_knowledge",
+    ]);
     expect(execution).toEqual({
       message: "Implemented the requested change. Ready for verification.",
       changedFiles: ["src/coding/runtime.ts"],
@@ -760,7 +793,7 @@ describe("PiCodingRuntime", () => {
       await expect(invoke(bypass), bypass).rejects.toThrow("Agency policy blocks");
     }
 
-    await expect(invoke("npm test -- --runInBand")).resolves.toBeDefined();
+    await expect(invoke("npm run test")).resolves.toBeDefined();
     await expect(invoke("git diff -- src/coding/runtime.ts")).resolves.toBeDefined();
 
     for (const destructive of ["rm -rf build", "rm -fr build", "rm --recursive build"]) {

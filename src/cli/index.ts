@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { AgencyApplication, type AgencyApplicationDependencies } from "./application.js";
 import { ReadlineTerminalIO } from "./repl.js";
+import { POLICY_DISPLAY } from "../coding/tool-policy.js";
 import {
   agencyWorktreeDirty,
   createAgencyWorktree,
@@ -33,26 +34,33 @@ export async function runAgency(
 
 export interface CliArguments {
   help: boolean;
+  policy: boolean;
   worktree: boolean;
 }
 
-export const CLI_USAGE = "Usage: agency [--worktree] [--help]";
+export const CLI_USAGE = "Usage: agency [--worktree] [--policy] [--help]";
 
 export function parseCliArguments(args: readonly string[]): CliArguments {
   let help = false;
+  let policy = false;
   let worktree = false;
   for (const argument of args) {
     if (argument === "--help" || argument === "-h") help = true;
+    else if (argument === "--policy") policy = true;
     else if (argument === "--worktree") worktree = true;
     else throw new Error(`Unknown option: ${argument}. ${CLI_USAGE}`);
   }
-  return { help, worktree };
+  return { help, policy, worktree };
 }
 
 export async function main(args: readonly string[] = process.argv.slice(2)): Promise<void> {
   const options = parseCliArguments(args);
   if (options.help) {
-    process.stdout.write(`${CLI_USAGE}\n\n--worktree  Run in a preserved isolated Git worktree.\n`);
+    process.stdout.write(`${CLI_USAGE}\n\n--worktree  Run in a preserved isolated Git worktree.\n--policy    Show enforced tool policy and sandbox status.\n`);
+    return;
+  }
+  if (options.policy) {
+    process.stdout.write(`${POLICY_DISPLAY}\n`);
     return;
   }
   let context: AgencyWorktreeContext | undefined;

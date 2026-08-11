@@ -7,6 +7,7 @@ import {
   type AgencyWorktreeContext,
 } from "../repo/index.js";
 import type { TerminalRenderer } from "./renderer.js";
+import { POLICY_DISPLAY } from "../coding/tool-policy.js";
 
 export type SlashCommandResult = "continue" | "exit";
 
@@ -109,6 +110,7 @@ export class SlashCommandRouter {
             "  /undo [checkpoint] Restore only unchanged Agency-owned paths",
             "  /worktree [keep|discard] Show or manage isolated worktree",
             "  /tools   Collapse or expand tool activity (TTY)",
+            "  /policy  Show enforced tool policy and sandbox status",
             "  /new     Start a fresh conversational session",
             "  /exit    Exit Agency",
           ].join("\n"),
@@ -197,6 +199,9 @@ export class SlashCommandRouter {
       }
       case "/tools":
         this.#dependencies.renderer.toggleToolActivity();
+        return "continue";
+      case "/policy":
+        this.#dependencies.renderer.message(POLICY_DISPLAY);
         return "continue";
       case "/new": {
         const session = await this.#dependencies.createNewSession();

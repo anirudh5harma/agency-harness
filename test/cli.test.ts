@@ -105,8 +105,8 @@ afterEach(async () => {
 
 describe("Agency terminal application", () => {
   it("parses --worktree and --help deterministically", () => {
-    expect(parseCliArguments([])).toEqual({ help: false, worktree: false });
-    expect(parseCliArguments(["--worktree", "--help"])).toEqual({ help: true, worktree: true });
+    expect(parseCliArguments([])).toEqual({ help: false, policy: false, worktree: false });
+    expect(parseCliArguments(["--worktree", "--policy", "--help"])).toEqual({ help: true, policy: true, worktree: true });
     expect(() => parseCliArguments(["--unknown"])).toThrow("Unknown option: --unknown");
   });
 

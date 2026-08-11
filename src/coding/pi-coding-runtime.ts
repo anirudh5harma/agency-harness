@@ -5,7 +5,6 @@ import {
   ModelRuntime,
   SessionManager,
   SettingsManager,
-  createBashToolDefinition,
   createAgentSession,
   getAgentDir,
   type AgentSessionEvent,
@@ -30,7 +29,7 @@ import {
   type RepoContext,
   type SessionContext,
 } from "../domain/index.js";
-import { InfrastructureError } from "../process/index.js";
+import { detectNodeVerificationCommands, InfrastructureError, type VerificationCommand } from "../process/index.js";
 import type {
   CodingEventSink,
   CodingResult,
@@ -41,9 +40,16 @@ import type {
   RepairInput,
   RuntimeContinuation,
 } from "./coding-runtime.js";
+import {
+  ROLE_TOOL_POLICY,
+  createProtectedBashTool,
+  createRoleFileTools,
+  defaultToolFactoryBoundary,
+  type ToolFactoryBoundary,
+} from "./tool-policy.js";
 
-const PLANNER_TOOLS = ["read", "grep", "find", "ls", "submit_plan", "request_human_input"];
-const EXECUTOR_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "request_human_input"];
+const PLANNER_TOOLS = [...ROLE_TOOL_POLICY.planner];
+const EXECUTOR_TOOLS = [...ROLE_TOOL_POLICY.executor];
 const MAX_INSTRUCTIONS_CHARS = 6_000;
 const MAX_CONTEXT_ITEMS = 6;
 const MAX_CONTEXT_ITEM_CHARS = 800;
@@ -109,14 +115,12 @@ function runtimeContinuation(session: PiSession, role: RuntimeContinuation["role
   return { role, sessionFile: pathBasename(session.sessionFile) };
 }
 
-type PiBashToolDefinition = ReturnType<typeof createBashToolDefinition>;
-
-export interface PiSdkBoundary {
+export interface PiSdkBoundary extends ToolFactoryBoundary {
   createModelRuntime(): Promise<ModelRuntime>;
   createSessionManager(cwd: string, sessionDir: string): SessionManager;
   openSessionManager(cwd: string, sessionDir: string, sessionFile: string): SessionManager;
   createResourceLoader(cwd: string): Promise<ResourceLoader>;
-  createBashTool(cwd: string): PiBashToolDefinition;
+  detectVerificationCommands(cwd: string): Promise<VerificationCommand[]>;
   createAgentSession(
     options: CreateAgentSessionOptions,
   ): Promise<{ session: PiSession }>;
@@ -144,133 +148,12 @@ const defaultSdk: PiSdkBoundary = {
   openSessionManager: (cwd, sessionDir, sessionFile) =>
     SessionManager.open(sessionFile, sessionDir, cwd),
   createResourceLoader: createSafeResourceLoader,
-  createBashTool: (cwd) => createBashToolDefinition(cwd),
+  detectVerificationCommands: detectNodeVerificationCommands,
+  ...defaultToolFactoryBoundary,
   createAgentSession,
 };
-
-const SAFE_GIT_COMMANDS = new Set([
-  "cat-file", "describe", "diff", "for-each-ref", "log", "ls-files", "ls-tree",
-  "merge-base", "name-rev", "rev-list", "rev-parse", "show", "show-ref", "status",
-]);
-const CONCEALING_SHELL_COMMANDS = new Set([
-  "alias", "eval", "source", "bash", "dash", "ksh", "sh", "zsh",
-]);
-
-function shellWords(command: string): string[] {
-  const words: string[] = [];
-  let word = "";
-  let quote: "'" | '"' | undefined;
-  const finish = () => {
-    if (word !== "") words.push(word);
-    word = "";
-  };
-  for (let index = 0; index < command.length; index += 1) {
-    const character = command[index]!;
-    if (character === "\\" && quote !== "'") {
-      if (index + 1 < command.length) word += command[++index];
-      continue;
-    }
-    if (character === "'" || character === '"') {
-      if (quote === undefined) quote = character;
-      else if (quote === character) quote = undefined;
-      else word += character;
-      continue;
-    }
-    if (/\s/.test(character) || ";|&()<>`".includes(character)) {
-      finish();
-      continue;
-    }
-    word += character;
-  }
-  finish();
-  return words;
-}
-
-function basename(command: string): string {
-  return command.slice(command.lastIndexOf("/") + 1).toLowerCase();
-}
-
-function isUnsafeGitInvocation(words: string[], gitIndex: number): boolean {
-  let index = gitIndex + 1;
-  while (index < words.length && words[index]!.startsWith("-")) {
-    const option = words[index]!.toLowerCase();
-    // Per-invocation configuration can redefine otherwise safe commands.
-    if (words[index] === "-c" || option.startsWith("-c=")) return true;
-    index += ["-C", "--git-dir", "--work-tree", "--namespace", "--config-env"]
-      .includes(words[index]!) ? 2 : 1;
-  }
-  const subcommand = words[index]?.toLowerCase();
-  return subcommand === undefined || !SAFE_GIT_COMMANDS.has(subcommand);
-}
-
 function normalizedAction(command: string): string {
   return command.replace(/\s+/gu, " ").trim();
-}
-
-function isRecursiveRm(words: readonly string[]): boolean {
-  return words.some((word, index) => {
-    if (basename(word) !== "rm") return false;
-    return words.slice(index + 1).some((argument) => {
-      const option = argument.toLowerCase();
-      if (option === "--recursive" || option.startsWith("--recursive=")) return true;
-      return /^-[^-]*r[^-]*$/u.test(option);
-    });
-  });
-}
-
-function isConsequentialShell(command: string, words = shellWords(command)): boolean {
-  const normalized = normalizedAction(command).toLowerCase();
-  return isRecursiveRm(words) ||
-    /(?:^|\s)(?:drop\s+(?:database|table)|truncate\s+table)(?:\s|$)/u.test(normalized) ||
-    /(?:prisma|knex|sequelize|typeorm|rails|rake|django-admin|alembic)[^\n]*(?:migrate|migration)/u.test(normalized) ||
-    /(?:npm|pnpm|yarn|bun)\s+(?:remove|uninstall|install|add|update|up)(?:\s|$)/u.test(normalized);
-}
-
-function assertAllowedBash(command: string, consumeApproval: (action: string) => boolean): void {
-  const words = shellWords(command);
-  const lower = words.map((word) => word.toLowerCase());
-  const hasUnsafeGit = words.some(
-    (word, index) => basename(word) === "git" && isUnsafeGitInvocation(words, index),
-  );
-  const hasPrCreation = lower.some((word, index) => {
-    const remaining = lower.slice(index + 1);
-    const hasOrderedWords = (first: string, second: string) => {
-      const firstIndex = remaining.indexOf(first);
-      return firstIndex >= 0 && remaining.indexOf(second, firstIndex + 1) >= 0;
-    };
-    return (basename(word) === "gh" && hasOrderedWords("pr", "create")) ||
-      (basename(word) === "glab" && hasOrderedWords("mr", "create")) ||
-      (basename(word) === "hub" && remaining.includes("pull-request"));
-  });
-  const hasConcealedInvocation = words.some((word) => {
-    const name = basename(word);
-    return CONCEALING_SHELL_COMMANDS.has(name) ||
-      (/^(?:\.\.\/|\.\/|\/)/.test(word) && /(?:\.(?:ba)?sh|\/[^/]+)$/.test(word));
-  });
-  if (hasUnsafeGit || hasPrCreation || hasConcealedInvocation) {
-    throw new Error(
-      "Agency policy blocks Git staging, commits, pushes, and pull-request creation",
-    );
-  }
-  const action = normalizedAction(command);
-  if (isConsequentialShell(action, words) && !consumeApproval(action)) {
-    throw new Error(
-      "Agency policy requires explicit one-shot approval for this exact consequential command",
-    );
-  }
-}
-
-function protectedBashTool(
-  delegate: PiBashToolDefinition,
-  consumeApproval: (action: string) => boolean,
-): PiBashToolDefinition {
-  return {
-    ...delegate,
-    async execute(toolCallId, params, signal, onUpdate, context) {
-      assertAllowedBash(stringProperty(params, "command") ?? "", consumeApproval);
-      return delegate.execute(toolCallId, params, signal, onUpdate, context);
-    },
-  };
 }
 
 interface ActiveCall {
@@ -643,7 +526,7 @@ function executorPrompt(input: ExecuteInput): string {
     `Project knowledge:\n${knowledgeSummary(input)}`,
     "Use record_project_knowledge only to propose concise durable facts likely to improve future coding tasks. Never record prompts, transcripts, command/tool output, or credentials.",
     "Stay within the plan. Do not commit, stage, push, or open a pull request.",
-    "Use request_human_input only for material ambiguity or a consequential action (dangerous shell, dependency replacement, database migration, or large destructive change); never elevate trivial choices.",
+    "Use request_human_input only when an Agency tool policy error supplies an exact approval action. Dependency changes and migrations remain blocked; approval cannot override them.",
     "An approval is scoped to its exact normalized action and can be consumed only once. Rejection or edited guidance must cancel or replan the original action.",
     ...(input.humanDecision === undefined
       ? []
@@ -692,7 +575,7 @@ function repairPrompt(input: RepairInput): string {
     "Diagnose the failure before editing, then address only the observed failure.",
     "Never weaken or delete tests, lint rules, typecheck settings, configuration, or scripts to make verification pass.",
     "Do not commit, stage, push, or open a pull request.",
-    "Use request_human_input only for material ambiguity or a consequential action; never elevate trivial choices. Rejection or edited guidance must not execute the original action.",
+    "Use request_human_input only when an Agency tool policy error supplies an exact approval action. Rejection or edited guidance must not execute the original action.",
     ...(input.humanDecision === undefined
       ? []
       : [`Validated human response to your prior request: ${JSON.stringify(input.humanDecision.response)}`]),
@@ -947,6 +830,11 @@ export class PiCodingRuntime implements CodingRuntime {
           tools: PLANNER_TOOLS,
           customTools: [
             tool,
+            ...createRoleFileTools({
+              root: input.repo.rootPath,
+              role: "planner",
+              factories: this.#sdk,
+            }),
             requestHumanInputTool((request) => this.#humanRequestHandlers.get(requestHandlerKey)?.(request)),
           ],
         })
@@ -1149,15 +1037,28 @@ export class PiCodingRuntime implements CodingRuntime {
         resourceLoader: await this.#sdk.createResourceLoader(repo.rootPath),
         tools: EXECUTOR_TOOLS,
         customTools: [
-          protectedBashTool(
-            this.#sdk.createBashTool(repo.rootPath),
-            (action) => {
+          ...createRoleFileTools({
+            root: repo.rootPath,
+            role: "executor",
+            factories: this.#sdk,
+            consumeApproval: (action) => {
               const approved = this.#approvedActions.get(executorKey);
               if (approved !== action) return false;
               this.#approvedActions.delete(executorKey);
               return true;
             },
-          ) as unknown as ToolDefinition,
+          }),
+          createProtectedBashTool({
+            root: repo.rootPath,
+            factories: this.#sdk,
+            verificationCommands: await this.#sdk.detectVerificationCommands(repo.rootPath),
+            consumeApproval: (action) => {
+              const approved = this.#approvedActions.get(executorKey);
+              if (approved !== action) return false;
+              this.#approvedActions.delete(executorKey);
+              return true;
+            },
+          }),
           requestHumanInputTool((request) => this.#humanRequestHandlers.get(executorKey)?.(request)),
           recordProjectKnowledgeTool((entry) => this.#knowledgeHandlers.get(executorKey)?.(entry)),
         ],
