@@ -9,7 +9,7 @@ bounded failures, and keeps durable checkpoints and project context.
 Requirements: Node.js 22.19+, npm, Git, and a Pi-supported model provider.
 
 ```sh
-git clone <this-repository-url>
+git clone https://github.com/anirudh5harma/agency-harness.git
 cd agency-harness
 npm install
 npm run build

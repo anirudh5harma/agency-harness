@@ -110,7 +110,7 @@ function isWithin(root: string, target: string): boolean {
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
 
-function assertPathClass(path: string, role: ToolRole, mutation: boolean): string {
+function assertPathClass(path: string, mutation: boolean): string {
   const normalized = relativePath(path);
   const privateSegment = normalized.split("/").some((segment) => PRIVATE_PATHS.has(segment.toLowerCase()));
   if (privateSegment) {
@@ -136,7 +136,7 @@ async function safeExistingPath(
   role: ToolRole,
   expected: "file" | "directory" | "either",
 ): Promise<string> {
-  const normalized = assertPathClass(input, role, false);
+  const normalized = assertPathClass(input, false);
   const canonicalRoot = await repositoryRoot(root);
   const lexical = resolve(canonicalRoot, normalized);
   if (!isWithin(canonicalRoot, lexical)) throw policyError("path escapes repository");
@@ -159,7 +159,7 @@ async function safeExistingPath(
 }
 
 async function safeMutationPath(root: string, input: string): Promise<string> {
-  const normalized = assertPathClass(input, "executor", true);
+  const normalized = assertPathClass(input, true);
   const canonicalRoot = await repositoryRoot(root);
   const lexical = resolve(canonicalRoot, normalized);
   if (!isWithin(canonicalRoot, lexical) || lexical === canonicalRoot) {
@@ -508,7 +508,7 @@ function prepareAllowedBash(
     if (paths.length === 0 || options.some((option) => !["-r", "-f", "-rf", "-fr", "--recursive", "--force"].includes(option))) {
       throw policyError("rm requires explicit literal repository paths and known options");
     }
-    for (const path of paths) assertPathClass(path, "executor", true);
+    for (const path of paths) assertPathClass(path, true);
     const action = bashApprovalAction(words);
     if (!consumeApproval(action)) {
       throw new Error(`Agency policy requires request_human_input explicit one-shot approval for exact action: ${action}`);

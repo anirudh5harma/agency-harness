@@ -1078,7 +1078,11 @@ export function createCodingRunGraph(
       liveMetrics.delete(state.threadId);
       cancellingThreads.delete(state.threadId);
     } catch (error) {
-      if (finalizationStage === "evaluation") throw error;
+      if (finalizationStage === "evaluation") {
+        liveMetrics.delete(state.threadId);
+        cancellingThreads.delete(state.threadId);
+        throw error;
+      }
       status = "failed";
       summary = `Run failed while finalizing incomplete-run metadata: ${errorMessage(error)}.`;
       await evaluationStore.write({ ...evaluation, status: "failed", success: false });

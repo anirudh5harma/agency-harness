@@ -1041,6 +1041,12 @@ export class PiCodingRuntime implements CodingRuntime {
     }
     try {
       const sessionDir = sessionDirectory(repo, "executor");
+      const consumeApproval = (action: string): boolean => {
+        const approved = this.#approvedActions.get(executorKey);
+        if (approved !== action) return false;
+        this.#approvedActions.delete(executorKey);
+        return true;
+      };
       const { session } = await this.#sdk.createAgentSession({
         cwd: repo.rootPath,
         modelRuntime: this.#modelRuntime,
@@ -1061,23 +1067,13 @@ export class PiCodingRuntime implements CodingRuntime {
             ...(this.#mutationBudgets.get(executorKey) === undefined
               ? {}
               : { mutationBudget: this.#mutationBudgets.get(executorKey)!.budget }),
-            consumeApproval: (action) => {
-              const approved = this.#approvedActions.get(executorKey);
-              if (approved !== action) return false;
-              this.#approvedActions.delete(executorKey);
-              return true;
-            },
+            consumeApproval,
           }),
           createProtectedBashTool({
             root: repo.rootPath,
             factories: this.#sdk,
             verificationCommands: await this.#sdk.detectVerificationCommands(repo.rootPath),
-            consumeApproval: (action) => {
-              const approved = this.#approvedActions.get(executorKey);
-              if (approved !== action) return false;
-              this.#approvedActions.delete(executorKey);
-              return true;
-            },
+            consumeApproval,
           }),
           requestHumanInputTool((request) => this.#humanRequestHandlers.get(executorKey)?.(request)),
           recordProjectKnowledgeTool((entry) => this.#knowledgeHandlers.get(executorKey)?.(entry)),
