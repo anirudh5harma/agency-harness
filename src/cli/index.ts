@@ -1,11 +1,21 @@
 #!/usr/bin/env node
 
 import { resolve } from "node:path";
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { AgencyApplication, type AgencyApplicationDependencies } from "./application.js";
 import { ReadlineTerminalIO } from "./repl.js";
 import { POLICY_DISPLAY } from "../coding/tool-policy.js";
+import {
+  defaultNpmRunner,
+  getUpdateCachePath,
+  getUpdateStatus,
+  isUpdateAvailable,
+  readPackageMetadata,
+  readUpdateCache,
+  runUpdate,
+} from "./update.js";
 import {
   agencyWorktreeDirty,
   createAgencyWorktree,
@@ -18,6 +28,7 @@ export * from "./application.js";
 export * from "./commands.js";
 export * from "./renderer.js";
 export * from "./repl.js";
+export * from "./update.js";
 
 export async function runAgency(
   dependencies: AgencyApplicationDependencies,
@@ -35,33 +46,76 @@ export async function runAgency(
 export interface CliArguments {
   help: boolean;
   policy: boolean;
+  version: boolean;
   worktree: boolean;
+  update: { checkOnly: boolean } | null;
 }
 
-export const CLI_USAGE = "Usage: agency [--worktree] [--policy] [--help]";
+export const CLI_USAGE = "Usage: agency [--worktree] [--policy] [--version] [--help]\n       agency update [--check]";
 
 export function parseCliArguments(args: readonly string[]): CliArguments {
   let help = false;
   let policy = false;
+  let version = false;
   let worktree = false;
+  if (args[0] === "update") {
+    let checkOnly = false;
+    for (let index = 1; index < args.length; index += 1) {
+      const argument = args[index];
+      if (argument === "--check") checkOnly = true;
+      else if (argument === "--help" || argument === "-h") help = true;
+      else throw new Error(`Unknown update option: ${argument ?? ""}. ${CLI_USAGE}`);
+    }
+    return { help, policy, version, worktree, update: { checkOnly } };
+  }
   for (const argument of args) {
     if (argument === "--help" || argument === "-h") help = true;
     else if (argument === "--policy") policy = true;
+    else if (argument === "--version" || argument === "-v") version = true;
     else if (argument === "--worktree") worktree = true;
     else throw new Error(`Unknown option: ${argument}. ${CLI_USAGE}`);
   }
-  return { help, policy, worktree };
+  return { help, policy, version, worktree, update: null };
 }
 
 export async function main(args: readonly string[] = process.argv.slice(2)): Promise<void> {
   const options = parseCliArguments(args);
   if (options.help) {
-    process.stdout.write(`${CLI_USAGE}\n\n--worktree  Run in a preserved isolated Git worktree.\n--policy    Show enforced tool policy and sandbox status.\n`);
+    process.stdout.write(`${CLI_USAGE}\n\n--worktree  Run in a preserved isolated Git worktree.\n--policy    Show enforced tool policy and sandbox status.\n--version   Show the installed Agency version.\n`);
+    return;
+  }
+  const metadata = await readPackageMetadata();
+  if (options.version) {
+    process.stdout.write(`agency ${metadata.version}\n`);
+    return;
+  }
+  if (options.update !== null) {
+    if (options.update.checkOnly) {
+      const status = await getUpdateStatus(metadata, { useCache: false, writeCache: false });
+      process.stdout.write(status.updateAvailable
+        ? `Agency ${status.availableVersion} is available. Run: agency update\n`
+        : `Agency ${metadata.version} is current.\n`);
+      return;
+    }
+    await runUpdate({ packageName: metadata.name, run: defaultNpmRunner });
+    process.stdout.write("Agency update completed. Run agency --version to confirm.\n");
     return;
   }
   if (options.policy) {
     process.stdout.write(`${POLICY_DISPLAY}\n`);
     return;
+  }
+  if (process.stderr.isTTY === true && process.env.AGENCY_DISABLE_UPDATE_CHECK !== "1") {
+    const cachePath = getUpdateCachePath();
+    const cached = await readUpdateCache(cachePath);
+    const availableVersion = cached?.version;
+    if (availableVersion !== null && availableVersion !== undefined
+        && isUpdateAvailable(metadata.version, availableVersion)) {
+      process.stderr.write(`Agency ${availableVersion} is available. Run: agency update\n`);
+    } else if (cached === undefined) {
+      void getUpdateStatus(metadata, { cachePath, timeoutMs: 1_500 })
+        .catch(() => undefined);
+    }
   }
   let context: AgencyWorktreeContext | undefined;
   let discard: { dirty: boolean } | undefined;
@@ -102,9 +156,13 @@ export async function main(args: readonly string[] = process.argv.slice(2)): Pro
   }
 }
 
-function isMainModule(): boolean {
-  const entry = process.argv[1];
-  return entry !== undefined && resolve(entry) === fileURLToPath(import.meta.url);
+export function isMainModule(entry = process.argv[1]): boolean {
+  if (entry === undefined) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(entry) === fileURLToPath(import.meta.url);
+  }
 }
 
 if (isMainModule()) {

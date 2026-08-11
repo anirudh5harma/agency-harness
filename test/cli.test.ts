@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ import {
   AgencyRepl,
   gitDiff,
   PlainTerminalRenderer,
+  isMainModule,
   parseCliArguments,
   runAgency,
   type ReplHandler,
@@ -105,9 +106,20 @@ afterEach(async () => {
 
 describe("Agency terminal application", () => {
   it("parses --worktree and --help deterministically", () => {
-    expect(parseCliArguments([])).toEqual({ help: false, policy: false, worktree: false });
-    expect(parseCliArguments(["--worktree", "--policy", "--help"])).toEqual({ help: true, policy: true, worktree: true });
+    expect(parseCliArguments([])).toEqual({ help: false, policy: false, version: false, worktree: false, update: null });
+    expect(parseCliArguments(["--worktree", "--policy", "--help", "--version"])).toEqual({ help: true, policy: true, version: true, worktree: true, update: null });
+    expect(parseCliArguments(["update"])).toEqual({ help: false, policy: false, version: false, worktree: false, update: { checkOnly: false } });
+    expect(parseCliArguments(["update", "--check"])).toEqual({ help: false, policy: false, version: false, worktree: false, update: { checkOnly: true } });
+    expect(() => parseCliArguments(["update", "--worktree"])).toThrow("Unknown update option: --worktree");
     expect(() => parseCliArguments(["--unknown"])).toThrow("Unknown option: --unknown");
+  });
+
+  it("recognizes an npm-style symlink as the main executable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agency-bin-"));
+    temporaryDirectories.push(directory);
+    const executable = join(directory, "agency");
+    await symlink(fileURLToPath(new URL("../src/cli/index.ts", import.meta.url)), executable);
+    expect(isMainModule(executable)).toBe(true);
   });
 
   it("confirms the exact deletion plan before undo", async () => {

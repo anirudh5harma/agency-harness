@@ -9,17 +9,17 @@ bounded failures, and keeps durable checkpoints and project context.
 Requirements: Node.js 22.19+, npm, Git, and a Pi-supported model provider.
 
 ```sh
-git clone https://github.com/anirudh5harma/agency-harness.git
-cd agency-harness
-npm install
-npm run build
-npm link
+npm install --global agency-harness
+agency --version
 ```
+
+The single global installation works from every trusted Git repository. Agency
+keeps repository-specific state under that project's `.devagency/` directory.
 
 Connect a provider. Recommended for ChatGPT/Codex subscribers:
 
 ```sh
-npx --no-install pi
+npx --yes @earendil-works/pi-coding-agent@0.84.1
 ```
 
 Inside Pi, run `/login`, choose **OpenAI Codex**, and complete browser login. Pick a
@@ -27,7 +27,7 @@ model offered by that account; model availability depends on provider/account, s
 not assume a model such as `gpt-5.6-sol` exists. Exit Pi, then verify auth if useful:
 
 ```sh
-npx --no-install pi auth check --provider openai-codex
+npx --yes @earendil-works/pi-coding-agent@0.84.1 auth check --provider openai-codex
 ```
 
 API-key providers also work. Start Pi, run `/login`, choose the provider, and enter
@@ -89,6 +89,20 @@ It never stages, commits, pushes, or opens a PR in the target repository.
 
 Use `agency --help` for startup options.
 
+## Updates
+
+Agency installs track immutable releases on npm's `latest` tag:
+
+```sh
+agency update
+```
+
+Use `agency update --check` for a read-only check. In an interactive terminal Agency
+checks npm at most once per day and
+prints a notice when a newer build exists. It never installs an update without an
+explicit `agency update` command. Set `AGENCY_DISABLE_UPDATE_CHECK=1` to disable the
+notice check.
+
 ## How runs work
 
 One natural-language request creates one bounded LangGraph run:
@@ -134,3 +148,9 @@ npm run acceptance:real-pi
 
 It builds Agency, creates a temporary fixture repository, runs two related natural
 turns, validates transcript/diff/status, then reruns fixture tests and typecheck.
+
+Every green `main` commit is packaged as a unique immutable version and published to
+npm's `latest` tag. The package must first be bootstrapped once and configured as an
+npm trusted publisher for `.github/workflows/publish.yml`; then set the repository
+variable `NPM_PUBLISH_ENABLED=true`. Publishing uses GitHub Actions OIDC and does not
+store an npm token in repository secrets.
