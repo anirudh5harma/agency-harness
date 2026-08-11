@@ -30,8 +30,10 @@ import {
 } from "../persistence/index.js";
 import {
   ensureAgencyMetadataIgnored,
+  GitCheckpointManager,
   inspectRepository,
   type RepositoryInspection,
+  type AgencyWorktreeContext,
 } from "../repo/index.js";
 import { SessionStore } from "../session/index.js";
 import type { SessionCompactionResult } from "../session/index.js";
@@ -89,6 +91,10 @@ export interface AgencyApplicationDependencies {
     graph: CodingRunGraphRunner,
   ) => Promise<IncompleteRunRecoveryInspection[]>;
   commandOverrides?: Pick<SlashCommandDependencies, "gitDiff" | "verify">;
+  worktree?: {
+    context: AgencyWorktreeContext;
+    requestDiscard(signal: AbortSignal): Promise<boolean>;
+  };
   createId?: () => string;
 }
 
@@ -104,6 +110,11 @@ export class AgencyApplication implements ReplHandler {
   readonly #inspectRecovery: NonNullable<AgencyApplicationDependencies["inspectRecovery"]>;
   readonly #commands: SlashCommandRouter;
   readonly #createId: () => string;
+  readonly #gitCheckpoints: GitCheckpointManager;
+  readonly #detachMutationTracking: () => void;
+  #activeMutationRunId: string | null = null;
+  #mutationWrites: Promise<void> = Promise.resolve();
+  #mutationWriteError: unknown;
   #session: SessionContext;
   #disposed = false;
 
@@ -117,6 +128,7 @@ export class AgencyApplication implements ReplHandler {
     graph: CodingRunGraphRunner;
     registry: IncompleteRunRegistryBoundary;
     checkpoint: SqliteCheckpointPersistence;
+    eventBus: EventBus;
   }) {
     this.#io = input.dependencies.io;
     this.#inspection = input.inspection;
@@ -130,6 +142,16 @@ export class AgencyApplication implements ReplHandler {
     this.#inspectRecovery =
       input.dependencies.inspectRecovery ?? inspectIncompleteRunRecovery;
     this.#createId = input.dependencies.createId ?? randomUUID;
+    this.#gitCheckpoints = new GitCheckpointManager(input.inspection.rootPath);
+    this.#detachMutationTracking = input.eventBus.subscribe("file_changed", ({ path }) => {
+      if (this.#activeMutationRunId === null) return;
+      try {
+        const write = this.#gitCheckpoints.recordSuccessfulFileMutation(this.#activeMutationRunId, path);
+        this.#mutationWrites = Promise.all([this.#mutationWrites, write]).then(() => {}).catch((error: unknown) => {
+          this.#mutationWriteError ??= error;
+        });
+      } catch (error) { this.#mutationWriteError ??= error; }
+    });
     this.#commands = new SlashCommandRouter({
       projectRoot: input.inspection.rootPath,
       renderer: input.renderer,
@@ -149,6 +171,12 @@ export class AgencyApplication implements ReplHandler {
         return result;
       },
       inspect: input.dependencies.inspectRepository ?? inspectRepository,
+      checkpoints: this.#gitCheckpoints,
+      ...(input.dependencies.worktree === undefined ? {} : { worktree: input.dependencies.worktree }),
+      confirm: async (prompt, signal) => {
+        const answer = await this.#readLineUntilAbort(prompt, signal);
+        return answer?.trim().toLowerCase() === "yes";
+      },
       ...input.dependencies.commandOverrides,
     });
   }
@@ -213,6 +241,7 @@ export class AgencyApplication implements ReplHandler {
         graph,
         registry,
         checkpoint,
+        eventBus,
       });
     } catch (error) {
       await runtime?.dispose();
@@ -249,7 +278,10 @@ export class AgencyApplication implements ReplHandler {
     const runId = this.#createId();
     const threadId = this.#createId();
     this.#renderer.setRunStatus("running");
+    this.#activeMutationRunId = runId;
+    this.#mutationWriteError = undefined;
     try {
+      await this.#gitCheckpoints.beginRun(runId);
       let state = await this.#graph.invoke(
         {
           runId,
@@ -281,6 +313,15 @@ export class AgencyApplication implements ReplHandler {
         this.#renderer.setRunStatus("failed");
         this.#renderer.error(error instanceof Error ? error.message : String(error));
       }
+    } finally {
+      this.#activeMutationRunId = null;
+      await this.#mutationWrites;
+      if (this.#mutationWriteError !== undefined) this.#renderer.recovery(`Warning: file mutation identity was not recorded: ${this.#mutationWriteError instanceof Error ? this.#mutationWriteError.message : String(this.#mutationWriteError)}.`);
+      try {
+        await this.#gitCheckpoints.finishRun(runId);
+      } catch (error) {
+        this.#renderer.recovery(`Warning: could not finalize undo ownership for run ${runId}: ${error instanceof Error ? error.message : String(error)}.`);
+      }
     }
     return "continue";
   }
@@ -301,6 +342,7 @@ export class AgencyApplication implements ReplHandler {
     if (this.#disposed) return;
     this.#disposed = true;
     this.#io.close();
+    this.#detachMutationTracking();
     await this.#runtime.dispose();
     this.#checkpoint.close();
     this.#renderer.dispose();
@@ -308,6 +350,7 @@ export class AgencyApplication implements ReplHandler {
 
   async #offerRecovery(): Promise<void> {
     let activeController: AbortController | null = null;
+    let boundRecoveryRunId: string | undefined;
     const detachInterrupt = this.#io.onInterrupt(() => {
       if (activeController === null) {
         this.#io.close();
@@ -335,6 +378,9 @@ export class AgencyApplication implements ReplHandler {
         this.#renderer.recovery(
           `Run ${inspection.entry.runId} terminal checkpoint reconciled.`,
         );
+        await this.#gitCheckpoints.finishRun(inspection.entry.runId).catch((error: unknown) => {
+          this.#renderer.recovery(`Warning: could not finalize undo ownership for recovered run ${inspection.entry.runId}: ${error instanceof Error ? error.message : String(error)}.`);
+        });
         await this.#pruneTerminalCheckpoint(inspection.entry.threadId);
       }
       for (const inspection of inspections.filter(
@@ -361,6 +407,9 @@ export class AgencyApplication implements ReplHandler {
           return;
         }
         this.#renderer.setRunStatus("running");
+        boundRecoveryRunId = await this.#gitCheckpoints.segmentRecoveryRun(candidate.entry.runId);
+        this.#activeMutationRunId = boundRecoveryRunId;
+        this.#mutationWriteError = undefined;
         let state = await this.#graph.resume(
           candidate.entry.threadId,
           response,
@@ -389,6 +438,9 @@ export class AgencyApplication implements ReplHandler {
         if (normalized === "r") {
           activeController = new AbortController();
           this.#renderer.setRunStatus("running");
+          boundRecoveryRunId = await this.#gitCheckpoints.segmentRecoveryRun(candidate.entry.runId);
+          this.#activeMutationRunId = boundRecoveryRunId;
+          this.#mutationWriteError = undefined;
           let state = await this.#graph.resume(candidate.entry.threadId, undefined, {
             signal: activeController.signal,
           });
@@ -425,6 +477,13 @@ export class AgencyApplication implements ReplHandler {
       }
       throw error;
     } finally {
+      if (boundRecoveryRunId !== undefined) {
+        this.#activeMutationRunId = null;
+        await this.#mutationWrites;
+        await this.#gitCheckpoints.finishRun(boundRecoveryRunId).catch((error: unknown) => {
+          this.#renderer.recovery(`Warning: could not finalize undo ownership for recovered run ${boundRecoveryRunId}: ${error instanceof Error ? error.message : String(error)}.`);
+        });
+      }
       detachInterrupt();
     }
   }

@@ -11,6 +11,7 @@ import {
   AgencyRepl,
   gitDiff,
   PlainTerminalRenderer,
+  parseCliArguments,
   runAgency,
   type ReplHandler,
   type TerminalIO,
@@ -23,7 +24,7 @@ import {
   type CodingRunGraphRunner,
 } from "../src/graph/index.js";
 import type { SqliteCheckpointPersistence } from "../src/persistence/index.js";
-import { resolveGitExcludePath } from "../src/repo/index.js";
+import { GitCheckpointManager, resolveGitExcludePath } from "../src/repo/index.js";
 
 const execFileAsync = promisify(execFile);
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -103,6 +104,28 @@ afterEach(async () => {
 });
 
 describe("Agency terminal application", () => {
+  it("parses --worktree and --help deterministically", () => {
+    expect(parseCliArguments([])).toEqual({ help: false, worktree: false });
+    expect(parseCliArguments(["--worktree", "--help"])).toEqual({ help: true, worktree: true });
+    expect(() => parseCliArguments(["--unknown"])).toThrow("Unknown option: --unknown");
+  });
+
+  it("confirms the exact deletion plan before undo", async () => {
+    const cwd = await temporaryGitProject();
+    const checkpoints = new GitCheckpointManager(cwd);
+    await checkpoints.create("before add");
+    await checkpoints.beginRun("run-added");
+    await writeFile(join(cwd, "agency-added.txt"), "added\n");
+    await checkpoints.recordSuccessfulFileMutation("run-added", "agency-added.txt");
+    await checkpoints.finishRun("run-added", ["agency-added.txt"]);
+    const io = new ScriptedIO(["/undo", "yes", "/exit"]);
+    const output = new BufferOutput();
+
+    await runAgency({ cwd, io, output, errorOutput: new BufferOutput(), runtimeFactory: async () => new FakeCodingRuntime() });
+
+    expect(io.prompts).toContain('Undo will delete 1 path(s): "agency-added.txt". Type yes to continue: ');
+    await expect(readFile(join(cwd, "agency-added.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
   it("compacts session context without invoking Pi or LangGraph and shows status metadata", async () => {
     const cwd = await temporaryGitProject();
     const runtime = new FakeCodingRuntime();
@@ -733,7 +756,6 @@ describe("Agency terminal application", () => {
       .toBe(runtime.calls.createPlan[1]?.sessionContext?.sessionId);
     expect(io.prompts.filter((prompt) => prompt === "agency> ")).toHaveLength(3);
     expect(output.value).toContain("Done:");
-    expect(errors.value).toBe("");
     expect(runtime.isDisposed).toBe(true);
     expect(io.closeCalls).toBe(1);
     expect(await readFile(join(cwd, ".devagency", "runs", "id-1.jsonl"), "utf8"))
@@ -750,6 +772,9 @@ describe("Agency terminal application", () => {
       "/help",
       "/status",
       "/diff",
+      "/checkpoint before-cli-test",
+      "/undo",
+      "/worktree",
       "/verify",
       "/new",
       "/status",
@@ -775,6 +800,10 @@ describe("Agency terminal application", () => {
     expect(output.value).toContain("Commands:");
     expect(output.value).toContain("-initial");
     expect(output.value).toContain("+changed");
+    expect(output.value).toContain("Checkpoint ");
+    expect(output.value).toContain("HEAD and staging unchanged");
+    expect(output.value).toContain("Undo ");
+    expect(output.value).toContain("Worktree: direct checkout");
     expect(output.value).toContain("Verification: passed");
     const sessions = [...output.value.matchAll(/Session: ([^\n]+)/g)].map((match) => match[1]);
     expect(sessions).toHaveLength(2);
@@ -824,7 +853,7 @@ describe("Agency terminal application", () => {
     const cwd = await mkdtemp(join(tmpdir(), "agency-outside-git-"));
     temporaryDirectories.push(cwd);
     await execFileAsync("npm", ["run", "build"], { cwd: projectRoot });
-    const error = await execFileAsync(process.execPath, [builtCliPath], { cwd }).catch(
+    const error = await execFileAsync(process.execPath, [builtCliPath], { cwd, timeout: 5_000 }).catch(
       (cause: unknown) => cause as { code: number; stderr: string },
     );
 

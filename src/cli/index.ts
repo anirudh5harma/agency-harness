@@ -5,6 +5,13 @@ import { fileURLToPath } from "node:url";
 
 import { AgencyApplication, type AgencyApplicationDependencies } from "./application.js";
 import { ReadlineTerminalIO } from "./repl.js";
+import {
+  agencyWorktreeDirty,
+  createAgencyWorktree,
+  discardAgencyWorktree,
+  findAgencyWorktree,
+  type AgencyWorktreeContext,
+} from "../repo/index.js";
 
 export * from "./application.js";
 export * from "./commands.js";
@@ -24,14 +31,67 @@ export async function runAgency(
   }
 }
 
-export async function main(): Promise<void> {
+export interface CliArguments {
+  help: boolean;
+  worktree: boolean;
+}
+
+export const CLI_USAGE = "Usage: agency [--worktree] [--help]";
+
+export function parseCliArguments(args: readonly string[]): CliArguments {
+  let help = false;
+  let worktree = false;
+  for (const argument of args) {
+    if (argument === "--help" || argument === "-h") help = true;
+    else if (argument === "--worktree") worktree = true;
+    else throw new Error(`Unknown option: ${argument}. ${CLI_USAGE}`);
+  }
+  return { help, worktree };
+}
+
+export async function main(args: readonly string[] = process.argv.slice(2)): Promise<void> {
+  const options = parseCliArguments(args);
+  if (options.help) {
+    process.stdout.write(`${CLI_USAGE}\n\n--worktree  Run in a preserved isolated Git worktree.\n`);
+    return;
+  }
+  let context: AgencyWorktreeContext | undefined;
+  let discard: { dirty: boolean } | undefined;
+  if (options.worktree) {
+    context = await createAgencyWorktree(process.cwd());
+    process.stdout.write(`Agency worktree: ${context.path}\nBranch: ${context.branch}\nPreserved unless /worktree discard is confirmed.\n`);
+  } else context = await findAgencyWorktree(process.cwd()) ?? undefined;
   const io = new ReadlineTerminalIO(process.stdin, process.stdout);
+  const worktree = context === undefined ? undefined : {
+    context,
+    requestDiscard: async (signal: AbortSignal): Promise<boolean> => {
+      const dirty = await agencyWorktreeDirty(context!);
+      const expected = dirty ? "discard dirty" : "discard";
+      const answer = await io.readLine(
+        dirty
+          ? `Worktree has changes. Type '${expected}' to permanently discard files and branch: `
+          : `Type '${expected}' to remove worktree and branch: `,
+        { signal },
+      );
+      if (answer?.trim().toLowerCase() !== expected) {
+        process.stdout.write("Worktree discard cancelled; it remains preserved.\n");
+        return false;
+      }
+      discard = { dirty };
+      return true;
+    },
+  };
   await runAgency({
-    cwd: process.cwd(),
+    cwd: context?.path ?? process.cwd(),
     io,
     output: process.stdout,
     errorOutput: process.stderr,
+    ...(worktree === undefined ? {} : { worktree }),
   });
+  if (context !== undefined && discard !== undefined) {
+    await discardAgencyWorktree(context, { confirmed: true, discardDirty: discard.dirty });
+    process.stdout.write(`Discarded Agency worktree ${context.path} and branch ${context.branch}.\n`);
+  }
 }
 
 function isMainModule(): boolean {

@@ -4,6 +4,7 @@ import { isAbsolute, resolve } from "node:path";
 import { InfrastructureError, runCommand } from "../process/index.js";
 
 export const AGENCY_LOCAL_EXCLUDE_RULE = ".devagency/";
+export const AGENCY_WORKTREE_EXCLUDE_RULE = ".agency-worktrees/";
 
 export async function resolveGitExcludePath(rootPath: string): Promise<string> {
   const result = await runCommand({
@@ -24,13 +25,22 @@ export async function resolveGitExcludePath(rootPath: string): Promise<string> {
 }
 
 export async function ensureAgencyMetadataIgnored(rootPath: string): Promise<void> {
+  await ensureLocalExcludeRules(rootPath, [AGENCY_LOCAL_EXCLUDE_RULE]);
+}
+
+export async function ensureLocalExcludeRules(
+  rootPath: string,
+  rules: readonly string[],
+): Promise<void> {
   let excludePath: string;
   try {
     excludePath = await resolveGitExcludePath(rootPath);
     const contents = await readFile(excludePath, "utf8");
-    if (contents.split(/\r?\n/u).includes(AGENCY_LOCAL_EXCLUDE_RULE)) return;
+    const existing = new Set(contents.split(/\r?\n/u));
+    const missing = rules.filter((rule) => !existing.has(rule));
+    if (missing.length === 0) return;
     const prefix = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
-    await appendFile(excludePath, `${prefix}${AGENCY_LOCAL_EXCLUDE_RULE}\n`, "utf8");
+    await appendFile(excludePath, `${prefix}${missing.join("\n")}\n`, "utf8");
   } catch (cause) {
     if (
       cause instanceof InfrastructureError &&

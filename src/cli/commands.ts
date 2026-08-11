@@ -2,6 +2,10 @@ import type { SessionContext, VerificationResult } from "../domain/index.js";
 import type { SessionCompactionResult } from "../session/index.js";
 import { detectNodeVerificationCommands, runCommand, VerificationRunner } from "../process/index.js";
 import { inspectRepository, type RepositoryInspection } from "../repo/index.js";
+import {
+  GitCheckpointManager,
+  type AgencyWorktreeContext,
+} from "../repo/index.js";
 import type { TerminalRenderer } from "./renderer.js";
 
 export type SlashCommandResult = "continue" | "exit";
@@ -15,6 +19,12 @@ export interface SlashCommandDependencies {
   inspect?: (cwd: string) => Promise<RepositoryInspection>;
   gitDiff?: (cwd: string, signal: AbortSignal) => Promise<string>;
   verify?: (cwd: string, signal: AbortSignal) => Promise<VerificationResult>;
+  checkpoints?: Pick<GitCheckpointManager, "create" | "prepareUndo" | "applyUndo" | "discardUndoPlan" | "list">;
+  worktree?: {
+    context: AgencyWorktreeContext;
+    requestDiscard(signal: AbortSignal): Promise<boolean>;
+  };
+  confirm?: (prompt: string, signal: AbortSignal) => Promise<boolean>;
 }
 
 function userChangedFiles(porcelain: string): string[] {
@@ -80,7 +90,7 @@ export class SlashCommandRouter {
 
   async execute(input: string, signal: AbortSignal): Promise<SlashCommandResult> {
     const [command, ...args] = input.trim().split(/\s+/);
-    if (args.length > 0) {
+    if (args.length > 0 && command !== "/checkpoint" && command !== "/undo" && command !== "/worktree") {
       this.#dependencies.renderer.error(`${command} does not accept arguments.`);
       return "continue";
     }
@@ -95,6 +105,9 @@ export class SlashCommandRouter {
             "  /compact Compact older session context",
             "  /diff    Show the current Git diff",
             "  /verify  Run project verification",
+            "  /checkpoint [label] Create a Git snapshot without changing HEAD or staging",
+            "  /undo [checkpoint] Restore only unchanged Agency-owned paths",
+            "  /worktree [keep|discard] Show or manage isolated worktree",
             "  /tools   Collapse or expand tool activity (TTY)",
             "  /new     Start a fresh conversational session",
             "  /exit    Exit Agency",
@@ -131,6 +144,54 @@ export class SlashCommandRouter {
         const verify = this.#dependencies.verify ?? verifyProject;
         this.#dependencies.renderer.verification(
           await verify(this.#dependencies.projectRoot, signal),
+        );
+        return "continue";
+      }
+      case "/checkpoint": {
+        const checkpoints = this.#dependencies.checkpoints ?? new GitCheckpointManager(this.#dependencies.projectRoot);
+        const checkpoint = await checkpoints.create(args.join(" ") || undefined);
+        this.#dependencies.renderer.message(`Checkpoint ${checkpoint.id} created at ${checkpoint.ref}. HEAD and staging unchanged.`);
+        return "continue";
+      }
+      case "/undo": {
+        if (args.length > 1) {
+          this.#dependencies.renderer.error("/undo accepts at most one checkpoint id.");
+          return "continue";
+        }
+        const checkpoints = this.#dependencies.checkpoints ?? new GitCheckpointManager(this.#dependencies.projectRoot);
+        const plan = await checkpoints.prepareUndo(args[0]);
+        let allowDeletes = false;
+        if (plan.deletionsRequired.length > 0) {
+          const quoted = plan.deletionsRequired.map((path) => JSON.stringify(path)).join(", ");
+          const confirmed = await this.#dependencies.confirm?.(`Undo will delete ${plan.deletionsRequired.length} path(s): ${quoted}. Type yes to continue: `, signal) ?? false;
+          if (!confirmed) {
+            await checkpoints.discardUndoPlan(plan);
+            this.#dependencies.renderer.message("Undo cancelled; no files changed.");
+            return "continue";
+          }
+          allowDeletes = true;
+        }
+        const result = await checkpoints.applyUndo(plan, { allowDeletes });
+        this.#dependencies.renderer.message(
+          `Undo ${result.checkpointId}: restored ${result.restored.length}; refused ${result.diverged.length} diverged path${result.diverged.length === 1 ? "" : "s"}.${result.diverged.length === 0 ? "" : ` ${result.diverged.join(", ")}`}`,
+        );
+        return "continue";
+      }
+      case "/worktree": {
+        if (args.length > 1 || (args[0] !== undefined && args[0] !== "keep" && args[0] !== "discard")) {
+          this.#dependencies.renderer.error("Usage: /worktree [keep|discard]");
+          return "continue";
+        }
+        const worktree = this.#dependencies.worktree;
+        if (worktree === undefined) {
+          this.#dependencies.renderer.message("Worktree: direct checkout. Start Agency with --worktree for isolation.");
+          return "continue";
+        }
+        if (args[0] === "discard") {
+          return (await worktree.requestDiscard(signal)) ? "exit" : "continue";
+        }
+        this.#dependencies.renderer.message(
+          `Worktree: ${worktree.context.path}\nBranch: ${worktree.context.branch}\nPreserved on exit${args[0] === "keep" ? " (keep selected)" : ""}.`,
         );
         return "continue";
       }
