@@ -417,7 +417,7 @@ const planParameters = {
     plan: {
       type: "object",
       additionalProperties: false,
-      required: ["objective", "steps", "verificationStrategy"],
+      required: ["objective", "assumptions", "steps", "likelyFiles", "verificationStrategy"],
       properties: {
         objective: { type: "string", minLength: 1 },
         assumptions: { type: "array", items: { type: "string", minLength: 1 } },

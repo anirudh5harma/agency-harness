@@ -220,6 +220,19 @@ describe("PiCodingRuntime", () => {
     );
     expect(boundary.sdk.createResourceLoader).toHaveBeenCalledWith(repo.rootPath);
     expect(boundary.sessionOptions[0]?.customTools?.[0]?.name).toBe("submit_plan");
+    type StrictObjectSchema = {
+      additionalProperties: boolean;
+      required: string[];
+      properties: Record<string, unknown>;
+    };
+    const submitPlanParameters = boundary.sessionOptions[0]?.customTools?.[0]
+      ?.parameters as StrictObjectSchema;
+    const planParameters = submitPlanParameters.properties.plan as StrictObjectSchema;
+    const stepParameters = (planParameters.properties.steps as { items: StrictObjectSchema }).items;
+    for (const parameters of [submitPlanParameters, planParameters, stepParameters]) {
+      expect(parameters.additionalProperties).toBe(false);
+      expect(new Set(parameters.required)).toEqual(new Set(Object.keys(parameters.properties)));
+    }
     expect(boundary.submitResults).toEqual([
       {
         content: [{ type: "text", text: "Plan accepted. Stop now." }],
