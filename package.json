@@ -1,8 +1,15 @@
 {
   "name": "agency-harness",
   "version": "0.1.0",
-  "private": true,
   "description": "Local autonomous coding harness with durable workflows and independent verification",
+  "license": "MIT",
+  "keywords": [
+    "autonomous-agent",
+    "cli",
+    "coding-agent",
+    "developer-tools",
+    "langgraph"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/anirudh5harma/agency-harness.git"
@@ -10,6 +17,10 @@
   "homepage": "https://github.com/anirudh5harma/agency-harness#readme",
   "bugs": {
     "url": "https://github.com/anirudh5harma/agency-harness/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
   },
   "type": "module",
   "bin": {

@@ -1,0 +1,84 @@
+name: Publish
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      vars.NPM_PUBLISH_ENABLED == 'true' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - id: source
+        name: Confirm source is current main
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current_main="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ "$SOURCE_SHA" == "$current_main" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping stale source $SOURCE_SHA; main is $current_main."
+          fi
+      - if: steps.source.outputs.current == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - if: steps.source.outputs.current == 'true'
+        run: npm install --global npm@11.13.0
+      - if: steps.source.outputs.current == 'true'
+        run: npm ci
+      - if: steps.source.outputs.current == 'true'
+        run: npm run build
+      - id: release
+        if: steps.source.outputs.current == 'true'
+        name: Select immutable version
+        shell: bash
+        run: |
+          version="$(node --input-type=module --eval '
+            import manifest from "./package.json" with { type: "json" };
+            const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(manifest.version);
+            if (match === null) throw new Error("package version must be stable SemVer");
+            const patch = Number(process.env.GITHUB_RUN_NUMBER) * 100
+              + Number(process.env.GITHUB_RUN_ATTEMPT);
+            process.stdout.write(`${match[1]}.${match[2]}.${patch}`);
+          ')"
+          npm version "$version" --no-git-tag-version
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - id: promote
+        if: steps.source.outputs.current == 'true'
+        name: Reconfirm source is current main
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current_main="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ "$SOURCE_SHA" == "$current_main" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping publish because main advanced to $current_main."
+          fi
+      - if: steps.promote.outputs.current == 'true'
+        run: npm publish --access public --tag latest
