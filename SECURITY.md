@@ -1,10 +1,16 @@
-# Phase 1 security boundary
+# Security boundary
 
-Agency Phase 1 is not secure isolation. Coding runtimes and verification commands
-execute with the same operating-system permissions as the Agency process. The
-repository-local `.devagency/` exclusion and redacted trajectory records protect
-working-tree hygiene and observability data; they are not a sandbox or command
-authorization boundary.
+Agency is for trusted local repositories. It enforces least-privilege tool roles,
+repository-relative file access, private metadata protection, one-shot approvals for
+sensitive mutations, a strict shell allowlist, and unconditional blocking of Git
+publication/mutation from Pi. Planner tools are read-only. Agency independently
+measures Git changes and verifies the project.
 
-Do not use Phase 1 to run untrusted repositories or instructions. Process
-sandboxing and dangerous-command policy enforcement are intentionally deferred.
+These controls are not an OS or network sandbox. Approved repository verification
+scripts are executable project code and inherit host permissions. Portable Node.js
+APIs also cannot eliminate every hostile concurrent filesystem race. Do not run
+untrusted repositories or instructions; keep credentials outside repositories and
+prompts; inspect `/diff`; prefer `agency --worktree` for working-tree isolation.
+
+Run `agency --policy` for the exact active tool policy. `.devagency/` is private
+runtime metadata and must not be committed or manually edited.

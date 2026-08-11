@@ -9,6 +9,7 @@ mirror it under `test/`. The real-provider fixture and driver live in `fixtures/
 - Runtime interface and test fake: `src/coding/coding-runtime.ts`
 - CLI application, commands, REPL, and rendering: `src/cli/`
 - Session/checkpoint/registry state: `src/session/` and `src/persistence/`
+- Evaluation metrics: `src/evaluations/`
 - Git inspection and local exclusion: `src/repo/`
 - Independent command execution and verification: `src/process/`
 
@@ -25,3 +26,7 @@ credentials or the network; do not claim it passed unless it was actually run.
 `.devagency/` is runtime-owned, project-local metadata. Keep it out of source changes,
 never commit it, and preserve the repo-local Git exclude mechanism rather than adding
 it to a target project's shared `.gitignore`.
+
+Keep tool-policy claims truthful: application containment is not an OS/network
+sandbox. Do not persist prompts, response text, tool arguments, credentials, or raw
+changed-file names in metrics or trajectories.
