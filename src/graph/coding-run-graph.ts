@@ -18,10 +18,13 @@ import {
   HumanDecisionResolutionSchema,
   HumanDecisionResponseSchema,
   PlanSchema,
+  ProjectKnowledgeEntrySchema,
+  ProjectKnowledgeSchema,
   RepoContextSchema,
   SessionContextSchema,
   type AgencyPhase,
   type FailureContext,
+  type ProjectKnowledgeEntry,
   type VerificationResult,
 } from "../domain/index.js";
 import type { EventBus } from "../events/index.js";
@@ -34,6 +37,7 @@ import type {
   IncompleteRunEntry,
   IncompleteRunRegistry,
 } from "../persistence/index.js";
+import { ProjectKnowledgeStore, type ProjectKnowledgeStoreBoundary } from "../persistence/index.js";
 import {
   VerificationRunner,
   detectNodeVerificationCommands,
@@ -147,6 +151,8 @@ export const CodingRunStateSchema = new StateSchema({
   repoContext: RepoContextSchema.nullable().default(null),
   repoInstructions: z.string().max(MAX_REPO_INSTRUCTIONS).default(""),
   sessionContext: SessionContextSchema.nullable().default(null),
+  projectKnowledge: ProjectKnowledgeSchema.nullable().default(null),
+  proposedKnowledge: z.array(ProjectKnowledgeEntrySchema).max(300).default([]),
   codingPlan: BoundedPlanSchema.nullable().default(null),
   baseline: GitBaselineSchema.nullable().default(null),
   verificationCommands: z
@@ -205,6 +211,7 @@ export interface CodingRunGraphDependencies {
   trajectoryWriter?: TrajectoryWriter;
   ensureMetadataIgnored?: (rootPath: string) => Promise<void>;
   registry: IncompleteRunRegistryBoundary | IncompleteRunRegistry;
+  knowledgeStore?: ProjectKnowledgeStoreBoundary;
   now?: () => Date;
 }
 
@@ -389,6 +396,7 @@ export function createCodingRunGraph(
   const now = dependencies.now ?? (() => new Date());
   const ensureMetadataIgnored =
     dependencies.ensureMetadataIgnored ?? ensureAgencyMetadataIgnored;
+  let knowledgeStore: ProjectKnowledgeStoreBoundary | undefined = dependencies.knowledgeStore;
   const forwardRuntimeEvent = dependencies.eventBus === undefined
     ? undefined
     : (event: Parameters<EventBus["emit"]>[0]) => {
@@ -445,6 +453,19 @@ export function createCodingRunGraph(
       .map(({ path }) => path)
       .filter((path) => !isInternalMetadataPath(path))
       .slice(0, MAX_CHANGED_FILES);
+  }
+
+  function mergeKnowledge(
+    current: readonly ProjectKnowledgeEntry[],
+    proposed: readonly ProjectKnowledgeEntry[] | undefined,
+  ): ProjectKnowledgeEntry[] {
+    const merged = new Map<string, ProjectKnowledgeEntry>();
+    for (const raw of [...current, ...(proposed ?? [])]) {
+      const entry = ProjectKnowledgeEntrySchema.parse(raw);
+      const identity = `${entry.category}:${entry.text.toLocaleLowerCase()}`;
+      if (!merged.has(identity)) merged.set(identity, entry);
+    }
+    return [...merged.values()].slice(0, 300);
   }
 
   async function recordHumanRequest(
@@ -509,6 +530,8 @@ export function createCodingRunGraph(
       const inspection = await inspect(state.repoPath);
       await ensureMetadataIgnored(inspection.rootPath);
       metadataSafe = true;
+      knowledgeStore ??= new ProjectKnowledgeStore(inspection.rootPath);
+      const projectKnowledge = await knowledgeStore.load();
       startedAt = now();
       await recordTrajectory(state, "run_started", { at: startedAt });
       await recordTrajectory(state, "prepare_started", { at: startedAt });
@@ -543,6 +566,7 @@ export function createCodingRunGraph(
           repoPath: inspection.rootPath,
           repoContext: repositoryContext(inspection),
           repoInstructions,
+          projectKnowledge,
           baseline,
           verificationCommands,
           verificationScripts: preparedVerificationScripts,
@@ -565,6 +589,7 @@ export function createCodingRunGraph(
         repoPath: inspection.rootPath,
         repoContext: repositoryContext(inspection),
         repoInstructions,
+        projectKnowledge,
         baseline,
         verificationCommands,
         verificationScripts: preparedVerificationScripts,
@@ -607,6 +632,7 @@ export function createCodingRunGraph(
         ...(state.humanDecision === null ? {} : { humanDecision: state.humanDecision }),
         ...(state.runtimeContinuation === null ? {} : { runtimeContinuation: state.runtimeContinuation }),
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
+        ...(state.projectKnowledge === null ? {} : { projectKnowledge: state.projectKnowledge }),
         signal: runtime.signal ?? new AbortController().signal,
         ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
@@ -660,6 +686,7 @@ export function createCodingRunGraph(
         ...(state.humanDecision === null ? {} : { humanDecision: state.humanDecision }),
         ...(state.runtimeContinuation === null ? {} : { runtimeContinuation: state.runtimeContinuation }),
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
+        ...(state.projectKnowledge === null ? {} : { projectKnowledge: state.projectKnowledge }),
         signal: runtime.signal ?? new AbortController().signal,
         ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
@@ -673,17 +700,23 @@ export function createCodingRunGraph(
           humanDecisionOrigin: "executing",
           runtimeContinuation: result.runtimeContinuation ?? null,
           executionMessage: concise(result.message),
+          proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
         };
       }
       const changedFiles = await actualChangedFiles(state.baseline);
       await recordTrajectory(state, "execution_completed", {
         startedAt: boundary.startedAt,
-        metadata: { changedFileCount: changedFiles.length },
+        metadata: {
+          changedFileCount: changedFiles.length,
+          knowledgeProposalCount: result.proposedKnowledge?.length ?? 0,
+          knowledgeCategories: [...new Set(result.proposedKnowledge?.map(({ category }) => category) ?? [])],
+        },
       });
       return {
         ...boundary.result,
         changedFiles,
         executionMessage: concise(result.message),
+        proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
         failure: null,
         pendingHumanDecision: null,
         humanDecision: null,
@@ -793,6 +826,7 @@ export function createCodingRunGraph(
         ...(state.humanDecision === null ? {} : { humanDecision: state.humanDecision }),
         ...(state.runtimeContinuation === null ? {} : { runtimeContinuation: state.runtimeContinuation }),
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
+        ...(state.projectKnowledge === null ? {} : { projectKnowledge: state.projectKnowledge }),
         signal: runtime.signal ?? new AbortController().signal,
         ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
@@ -806,18 +840,25 @@ export function createCodingRunGraph(
           humanDecisionOrigin: "repairing",
           runtimeContinuation: result.runtimeContinuation ?? null,
           executionMessage: concise(result.message),
+          proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
         };
       }
       const changedFiles = await actualChangedFiles(state.baseline);
       await recordTrajectory(state, "repair_completed", {
         startedAt: boundary.startedAt,
-        metadata: { attempt, changedFileCount: changedFiles.length },
+        metadata: {
+          attempt,
+          changedFileCount: changedFiles.length,
+          knowledgeProposalCount: result.proposedKnowledge?.length ?? 0,
+          knowledgeCategories: [...new Set(result.proposedKnowledge?.map(({ category }) => category) ?? [])],
+        },
       });
       return {
         ...boundary.result,
         attempt,
         changedFiles,
         executionMessage: concise(result.message),
+        proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
         failure: null,
         pendingHumanDecision: null,
         humanDecision: null,
@@ -872,6 +913,10 @@ export function createCodingRunGraph(
       : state.failure?.recoverable === true && state.attempt >= state.maxRepairAttempts
         ? `${state.failure.message}; exhausted ${state.maxRepairAttempts} repair attempts.`
         : `Run failed: ${state.failure?.message ?? "unknown failure"}.`;
+    if (completed && state.proposedKnowledge.length > 0) {
+      knowledgeStore ??= new ProjectKnowledgeStore(state.repoPath);
+      await knowledgeStore.append(state.proposedKnowledge);
+    }
     try {
       await recordTrajectory(state, "run_completed", {
         metadata: {

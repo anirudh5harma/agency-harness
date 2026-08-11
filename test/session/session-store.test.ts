@@ -70,6 +70,29 @@ describe("SessionStore", () => {
     expect(session.runSummaries).toHaveLength(10);
     expect(session.runSummaries[0]?.runId).toBe("run-3");
     expect(session.runSummaries.at(-1)?.runId).toBe("run-12");
+    expect(session.olderSummary).toContain("[turn:user] request 0");
+    expect(session.olderSummary).toContain("[run:completed] objective 0");
+    expect(session.compactionCount).toBeGreaterThan(0);
+  });
+
+  it("loads Phase 1 JSON compatibly and explicitly compacts with redaction and counts", async () => {
+    const projectRoot = await temporaryProject();
+    const metadataDirectory = join(projectRoot, ".devagency");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(metadataDirectory);
+    const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+    await writeFile(join(metadataDirectory, "session.json"), JSON.stringify({
+      sessionId,
+      recentTurns: Array.from({ length: 10 }, (_, index) => ({ role: "user", content: index === 0 ? "token=secret-value" : `turn ${index}` })),
+      runSummaries: Array.from({ length: 6 }, (_, index) => ({ runId: `r${index}`, status: "completed", objective: `o${index}`, summary: `s${index}` })),
+    }));
+    const store = new SessionStore(projectRoot);
+    const loaded = await store.loadOrCreate();
+    expect(loaded).toMatchObject({ olderSummary: "", compactionCount: 0, lastCompactedAt: null });
+    const result = await store.compact();
+    expect(result).toMatchObject({ beforeTurns: 10, afterTurns: 6, beforeRunSummaries: 6, afterRunSummaries: 4 });
+    expect(result.session.olderSummary).not.toContain("secret-value");
+    expect(result.session.olderSummary).toContain("[REDACTED]");
   });
 
   it("starts a fresh session without touching other project metadata", async () => {

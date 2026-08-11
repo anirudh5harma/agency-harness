@@ -23,7 +23,7 @@ import type {
   TrajectoryLifecycleEvent,
   TrajectoryWriter,
 } from "../../src/observability/index.js";
-import { createSqliteCheckpointPersistence, IncompleteRunRegistry } from "../../src/persistence/index.js";
+import { createSqliteCheckpointPersistence, IncompleteRunRegistry, inspectIncompleteRunRecovery } from "../../src/persistence/index.js";
 import { InfrastructureError } from "../../src/process/index.js";
 import { EventBus } from "../../src/events/index.js";
 import {
@@ -112,6 +112,67 @@ afterEach(async () => {
 });
 
 describe("coding run graph", () => {
+  it("persists deduplicated proposals only after verification passes", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    const trajectory: Array<Parameters<TrajectoryWriter["append"]>[0]> = [];
+    deps.trajectoryWriter = { append: async (event) => { trajectory.push(event); } };
+    const append = vi.fn(async (entries) => ({ entries: [...entries], renderedContext: "saved" }));
+    deps.knowledgeStore = { load: async () => ({ entries: [], renderedContext: "None." }), append };
+    runtime.enqueueExecuteResult({
+      message: "done", changedFiles: [], sessionId: "pi-1",
+      proposedKnowledge: [
+        { category: "decision", text: "Use SQLite." },
+        { category: "decision", text: "use sqlite." },
+      ],
+    });
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+    expect(state.status).toBe("completed");
+    expect(append).toHaveBeenCalledWith([{ category: "decision", text: "Use SQLite." }]);
+    const executionEvent = trajectory.find(({ event }) => event === "execution_completed");
+    expect(executionEvent?.metadata).toMatchObject({ knowledgeProposalCount: 2, knowledgeCategories: ["decision"] });
+    expect(JSON.stringify(executionEvent)).not.toContain("SQLite");
+
+    const failed = await setup([verification("failed")]);
+    const failedAppend = vi.fn();
+    failed.deps.knowledgeStore = { load: async () => ({ entries: [], renderedContext: "None." }), append: failedAppend };
+    failed.runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-2", proposedKnowledge: [{ category: "learning", text: "Never persist me." }] });
+    failed.runtime.enqueueRepairResult({ message: "repair", changedFiles: [], sessionId: "pi-2" });
+    await createCodingRunGraph(failed.deps).invoke(input(failed.root, 1));
+    expect(failedAppend).not.toHaveBeenCalled();
+  });
+
+  it("keeps finalization recoverable and discoverable when knowledge persistence fails", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1", proposedKnowledge: [{ category: "learning", text: "A fact." }] });
+    const append = vi.fn()
+      .mockRejectedValueOnce(new InfrastructureError("METADATA_WRITE_FAILED", "knowledge unavailable"))
+      .mockResolvedValue({ entries: [{ category: "learning", text: "A fact." }], renderedContext: "saved" });
+    deps.knowledgeStore = {
+      load: async () => ({ entries: [], renderedContext: "None." }),
+      append,
+    };
+    const persistence = await createSqliteCheckpointPersistence(root);
+    const trajectory: TrajectoryLifecycleEvent[] = [];
+    deps.trajectoryWriter = { append: async ({ event }) => { trajectory.push(event); } };
+    const graph = createCodingRunGraph(deps, { checkpointer: persistence.checkpointer });
+
+    await expect(graph.invoke(input(root))).rejects.toThrow("knowledge unavailable");
+    const snapshot = await graph.getState("thread-001");
+    expect(snapshot).toMatchObject({
+      values: { runId: "run-001", status: "verifying", failure: null },
+      next: ["summarize"],
+    });
+    await expect(deps.registry.list()).resolves.toMatchObject([{ runId: "run-001" }]);
+    await expect(inspectIncompleteRunRecovery(deps.registry, graph)).resolves.toMatchObject([
+      { status: "resumable", entry: { runId: "run-001" } },
+    ]);
+
+    await expect(graph.resume("thread-001")).resolves.toMatchObject({ status: "completed" });
+    expect(append).toHaveBeenCalledTimes(2);
+    expect(trajectory.filter((event) => event === "run_completed")).toHaveLength(1);
+    await expect(deps.registry.list()).resolves.toEqual([]);
+    persistence.close();
+  });
   it("checkpoints a human request and resumes without duplicating execution", async () => {
     const { root, runtime, deps } = await setup([verification("passed")]);
     const request = {
@@ -337,9 +398,13 @@ describe("coding run graph", () => {
     runtime.enqueuePlanResult({ plan, message: "planned" });
     runtime.enqueueExecuteResult({ message: "broken", changedFiles: [], sessionId: "pi-1" });
     runtime.enqueueRepairResult({ message: "fixed", changedFiles: [], sessionId: "pi-1" });
-    const graph = createCodingRunGraph(
-      dependencies(runtime, [verification("failed"), verification("passed")], root),
-    );
+    const deps = dependencies(runtime, [verification("failed"), verification("passed")], root);
+    const knowledge = {
+      entries: [{ category: "architecture" as const, text: "The graph owns verification." }],
+      renderedContext: "Architecture:\n- The graph owns verification.",
+    };
+    deps.knowledgeStore = { load: async () => knowledge, append: async () => knowledge };
+    const graph = createCodingRunGraph(deps);
 
     const state = await graph.invoke(input(root));
 
@@ -347,6 +412,10 @@ describe("coding run graph", () => {
     expect(runtime.calls.createPlan[0]?.repoInstructions).toBe(state.repoInstructions);
     expect(runtime.calls.execute[0]?.repoInstructions).toBe(state.repoInstructions);
     expect(runtime.calls.repair[0]?.repoInstructions).toBe(state.repoInstructions);
+    expect(state.projectKnowledge).toEqual(knowledge);
+    expect(runtime.calls.createPlan[0]?.projectKnowledge).toEqual(knowledge);
+    expect(runtime.calls.execute[0]?.projectKnowledge).toEqual(knowledge);
+    expect(runtime.calls.repair[0]?.projectKnowledge).toEqual(knowledge);
   });
 
   it("repairs a coding verification failure and then succeeds", async () => {

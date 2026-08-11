@@ -33,6 +33,7 @@ import {
   type RepositoryInspection,
 } from "../repo/index.js";
 import { SessionStore } from "../session/index.js";
+import type { SessionCompactionResult } from "../session/index.js";
 import { SlashCommandRouter, type SlashCommandDependencies } from "./commands.js";
 import { AgencyRepl, type ReplHandler, type TerminalIO } from "./repl.js";
 import {
@@ -48,6 +49,7 @@ export interface SessionStoreBoundary {
   createNew(): Promise<SessionContext>;
   recordUserTurn(content: string): Promise<SessionContext>;
   recordRunSummary(summary: RunSummary): Promise<SessionContext>;
+  compact?(): Promise<SessionCompactionResult>;
 }
 
 export interface IncompleteRunRegistryBoundary {
@@ -134,6 +136,14 @@ export class AgencyApplication implements ReplHandler {
       createNewSession: async () => {
         this.#session = await this.#sessionStore.createNew();
         return this.#session;
+      },
+      compactSession: async () => {
+        if (this.#sessionStore.compact === undefined) {
+          throw new Error("Session compaction is unavailable");
+        }
+        const result = await this.#sessionStore.compact();
+        this.#session = result.session;
+        return result;
       },
       inspect: input.dependencies.inspectRepository ?? inspectRepository,
       ...input.dependencies.commandOverrides,

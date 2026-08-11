@@ -1,4 +1,5 @@
 import type { SessionContext, VerificationResult } from "../domain/index.js";
+import type { SessionCompactionResult } from "../session/index.js";
 import { detectNodeVerificationCommands, runCommand, VerificationRunner } from "../process/index.js";
 import { inspectRepository, type RepositoryInspection } from "../repo/index.js";
 import type { TerminalRenderer } from "./renderer.js";
@@ -10,6 +11,7 @@ export interface SlashCommandDependencies {
   renderer: TerminalRenderer;
   getSession(): SessionContext;
   createNewSession(): Promise<SessionContext>;
+  compactSession(): Promise<SessionCompactionResult>;
   inspect?: (cwd: string) => Promise<RepositoryInspection>;
   gitDiff?: (cwd: string, signal: AbortSignal) => Promise<string>;
   verify?: (cwd: string, signal: AbortSignal) => Promise<VerificationResult>;
@@ -90,6 +92,7 @@ export class SlashCommandRouter {
             "Commands:",
             "  /help    Show this help",
             "  /status  Show project and session status",
+            "  /compact Compact older session context",
             "  /diff    Show the current Git diff",
             "  /verify  Run project verification",
             "  /new     Start a fresh conversational session",
@@ -110,6 +113,17 @@ export class SlashCommandRouter {
       case "/diff": {
         const diff = this.#dependencies.gitDiff ?? gitDiff;
         this.#dependencies.renderer.diff(await diff(this.#dependencies.projectRoot, signal));
+        return "continue";
+      }
+      case "/compact": {
+        const result = await this.#dependencies.compactSession();
+        this.#dependencies.renderer.event({
+          type: "context_compacted",
+          beforeTurns: result.beforeTurns,
+          afterTurns: result.afterTurns,
+          beforeRunSummaries: result.beforeRunSummaries,
+          afterRunSummaries: result.afterRunSummaries,
+        });
         return "continue";
       }
       case "/verify": {

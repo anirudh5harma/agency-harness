@@ -4,6 +4,8 @@ import type {
   HumanDecisionRequest,
   HumanDecisionResolution,
   Plan,
+  ProjectKnowledge,
+  ProjectKnowledgeEntry,
   RepoContext,
   SessionContext,
 } from "../domain/index.js";
@@ -22,6 +24,7 @@ export interface CodingRuntimeInput {
   repo: RepoContext;
   repoInstructions?: string;
   sessionContext?: SessionContext;
+  projectKnowledge?: ProjectKnowledge;
   onEvent?: CodingEventSink;
   signal?: AbortSignal;
   /** Stable conversation identity for continuing a paused model session. */
@@ -55,12 +58,14 @@ export interface HumanDecisionResult {
   decisionRequest: HumanDecisionRequest;
   message: string;
   runtimeContinuation?: RuntimeContinuation;
+  proposedKnowledge?: ProjectKnowledgeEntry[];
 }
 
 export interface CodingResult {
   message: string;
   changedFiles: string[];
   sessionId: string;
+  proposedKnowledge?: ProjectKnowledgeEntry[];
 }
 
 export interface CodingRuntime {

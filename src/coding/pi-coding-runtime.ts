@@ -19,10 +19,12 @@ import {
   AgencyEventSchema,
   HumanDecisionRequestSchema,
   PlanSchema,
+  ProjectKnowledgeEntrySchema,
   type AgencyEvent,
   type FailureContext,
   type HumanDecisionRequest,
   type Plan,
+  type ProjectKnowledgeEntry,
   type RepoContext,
   type SessionContext,
 } from "../domain/index.js";
@@ -417,7 +419,16 @@ function sessionSummary(context: SessionContext | undefined): string {
     objective: concise(run.objective, MAX_CONTEXT_ITEM_CHARS),
     summary: concise(run.summary, MAX_CONTEXT_ITEM_CHARS),
   }));
-  return JSON.stringify({ turns, runs });
+  return [
+    `Older summary: ${context.olderSummary || "None."}`,
+    `Recent turns: ${JSON.stringify(turns)}`,
+    `Recent run summaries: ${JSON.stringify(runs)}`,
+    `Compaction metadata: ${JSON.stringify({ count: context.compactionCount, lastCompactedAt: context.lastCompactedAt })}`,
+  ].join("\n");
+}
+
+function knowledgeSummary(input: { projectKnowledge?: { renderedContext: string } }): string {
+  return input.projectKnowledge?.renderedContext ?? "None.";
 }
 
 function repositoryInstructions(input: { repoInstructions?: string }): string {
@@ -429,10 +440,11 @@ function repositoryInstructions(input: { repoInstructions?: string }): string {
 function plannerPrompt(input: CreatePlanInput): string {
   return [
     "Create a small, executable implementation plan for the stated intent.",
-    `Repository: ${repositorySummary(input.repo)}`,
+    `Current Git/repository state: ${repositorySummary(input.repo)}`,
     `Repository instructions: ${repositoryInstructions(input)}`,
     `Intent: ${concise(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
-    `Bounded prior context: ${sessionSummary(input.sessionContext)}`,
+    `Bounded session context:\n${sessionSummary(input.sessionContext)}`,
+    `Project knowledge:\n${knowledgeSummary(input)}`,
     "Inspect only as needed. You have no shell or mutation tools.",
     "Use request_human_input only for material ambiguity or a consequential approval; never elevate trivial choices.",
     ...(input.humanDecision === undefined
@@ -445,11 +457,13 @@ function plannerPrompt(input: CreatePlanInput): string {
 function executorPrompt(input: ExecuteInput): string {
   return [
     "Implement the validated plan in the repository.",
-    `Repository: ${repositorySummary(input.repo)}`,
+    `Current Git/repository state: ${repositorySummary(input.repo)}`,
     `Repository instructions: ${repositoryInstructions(input)}`,
     `Intent: ${concise(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
     `Validated plan: ${JSON.stringify(PlanSchema.parse(input.plan))}`,
-    `Bounded prior context: ${sessionSummary(input.sessionContext)}`,
+    `Bounded session context:\n${sessionSummary(input.sessionContext)}`,
+    `Project knowledge:\n${knowledgeSummary(input)}`,
+    "Use record_project_knowledge only to propose concise durable facts likely to improve future coding tasks. Never record prompts, transcripts, command/tool output, or credentials.",
     "Stay within the plan. Do not commit, stage, push, or open a pull request.",
     "Use request_human_input only for material ambiguity or a consequential action (dangerous shell, dependency replacement, database migration, or large destructive change); never elevate trivial choices.",
     "An approval is scoped to its exact normalized action and can be consumed only once. Rejection or edited guidance must cancel or replan the original action.",
@@ -489,12 +503,14 @@ function failureSummary(failure: FailureContext, changedFiles: string[]): string
 function repairPrompt(input: RepairInput): string {
   return [
     "Repair the existing implementation in this same executor session.",
-    `Repository: ${repositorySummary(input.repo)}`,
+    `Current Git/repository state: ${repositorySummary(input.repo)}`,
     `Repository instructions: ${repositoryInstructions(input)}`,
     `Intent: ${concise(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
     `Validated plan: ${JSON.stringify(PlanSchema.parse(input.plan))}`,
     `Repair attempt ${input.attempt}; bounded failure context: ${failureSummary(input.failure, input.changedFiles)}`,
-    `Bounded prior context: ${sessionSummary(input.sessionContext)}`,
+    `Bounded session context:\n${sessionSummary(input.sessionContext)}`,
+    `Project knowledge:\n${knowledgeSummary(input)}`,
+    "Use record_project_knowledge only to propose concise durable facts likely to improve future coding tasks. Never record prompts, transcripts, command/tool output, or credentials.",
     "Diagnose the failure before editing, then address only the observed failure.",
     "Never weaken or delete tests, lint rules, typecheck settings, configuration, or scripts to make verification pass.",
     "Do not commit, stage, push, or open a pull request.",
@@ -617,6 +633,32 @@ function requestHumanInputTool(onRequest: (request: HumanDecisionRequest) => voi
   };
 }
 
+const knowledgeParameters = {
+  type: "object",
+  additionalProperties: false,
+  required: ["category", "text"],
+  properties: {
+    category: { type: "string", enum: ["architecture", "decision", "learning"] },
+    text: { type: "string", minLength: 1, maxLength: 500 },
+  },
+} as ToolDefinition["parameters"];
+
+function recordProjectKnowledgeTool(onEntry: (entry: ProjectKnowledgeEntry) => void): ToolDefinition {
+  return {
+    name: "record_project_knowledge",
+    label: "Record project knowledge",
+    description: "Propose one concise durable project fact to Agency. This tool does not write files.",
+    parameters: knowledgeParameters,
+    constrainedSampling: { type: "json_schema", strict: "prefer" },
+    executionMode: "sequential",
+    async execute(_toolCallId, params) {
+      const entry = ProjectKnowledgeEntrySchema.parse(params);
+      onEntry(entry);
+      return { content: [{ type: "text", text: "Knowledge proposal recorded for post-verification review." }], details: {} };
+    },
+  };
+}
+
 function infrastructure(
   code:
     | "PI_RUNTIME_INITIALIZATION_FAILED"
@@ -665,6 +707,7 @@ export class PiCodingRuntime implements CodingRuntime {
   readonly #planners = new Map<string, PiSession>();
   readonly #planHandlers = new Map<string, (value: unknown) => void>();
   readonly #humanRequestHandlers = new Map<string, (request: HumanDecisionRequest) => void>();
+  readonly #knowledgeHandlers = new Map<string, (entry: ProjectKnowledgeEntry) => void>();
   readonly #approvedActions = new Map<string, string>();
   readonly #activeSessions = new Set<PiSession>();
   #disposed = false;
@@ -816,6 +859,7 @@ export class PiCodingRuntime implements CodingRuntime {
     this.#executors.clear();
     this.#planners.clear();
     this.#humanRequestHandlers.clear();
+    this.#knowledgeHandlers.clear();
     this.#planHandlers.clear();
     this.#approvedActions.clear();
     await Promise.allSettled([...sessions].map((session) => session.abort()));
@@ -842,7 +886,9 @@ export class PiCodingRuntime implements CodingRuntime {
     this.#activeSessions.add(session);
     const executorKey = this.#executorKey(input.repo, input.sessionId);
     let decisionRequest: HumanDecisionRequest | undefined;
+    const proposedKnowledge: ProjectKnowledgeEntry[] = [];
     this.#humanRequestHandlers.set(executorKey, (request) => { decisionRequest = request; });
+    this.#knowledgeHandlers.set(executorKey, (entry) => { proposedKnowledge.push(entry); });
     this.#approvedActions.delete(executorKey);
     if (
       input.humanDecision?.request.kind === "approval" &&
@@ -863,6 +909,7 @@ export class PiCodingRuntime implements CodingRuntime {
           decisionRequest,
           message: "Waiting for human input.",
           runtimeContinuation: runtimeContinuation(session, "executor"),
+          ...(proposedKnowledge.length === 0 ? {} : { proposedKnowledge }),
         };
       }
       if (state.eventState.providerError !== undefined) {
@@ -877,6 +924,7 @@ export class PiCodingRuntime implements CodingRuntime {
         message,
         changedFiles: [...state.eventState.changedFiles],
         sessionId: session.sessionId,
+        ...(proposedKnowledge.length === 0 ? {} : { proposedKnowledge }),
       };
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") throw error;
@@ -888,6 +936,7 @@ export class PiCodingRuntime implements CodingRuntime {
       state.unsubscribe();
       this.#activeSessions.delete(session);
       this.#humanRequestHandlers.delete(executorKey);
+      this.#knowledgeHandlers.delete(executorKey);
     }
   }
 
@@ -928,6 +977,7 @@ export class PiCodingRuntime implements CodingRuntime {
             },
           ) as unknown as ToolDefinition,
           requestHumanInputTool((request) => this.#humanRequestHandlers.get(executorKey)?.(request)),
+          recordProjectKnowledgeTool((entry) => this.#knowledgeHandlers.get(executorKey)?.(entry)),
         ],
       });
       enforceExclusiveHumanRequest(session);

@@ -38,6 +38,8 @@ export type TrajectoryLifecycleEvent = z.infer<
 export const TrajectoryMetadataSchema = z.strictObject({
   attempt: z.number().int().nonnegative().max(20).optional(),
   changedFileCount: z.number().int().nonnegative().max(2_000).optional(),
+  knowledgeProposalCount: z.number().int().nonnegative().max(300).optional(),
+  knowledgeCategories: z.array(z.enum(["architecture", "decision", "learning"])).max(3).optional(),
   status: z.enum(["completed", "failed"]).optional(),
   requestId: IdentifierSchema.optional(),
   decisionKind: z.enum(["clarification", "approval"]).optional(),

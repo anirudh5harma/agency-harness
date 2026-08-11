@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 const NonEmptyStringSchema = z.string().trim().min(1);
-function redactSecrets(value: string): string {
+export function redactSecrets(value: string): string {
   return value
     .replace(/\bBearer\s+[^\s,;]+/giu, "Bearer [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gu, "[REDACTED]")
@@ -193,6 +193,26 @@ export type RunStatus = z.infer<typeof RunStatusSchema>;
 
 export const MAX_SESSION_TURNS = 20;
 export const MAX_SESSION_RUN_SUMMARIES = 10;
+export const MAX_OLDER_SUMMARY_CHARS = 12_000;
+export const EXPLICIT_COMPACT_TURNS = 6;
+export const EXPLICIT_COMPACT_RUN_SUMMARIES = 4;
+
+export const ProjectKnowledgeEntrySchema = z.strictObject({
+  category: z.enum(["architecture", "decision", "learning"]),
+  text: z.string()
+    .regex(/^[^\r\n]*$/u, "Project knowledge entries must be a single line")
+    .trim()
+    .min(1)
+    .max(500)
+    .transform(redactSecrets),
+});
+export type ProjectKnowledgeEntry = z.infer<typeof ProjectKnowledgeEntrySchema>;
+
+export const ProjectKnowledgeSchema = z.strictObject({
+  entries: z.array(ProjectKnowledgeEntrySchema).max(300).default([]),
+  renderedContext: z.string().max(12_000).default("None."),
+});
+export type ProjectKnowledge = z.infer<typeof ProjectKnowledgeSchema>;
 
 export const SessionTurnSchema = z.strictObject({
   role: z.enum(["user", "assistant"]),
@@ -215,6 +235,9 @@ export type RunSummary = z.infer<typeof RunSummarySchema>;
 
 export const SessionContextSchema = z.strictObject({
   sessionId: NonEmptyStringSchema,
+  olderSummary: z.string().max(MAX_OLDER_SUMMARY_CHARS).default(""),
+  compactionCount: z.number().int().nonnegative().default(0),
+  lastCompactedAt: z.iso.datetime().nullable().default(null),
   recentTurns: z
     .array(SessionTurnSchema)
     .max(MAX_SESSION_TURNS)
@@ -254,6 +277,13 @@ export const AgencyEventSchema = z.discriminatedUnion("type", [
     durationMs: z.number().finite().nonnegative(),
   }),
   z.strictObject({ type: z.literal("message"), content: NonEmptyStringSchema }),
+  z.strictObject({
+    type: z.literal("context_compacted"),
+    beforeTurns: z.number().int().nonnegative(),
+    afterTurns: z.number().int().nonnegative(),
+    beforeRunSummaries: z.number().int().nonnegative(),
+    afterRunSummaries: z.number().int().nonnegative(),
+  }),
   z.strictObject({ type: z.literal("error"), message: NonEmptyStringSchema }),
   z.strictObject({
     type: z.literal("human_input_requested"),

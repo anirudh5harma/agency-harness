@@ -197,6 +197,39 @@ function createBoundary(options: {
 }
 
 describe("PiCodingRuntime", () => {
+  it("captures validated knowledge proposals without writing and labels bounded prompt context", async () => {
+    const boundary = createBoundary({
+      executorPrompt: async (_session, prompt) => {
+        expect(prompt).toContain("Older summary:");
+        expect(prompt).toContain("Recent turns:");
+        expect(prompt).toContain("Recent run summaries:");
+        expect(prompt).toContain("Current Git/repository state:");
+        expect(prompt).toContain("Project knowledge:\nArchitecture:");
+        const tool = boundary.sessionOptions.at(-1)?.customTools?.find(({ name }) => name === "record_project_knowledge");
+        await tool!.execute("knowledge-1", { category: "architecture", text: "token=do-not-store" }, undefined, undefined, {} as never);
+      },
+    });
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    const result = await runtime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-knowledge",
+      sessionContext: {
+        sessionId: "agency-knowledge",
+        olderSummary: "Earlier objective completed.",
+        compactionCount: 1,
+        lastCompactedAt: "2026-01-01T00:00:00.000Z",
+        recentTurns: [{ role: "user", content: "current task" }],
+        runSummaries: [],
+      },
+      projectKnowledge: {
+        entries: [{ category: "architecture", text: "The graph owns verification." }],
+        renderedContext: "Architecture:\n- The graph owns verification.",
+      },
+    });
+    expect(result).toMatchObject({ proposedKnowledge: [{ category: "architecture", text: "token=[REDACTED]" }] });
+  });
   it("pauses and continues the same planner session for human clarification", async () => {
     let prompts = 0;
     const boundary = createBoundary({

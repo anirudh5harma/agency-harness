@@ -103,6 +103,41 @@ afterEach(async () => {
 });
 
 describe("Agency terminal application", () => {
+  it("compacts session context without invoking Pi or LangGraph and shows status metadata", async () => {
+    const cwd = await temporaryGitProject();
+    const runtime = new FakeCodingRuntime();
+    const session: SessionContext = {
+      sessionId: "compact-session",
+      olderSummary: "",
+      compactionCount: 0,
+      lastCompactedAt: null,
+      recentTurns: Array.from({ length: 10 }, (_, index) => ({ role: "user" as const, content: `turn ${index}` })),
+      runSummaries: [],
+    };
+    const compacted = { ...session, olderSummary: "[turn:user] turn 0", compactionCount: 1, lastCompactedAt: "2026-01-01T00:00:00.000Z", recentTurns: session.recentTurns.slice(-6) };
+    const output = new BufferOutput();
+    const invoke = vi.fn();
+    await runAgency({
+      cwd,
+      io: new ScriptedIO(["/compact", "/status", "/exit"]),
+      output,
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => runtime,
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => session,
+        createNew: async () => session,
+        recordUserTurn: async () => session,
+        recordRunSummary: async () => session,
+        compact: async () => ({ session: compacted, beforeTurns: 10, afterTurns: 6, beforeRunSummaries: 0, afterRunSummaries: 0 }),
+      }),
+      graphFactory: () => ({ invoke, getState: async () => ({}), resume: vi.fn() }),
+      registryFactory: () => ({ list: async () => [], upsert: async () => {}, updateStatus: async () => {} }),
+    });
+    expect(runtime.calls).toEqual({ createPlan: [], execute: [], repair: [] });
+    expect(invoke).not.toHaveBeenCalled();
+    expect(output.value).toContain("Context compacted: turns 10→6, run summaries 0→0.");
+    expect(output.value).toContain("yes older summary (1 compactions)");
+  });
   it("cleans up initialized startup resources when a later dependency fails", async () => {
     const cwd = await temporaryGitProject();
     const io = new ScriptedIO([]);

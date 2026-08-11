@@ -45,6 +45,7 @@ export class PlainTerminalRenderer implements TerminalRenderer {
         "command_started",
         "command_finished",
         "message",
+        "context_compacted",
         "error",
         "human_input_requested",
         "human_input_resolved",
@@ -75,6 +76,9 @@ export class PlainTerminalRenderer implements TerminalRenderer {
     } else if (event.type === "human_input_resolved") {
       line(this.#output, `Human input resolved: ${event.resolution}`);
     } else if (event.type === "message") line(this.#output, event.content);
+    else if (event.type === "context_compacted") {
+      line(this.#output, `Context compacted: turns ${event.beforeTurns}→${event.afterTurns}, run summaries ${event.beforeRunSummaries}→${event.afterRunSummaries}.`);
+    }
     else if (event.type === "error") this.error(event.message);
   }
 
@@ -119,6 +123,7 @@ export class PlainTerminalRenderer implements TerminalRenderer {
     line(this.#output, `Last task: ${last?.objective ?? "none"}`);
     line(this.#output, `Status: ${last?.status ?? "idle"}`);
     line(this.#output, `Verification: ${last?.verification?.status ?? "none"}`);
+    line(this.#output, `Context: ${input.session.recentTurns.length} recent turns, ${input.session.runSummaries.length} recent runs, ${input.session.olderSummary === "" ? "no" : "yes"} older summary (${input.session.compactionCount} compactions)`);
     line(
       this.#output,
       (last?.changedFiles ?? input.changedFiles).length === 0

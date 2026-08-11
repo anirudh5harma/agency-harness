@@ -7,12 +7,21 @@ import {
   HumanDecisionRequestSchema,
   HumanDecisionResponseSchema,
   PlanSchema,
+  ProjectKnowledgeEntrySchema,
   RepoContextSchema,
   SessionContextSchema,
   VerificationResultSchema,
   type AgencyEvent,
   type Plan,
 } from "../../src/domain/index.js";
+
+describe("project knowledge contracts", () => {
+  it("rejects carriage returns and line feeds in a single entry", () => {
+    for (const text of ["one\ntwo", "one\rtwo", "one\r\ntwo"]) {
+      expect(() => ProjectKnowledgeEntrySchema.parse({ category: "learning", text })).toThrow();
+    }
+  });
+});
 
 describe("human decision contracts", () => {
   it("accepts bounded clarification and consequential approval requests", () => {
@@ -182,6 +191,9 @@ describe("runtime state contracts", () => {
   it("applies bounded session defaults", () => {
     expect(SessionContextSchema.parse({ sessionId: "session-1" })).toEqual({
       sessionId: "session-1",
+      olderSummary: "",
+      compactionCount: 0,
+      lastCompactedAt: null,
       recentTurns: [],
       runSummaries: [],
     });
