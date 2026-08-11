@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   POLICY_DISPLAY,
+  MissionMutationBudget,
   ROLE_TOOL_POLICY,
   assertAllowedBash,
   bashApprovalAction,
@@ -113,6 +114,46 @@ describe("Agency tool policy", () => {
     await expect(invoke(write, { path: ".GIT/config", content: "nope" })).rejects.toThrow("control paths");
     await expect(invoke(write, { path: "../escape", content: "nope" })).rejects.toThrow("traversal");
     await expect(invoke(write, { path: "outside-link", content: "nope" })).rejects.toThrow("non-symlink");
+  });
+
+  it("denies a fourth distinct mission path before mutation", async () => {
+    const { root } = await fixture();
+    const budget = new MissionMutationBudget();
+    budget.reconcile(3, []);
+    const write = createRoleFileTools({ root, role: "executor", mutationBudget: budget })
+      .find(({ name }) => name === "write")!;
+    for (const path of ["one.ts", "two.ts", "three.ts"]) {
+      await expect(invoke(write, { path, content: path })).resolves.toBeDefined();
+    }
+    await expect(invoke(write, { path: "four.ts", content: "forbidden" })).rejects.toThrow(
+      "mission mutation budget is limited to 3 distinct paths",
+    );
+    await expect(readFile(join(root, "four.ts"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("atomically reserves at most three parallel mission paths", async () => {
+    const { root } = await fixture();
+    const budget = new MissionMutationBudget();
+    budget.reconcile(3, []);
+    const write = createRoleFileTools({ root, role: "executor", mutationBudget: budget })
+      .find(({ name }) => name === "write")!;
+    const settled = await Promise.allSettled(["one", "two", "three", "four"].map((path) =>
+      invoke(write, { path: `${path}.ts`, content: path })));
+    expect(settled.filter(({ status }) => status === "fulfilled")).toHaveLength(3);
+    expect(settled.filter(({ status }) => status === "rejected")).toHaveLength(1);
+    expect((await Promise.all(["one", "two", "three", "four"].map(async (path) =>
+      readFile(join(root, `${path}.ts`), "utf8").then(() => true, () => false))))
+      .filter(Boolean)).toHaveLength(3);
+  });
+
+  it("releases only a failed new mission reservation", async () => {
+    const budget = new MissionMutationBudget();
+    budget.reconcile(1, []);
+    await expect(budget.run("failed.ts", async () => { throw new Error("delegate failed"); }))
+      .rejects.toThrow("delegate failed");
+    await expect(budget.run("replacement.ts", async () => "ok")).resolves.toBe("ok");
+    await expect(budget.run("replacement.ts", async () => "same")).resolves.toBe("same");
+    expect([...budget.paths]).toEqual(["replacement.ts"]);
   });
 
   it("allows local verification but blocks unsafe shell variants", () => {

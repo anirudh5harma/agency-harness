@@ -11,6 +11,7 @@ import {
   type SessionContext,
 } from "../domain/index.js";
 import { EventBus } from "../events/index.js";
+import { EvaluationStore, type EvaluationRepository, type MissionKind } from "../evaluations/index.js";
 import {
   createCodingRunGraph,
   type CodingRunGraphRunner,
@@ -79,12 +80,14 @@ export interface AgencyApplicationDependencies {
   runtimeFactory?: () => Promise<CodingRuntime>;
   registryFactory?: (root: string) => IncompleteRunRegistryBoundary;
   trajectoryWriterFactory?: (root: string) => TrajectoryWriter;
+  evaluationStoreFactory?: (root: string) => EvaluationRepository;
   graphFactory?: (input: {
     runtime: CodingRuntime;
     registry: IncompleteRunRegistryBoundary;
     eventBus: EventBus;
     checkpoint: SqliteCheckpointPersistence;
     trajectoryWriter: TrajectoryWriter;
+    evaluationStore: EvaluationRepository;
   }) => CodingRunGraphRunner;
   inspectRecovery?: (
     registry: IncompleteRunRegistryBoundary,
@@ -111,6 +114,7 @@ export class AgencyApplication implements ReplHandler {
   readonly #commands: SlashCommandRouter;
   readonly #createId: () => string;
   readonly #gitCheckpoints: GitCheckpointManager;
+  readonly #evaluationStore: EvaluationRepository;
   readonly #detachMutationTracking: () => void;
   #activeMutationRunId: string | null = null;
   #mutationWrites: Promise<void> = Promise.resolve();
@@ -129,6 +133,7 @@ export class AgencyApplication implements ReplHandler {
     registry: IncompleteRunRegistryBoundary;
     checkpoint: SqliteCheckpointPersistence;
     eventBus: EventBus;
+    evaluationStore: EvaluationRepository;
   }) {
     this.#io = input.dependencies.io;
     this.#inspection = input.inspection;
@@ -143,6 +148,7 @@ export class AgencyApplication implements ReplHandler {
       input.dependencies.inspectRecovery ?? inspectIncompleteRunRecovery;
     this.#createId = input.dependencies.createId ?? randomUUID;
     this.#gitCheckpoints = new GitCheckpointManager(input.inspection.rootPath);
+    this.#evaluationStore = input.evaluationStore;
     this.#detachMutationTracking = input.eventBus.subscribe("file_changed", ({ path }) => {
       if (this.#activeMutationRunId === null) return;
       try {
@@ -177,6 +183,8 @@ export class AgencyApplication implements ReplHandler {
         const answer = await this.#readLineUntilAbort(prompt, signal);
         return answer?.trim().toLowerCase() === "yes";
       },
+      runMission: (kind, intent, signal) => this.#handleIntent(intent, signal, kind),
+      evaluations: this.#evaluationStore,
       ...input.dependencies.commandOverrides,
     });
   }
@@ -213,12 +221,15 @@ export class AgencyApplication implements ReplHandler {
       const trajectoryWriter =
         dependencies.trajectoryWriterFactory?.(inspection.rootPath) ??
         new JsonlTrajectoryWriter(inspection.rootPath);
+      const evaluationStore = dependencies.evaluationStoreFactory?.(inspection.rootPath) ??
+        new EvaluationStore(inspection.rootPath);
       const graph = dependencies.graphFactory?.({
         runtime,
         registry,
         eventBus,
         checkpoint,
         trajectoryWriter,
+        evaluationStore,
       }) ??
         createCodingRunGraph(
           {
@@ -226,6 +237,7 @@ export class AgencyApplication implements ReplHandler {
             registry,
             eventBus,
             trajectoryWriter,
+            evaluationStore,
             // Bootstrap already established the local exclusion before persistence.
             ensureMetadataIgnored: async () => {},
           },
@@ -242,6 +254,7 @@ export class AgencyApplication implements ReplHandler {
         registry,
         checkpoint,
         eventBus,
+        evaluationStore,
       });
     } catch (error) {
       await runtime?.dispose();
@@ -272,7 +285,11 @@ export class AgencyApplication implements ReplHandler {
       }
     }
 
-    const intent = line.slice(0, MAX_USER_INTENT_CHARS);
+    await this.#handleIntent(line.slice(0, MAX_USER_INTENT_CHARS), signal);
+    return "continue";
+  }
+
+  async #handleIntent(intent: string, signal: AbortSignal, missionKind?: MissionKind): Promise<void> {
     const sessionContext = await this.#sessionStore.recordUserTurn(intent);
     this.#session = sessionContext;
     const runId = this.#createId();
@@ -290,25 +307,23 @@ export class AgencyApplication implements ReplHandler {
           repoPath: this.#inspection.rootPath,
           userIntent: intent,
           sessionContext,
+          ...(missionKind === undefined ? {} : { missionKind }),
         },
         { threadId, signal },
       );
       if (signal.aborted) {
-        this.#renderer.setRunStatus("cancelled");
-        this.#renderer.message("Cancelled.");
-        return "continue";
+        await this.#finalizeCancellation(threadId);
+        return;
       }
       state = await this.#resolveHumanInput(state, signal);
       if (signal.aborted) {
-        this.#renderer.setRunStatus("cancelled");
-        this.#renderer.message("Cancelled.");
-        return "continue";
+        await this.#finalizeCancellation(threadId);
+        return;
       }
       await this.#handleTerminalRun(state);
     } catch (error) {
       if (signal.aborted) {
-        this.#renderer.setRunStatus("cancelled");
-        this.#renderer.message("Cancelled.");
+        await this.#finalizeCancellation(threadId);
       } else {
         this.#renderer.setRunStatus("failed");
         this.#renderer.error(error instanceof Error ? error.message : String(error));
@@ -323,7 +338,6 @@ export class AgencyApplication implements ReplHandler {
         this.#renderer.recovery(`Warning: could not finalize undo ownership for run ${runId}: ${error instanceof Error ? error.message : String(error)}.`);
       }
     }
-    return "continue";
   }
 
   async interruptActive(): Promise<void> {
@@ -403,22 +417,24 @@ export class AgencyApplication implements ReplHandler {
         activeController = new AbortController();
         const response = await this.#promptHumanDecision(pendingRequest, activeController.signal);
         if (response === null || activeController.signal.aborted) {
-          this.#renderer.setRunStatus(activeController.signal.aborted ? "cancelled" : "idle");
+          if (activeController.signal.aborted) await this.#finalizeCancellation(candidate.entry.threadId);
+          else this.#renderer.setRunStatus("idle");
           return;
         }
         this.#renderer.setRunStatus("running");
         boundRecoveryRunId = await this.#gitCheckpoints.segmentRecoveryRun(candidate.entry.runId);
         this.#activeMutationRunId = boundRecoveryRunId;
         this.#mutationWriteError = undefined;
-        let state = await this.#graph.resume(
+        const resumed = await this.#resumeWithCancellation(
           candidate.entry.threadId,
           response,
-          { signal: activeController.signal },
+          activeController.signal,
         );
+        if (resumed === null) return;
+        let state = resumed;
         state = await this.#resolveHumanInput(state, activeController.signal);
         if (activeController.signal.aborted) {
-          this.#renderer.setRunStatus("cancelled");
-          this.#renderer.message("Cancelled.");
+          await this.#finalizeCancellation(candidate.entry.threadId);
           return;
         }
         await this.#handleTerminalRun(state);
@@ -441,18 +457,20 @@ export class AgencyApplication implements ReplHandler {
           boundRecoveryRunId = await this.#gitCheckpoints.segmentRecoveryRun(candidate.entry.runId);
           this.#activeMutationRunId = boundRecoveryRunId;
           this.#mutationWriteError = undefined;
-          let state = await this.#graph.resume(candidate.entry.threadId, undefined, {
-            signal: activeController.signal,
-          });
+          const resumed = await this.#resumeWithCancellation(
+            candidate.entry.threadId,
+            undefined,
+            activeController.signal,
+          );
+          if (resumed === null) return;
+          let state = resumed;
           if (activeController.signal.aborted) {
-            this.#renderer.setRunStatus("cancelled");
-            this.#renderer.message("Cancelled.");
+            await this.#finalizeCancellation(candidate.entry.threadId);
             return;
           }
           state = await this.#resolveHumanInput(state, activeController.signal);
           if (activeController.signal.aborted) {
-            this.#renderer.setRunStatus("cancelled");
-            this.#renderer.message("Cancelled.");
+            await this.#finalizeCancellation(candidate.entry.threadId);
             return;
           }
           await this.#handleTerminalRun(state);
@@ -605,6 +623,36 @@ export class AgencyApplication implements ReplHandler {
     this.#renderer.run(state);
     if (state.failure?.stage !== "finalizing") {
       await this.#pruneTerminalCheckpoint(state.threadId);
+    }
+  }
+
+  async #finalizeCancellation(threadId: string): Promise<void> {
+    this.#renderer.setRunStatus("cancelled");
+    try {
+      const state = await this.#graph.cancel?.(threadId);
+      if (state === undefined) {
+        this.#renderer.message("Cancelled.");
+        return;
+      }
+      await this.#handleTerminalRun(state);
+    } catch (error) {
+      this.#renderer.recovery(
+        `Cancellation finalization for ${threadId} remains recoverable: ${error instanceof Error ? error.message : String(error)}.`,
+      );
+    }
+  }
+
+  async #resumeWithCancellation(
+    threadId: string,
+    response: HumanDecisionResponse | undefined,
+    signal: AbortSignal,
+  ): Promise<CodingRunState | null> {
+    try {
+      return await this.#graph.resume(threadId, response, { signal });
+    } catch (error) {
+      if (!signal.aborted) throw error;
+      await this.#finalizeCancellation(threadId);
+      return null;
     }
   }
 

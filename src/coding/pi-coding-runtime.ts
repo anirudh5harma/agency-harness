@@ -42,6 +42,7 @@ import type {
 } from "./coding-runtime.js";
 import {
   ROLE_TOOL_POLICY,
+  MissionMutationBudget,
   createProtectedBashTool,
   createRoleFileTools,
   defaultToolFactoryBoundary,
@@ -389,6 +390,8 @@ export function normalizePiEvent(
   now = Date.now(),
 ): AgencyEvent[] {
   recordMessages(event, state);
+
+  if (event.type === "turn_start") return [{ type: "model_turn" }];
 
   if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
     state.assistantStream ??= new IncrementalSecretRedactor();
@@ -766,6 +769,7 @@ export class PiCodingRuntime implements CodingRuntime {
   readonly #sdk: PiSdkBoundary;
   readonly #modelRuntime: ModelRuntime;
   readonly #executors = new Map<string, PiSession>();
+  readonly #mutationBudgets = new Map<string, { budgetId?: string; budget: MissionMutationBudget }>();
   readonly #planners = new Map<string, PiSession>();
   readonly #planHandlers = new Map<string, (value: unknown) => void>();
   readonly #humanRequestHandlers = new Map<string, (request: HumanDecisionRequest) => void>();
@@ -929,6 +933,7 @@ export class PiCodingRuntime implements CodingRuntime {
     this.#knowledgeHandlers.clear();
     this.#planHandlers.clear();
     this.#approvedActions.clear();
+    this.#mutationBudgets.clear();
     await Promise.allSettled([...sessions].map((session) => session.abort()));
     for (const session of persistentSessions) session.dispose();
     this.#activeSessions.clear();
@@ -943,6 +948,19 @@ export class PiCodingRuntime implements CodingRuntime {
   async #runExecutor(input: ExecuteInput, prompt: string): Promise<CodingResult | import("./coding-runtime.js").HumanDecisionResult> {
     this.#assertUsable();
     assertNotAborted(input.signal);
+    const executorKey = this.#executorKey(input.repo, input.sessionId);
+    const mutationBudget = this.#mutationBudgets.get(executorKey) ?? { budget: new MissionMutationBudget() };
+    if (input.missionPolicy === undefined) {
+      delete mutationBudget.budgetId;
+      mutationBudget.budget.reconcile(undefined, []);
+    } else {
+      if (mutationBudget.budgetId !== input.missionPolicy.budgetId) {
+        mutationBudget.budget.reconcile(undefined, []);
+      }
+      mutationBudget.budgetId = input.missionPolicy.budgetId;
+      mutationBudget.budget.reconcile(input.missionPolicy.maxChangedFiles, input.missionPolicy.changedPaths);
+    }
+    this.#mutationBudgets.set(executorKey, mutationBudget);
     const session = await this.#executor(
       input.repo,
       input.sessionId,
@@ -951,7 +969,6 @@ export class PiCodingRuntime implements CodingRuntime {
     );
     const state = this.#subscribe(session, input.onEvent);
     this.#activeSessions.add(session);
-    const executorKey = this.#executorKey(input.repo, input.sessionId);
     let decisionRequest: HumanDecisionRequest | undefined;
     const proposedKnowledge: ProjectKnowledgeEntry[] = [];
     this.#humanRequestHandlers.set(executorKey, (request) => { decisionRequest = request; });
@@ -1041,6 +1058,9 @@ export class PiCodingRuntime implements CodingRuntime {
             root: repo.rootPath,
             role: "executor",
             factories: this.#sdk,
+            ...(this.#mutationBudgets.get(executorKey) === undefined
+              ? {}
+              : { mutationBudget: this.#mutationBudgets.get(executorKey)!.budget }),
             consumeApproval: (action) => {
               const approved = this.#approvedActions.get(executorKey);
               if (approved !== action) return false;

@@ -29,6 +29,12 @@ import {
   type VerificationResult,
 } from "../domain/index.js";
 import type { EventBus } from "../events/index.js";
+import {
+  EvaluationStore,
+  type EvaluationStoreBoundary,
+  type MissionKind,
+  type RunEvaluation,
+} from "../evaluations/index.js";
 import type {
   TrajectoryLifecycleEvent,
   TrajectoryMetadata,
@@ -162,9 +168,19 @@ export const CodingRunStateSchema = new StateSchema({
     .default([]),
   verificationScripts: VerificationScriptsSchema.default({}),
   attempt: z.number().int().nonnegative().max(20).default(0),
+  missionKind: z.enum(["tests", "dead-code", "simplify", "performance"]).nullable().default(null),
+  toolCalls: z.number().int().nonnegative().max(1_000_000).default(0),
+  modelCalls: z.strictObject({
+    planner: z.number().int().nonnegative().max(1_000_000),
+    execute: z.number().int().nonnegative().max(1_000_000),
+    repair: z.number().int().nonnegative().max(1_000_000),
+  }).default({ planner: 0, execute: 0, repair: 0 }),
+  humanDecisionCount: z.number().int().nonnegative().max(1_000_000).default(0),
   maxRepairAttempts: z.number().int().positive().max(20).default(2),
   changedFiles: z.array(z.string().trim().min(1)).max(MAX_CHANGED_FILES).default([]),
   verification: BoundedVerificationSchema.nullable().default(null),
+  verificationCommandCount: z.number().int().nonnegative().max(MAX_COMMANDS * 21).default(0),
+  verificationCommandDurationsMs: z.array(z.number().finite().nonnegative()).max(MAX_COMMANDS * 21).default([]),
   pendingHumanDecision: HumanDecisionRequestSchema.nullable().default(null),
   humanDecision: HumanDecisionResolutionSchema.nullable().default(null),
   runtimeContinuation: RuntimeContinuationSchema.nullable().default(null),
@@ -180,7 +196,7 @@ export type CodingRunInput = Pick<
   CodingRunState,
   "runId" | "threadId" | "sessionId" | "repoPath" | "userIntent"
 > &
-  Partial<Pick<CodingRunState, "maxRepairAttempts" | "sessionContext">>;
+  Partial<Pick<CodingRunState, "maxRepairAttempts" | "sessionContext" | "missionKind">>;
 
 export interface IncompleteRunRegistryBoundary {
   readonly path?: string;
@@ -212,6 +228,7 @@ export interface CodingRunGraphDependencies {
   ensureMetadataIgnored?: (rootPath: string) => Promise<void>;
   registry: IncompleteRunRegistryBoundary | IncompleteRunRegistry;
   knowledgeStore?: ProjectKnowledgeStoreBoundary;
+  evaluationStore?: EvaluationStoreBoundary;
   now?: () => Date;
 }
 
@@ -232,6 +249,7 @@ export interface CodingRunGraphRunner {
     response?: import("../domain/index.js").HumanDecisionResponse,
     options?: { signal?: AbortSignal },
   ): Promise<CodingRunState>;
+  cancel?(threadId: string): Promise<CodingRunState>;
 }
 
 type PhaseStatus = Extract<
@@ -397,13 +415,41 @@ export function createCodingRunGraph(
   const ensureMetadataIgnored =
     dependencies.ensureMetadataIgnored ?? ensureAgencyMetadataIgnored;
   let knowledgeStore: ProjectKnowledgeStoreBoundary | undefined = dependencies.knowledgeStore;
-  const forwardRuntimeEvent = dependencies.eventBus === undefined
-    ? undefined
-    : (event: Parameters<EventBus["emit"]>[0]) => {
+  let evaluationStore: EvaluationStoreBoundary | undefined = dependencies.evaluationStore;
+  // Live deltas make normal SIGINT exact. A process crash can recover only metrics
+  // already committed in the LangGraph checkpoint; uncheckpointed provider events
+  // are intentionally not reconstructed or estimated.
+  const liveMetrics = new Map<string, {
+    toolCalls: number;
+    modelCalls: CodingRunState["modelCalls"];
+  }>();
+  const cancellingThreads = new Set<string>();
+
+  function runtimeCallMetrics(
+    state: CodingRunState,
+    role: keyof CodingRunState["modelCalls"],
+  ) {
+    const live = liveMetrics.get(state.threadId) ?? {
+      toolCalls: state.toolCalls,
+      modelCalls: { ...state.modelCalls },
+    };
+    liveMetrics.set(state.threadId, live);
+    return {
+      onEvent(event: Parameters<EventBus["emit"]>[0]) {
+        if (event.type === "tool") live.toolCalls += 1;
+        if (event.type === "model_turn") live.modelCalls[role] += 1;
         // Graph lifecycle owns phase events. Forwarding the runtime's duplicate
         // phase notification would render every model phase twice.
         if (event.type !== "phase") dependencies.eventBus?.emit(event);
-      };
+      },
+      result() {
+        return {
+          toolCalls: live.toolCalls,
+          modelCalls: { ...live.modelCalls },
+        };
+      },
+    };
+  }
 
   async function recordTrajectory(
     state: Pick<CodingRunState, "runId" | "sessionId">,
@@ -466,6 +512,14 @@ export function createCodingRunGraph(
       if (!merged.has(identity)) merged.set(identity, entry);
     }
     return [...merged.values()].slice(0, 300);
+  }
+
+  function missionPolicyInput(state: CodingRunState, changedPaths = state.changedFiles): Pick<import("../coding/index.js").CodingRuntimeInput, "missionPolicy"> | Record<never, never> {
+    return state.missionKind === null ? {} : { missionPolicy: {
+      budgetId: state.runId,
+      maxChangedFiles: 3,
+      changedPaths: [...changedPaths],
+    } };
   }
 
   async function recordHumanRequest(
@@ -531,6 +585,7 @@ export function createCodingRunGraph(
       await ensureMetadataIgnored(inspection.rootPath);
       metadataSafe = true;
       knowledgeStore ??= new ProjectKnowledgeStore(inspection.rootPath);
+      evaluationStore ??= new EvaluationStore(inspection.rootPath);
       const projectKnowledge = await knowledgeStore.load();
       startedAt = now();
       await recordTrajectory(state, "run_started", { at: startedAt });
@@ -623,6 +678,7 @@ export function createCodingRunGraph(
       const reportedError = await failureAfterRecording(state, "plan_failed", boundary.startedAt, error);
       return { status: "failed", failure: infrastructureFailure("planning", reportedError) };
     }
+    const callMetrics = runtimeCallMetrics(state, "planner");
     try {
       const result = await dependencies.runtime.createPlan({
         intent: state.userIntent,
@@ -634,13 +690,15 @@ export function createCodingRunGraph(
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         ...(state.projectKnowledge === null ? {} : { projectKnowledge: state.projectKnowledge }),
         signal: runtime.signal ?? new AbortController().signal,
-        ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
+        ...missionPolicyInput(state),
+        onEvent: callMetrics.onEvent,
       });
       if ("decisionRequest" in result) {
         const decisionRequest = HumanDecisionRequestSchema.parse(result.decisionRequest);
         await recordHumanRequest(state, decisionRequest);
         return {
           ...boundary.result,
+          ...callMetrics.result(),
           pendingHumanDecision: decisionRequest,
           humanDecision: null,
           runtimeContinuation: result.runtimeContinuation ?? null,
@@ -648,11 +706,15 @@ export function createCodingRunGraph(
         };
       }
       const codingPlan = BoundedPlanSchema.parse(result.plan);
+      if (state.missionKind !== null && codingPlan.steps.length > 3) {
+        throw new Error("Mission plan exceeds the bounded maximum of 3 steps");
+      }
       await recordTrajectory(state, "plan_completed", {
         startedAt: boundary.startedAt,
       });
       return {
         ...boundary.result,
+        ...callMetrics.result(),
         codingPlan,
         pendingHumanDecision: null,
         humanDecision: null,
@@ -661,7 +723,7 @@ export function createCodingRunGraph(
       };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "plan_failed", boundary.startedAt, error);
-      return { ...boundary.result, status: "failed", failure: infrastructureFailure("planning", reportedError) };
+      return { ...boundary.result, ...callMetrics.result(), status: "failed", failure: infrastructureFailure("planning", reportedError) };
     }
   };
 
@@ -674,6 +736,16 @@ export function createCodingRunGraph(
       const reportedError = await failureAfterRecording(state, "execution_failed", boundary.startedAt, error);
       return { status: "failed", failure: infrastructureFailure("executing", reportedError) };
     }
+    const preRuntimeChangedFiles = await actualChangedFiles(state.baseline);
+    if (state.missionKind !== null && preRuntimeChangedFiles.length > 3) {
+      return {
+        ...boundary.result,
+        changedFiles: preRuntimeChangedFiles,
+        status: "failed",
+        failure: { stage: "executing", message: "Mission already exceeds the 3-file budget", recoverable: false },
+      };
+    }
+    const callMetrics = runtimeCallMetrics(state, "execute");
     try {
       const result = await dependencies.runtime.execute({
         intent: state.userIntent,
@@ -686,13 +758,17 @@ export function createCodingRunGraph(
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         ...(state.projectKnowledge === null ? {} : { projectKnowledge: state.projectKnowledge }),
         signal: runtime.signal ?? new AbortController().signal,
-        ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
+        ...missionPolicyInput(state, preRuntimeChangedFiles),
+        onEvent: callMetrics.onEvent,
       });
+      const measuredChangedFiles = await actualChangedFiles(state.baseline);
       if ("decisionRequest" in result) {
         const decisionRequest = HumanDecisionRequestSchema.parse(result.decisionRequest);
         await recordHumanRequest(state, decisionRequest);
         return {
           ...boundary.result,
+          ...callMetrics.result(),
+          changedFiles: measuredChangedFiles,
           pendingHumanDecision: decisionRequest,
           humanDecision: null,
           runtimeContinuation: result.runtimeContinuation ?? null,
@@ -700,7 +776,17 @@ export function createCodingRunGraph(
           proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
         };
       }
-      const changedFiles = await actualChangedFiles(state.baseline);
+      const changedFiles = measuredChangedFiles;
+      if (state.missionKind !== null && changedFiles.length > 3) {
+        const message = "Mission changed more than 3 files; refusing successful completion";
+        return {
+          ...boundary.result,
+          ...callMetrics.result(),
+          changedFiles,
+          status: "failed",
+          failure: { stage: "executing", message, recoverable: false },
+        };
+      }
       await recordTrajectory(state, "execution_completed", {
         startedAt: boundary.startedAt,
         metadata: {
@@ -711,6 +797,7 @@ export function createCodingRunGraph(
       });
       return {
         ...boundary.result,
+        ...callMetrics.result(),
         changedFiles,
         executionMessage: concise(result.message),
         proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
@@ -721,7 +808,7 @@ export function createCodingRunGraph(
       };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "execution_failed", boundary.startedAt, error);
-      return { ...boundary.result, status: "failed", failure: infrastructureFailure("executing", reportedError) };
+      return { ...boundary.result, ...callMetrics.result(), status: "failed", failure: infrastructureFailure("executing", reportedError) };
     }
   };
 
@@ -766,6 +853,13 @@ export function createCodingRunGraph(
           runtime.signal ?? new AbortController().signal,
         ),
       );
+      const verificationMetrics = {
+        verificationCommandCount: state.verificationCommandCount + verification.commands.length,
+        verificationCommandDurationsMs: [
+          ...state.verificationCommandDurationsMs,
+          ...verification.commands.map(({ durationMs }) => durationMs),
+        ].slice(0, MAX_COMMANDS * 21),
+      };
       if (verification.status !== "passed") {
         await recordTrajectory(state, "verification_failed");
         await recordTrajectory(state, "verification_completed", {
@@ -773,6 +867,7 @@ export function createCodingRunGraph(
         });
         return {
           ...boundary.result,
+          ...verificationMetrics,
           verification,
           failure: {
             stage: "verifying",
@@ -788,7 +883,7 @@ export function createCodingRunGraph(
       await recordTrajectory(state, "verification_completed", {
         startedAt: boundary.startedAt,
       });
-      return { ...boundary.result, verification, failure: null };
+      return { ...boundary.result, ...verificationMetrics, verification, failure: null };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "verification_failed", boundary.startedAt, error);
       return { ...boundary.result, status: "failed", failure: infrastructureFailure("verifying", reportedError) };
@@ -808,7 +903,17 @@ export function createCodingRunGraph(
       const reportedError = await failureAfterRecording(state, "repair_failed", boundary.startedAt, error);
       return { status: "failed", failure: infrastructureFailure("repairing", reportedError) };
     }
+    const preRuntimeChangedFiles = await actualChangedFiles(state.baseline);
+    if (state.missionKind !== null && preRuntimeChangedFiles.length > 3) {
+      return {
+        ...boundary.result,
+        changedFiles: preRuntimeChangedFiles,
+        status: "failed",
+        failure: { stage: "repairing", message: "Mission already exceeds the 3-file budget", recoverable: false },
+      };
+    }
     const attempt = state.attempt + 1;
+    const callMetrics = runtimeCallMetrics(state, "repair");
     try {
       const result = await dependencies.runtime.repair({
         intent: state.userIntent,
@@ -824,13 +929,17 @@ export function createCodingRunGraph(
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         ...(state.projectKnowledge === null ? {} : { projectKnowledge: state.projectKnowledge }),
         signal: runtime.signal ?? new AbortController().signal,
-        ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
+        ...missionPolicyInput(state, preRuntimeChangedFiles),
+        onEvent: callMetrics.onEvent,
       });
+      const measuredChangedFiles = await actualChangedFiles(state.baseline);
       if ("decisionRequest" in result) {
         const decisionRequest = HumanDecisionRequestSchema.parse(result.decisionRequest);
         await recordHumanRequest(state, decisionRequest);
         return {
           ...boundary.result,
+          ...callMetrics.result(),
+          changedFiles: measuredChangedFiles,
           pendingHumanDecision: decisionRequest,
           humanDecision: null,
           runtimeContinuation: result.runtimeContinuation ?? null,
@@ -838,7 +947,18 @@ export function createCodingRunGraph(
           proposedKnowledge: mergeKnowledge(state.proposedKnowledge, result.proposedKnowledge),
         };
       }
-      const changedFiles = await actualChangedFiles(state.baseline);
+      const changedFiles = measuredChangedFiles;
+      if (state.missionKind !== null && changedFiles.length > 3) {
+        const message = "Mission changed more than 3 files; refusing successful completion";
+        return {
+          ...boundary.result,
+          ...callMetrics.result(),
+          attempt,
+          changedFiles,
+          status: "failed",
+          failure: { stage: "repairing", message, recoverable: false },
+        };
+      }
       await recordTrajectory(state, "repair_completed", {
         startedAt: boundary.startedAt,
         metadata: {
@@ -850,6 +970,7 @@ export function createCodingRunGraph(
       });
       return {
         ...boundary.result,
+        ...callMetrics.result(),
         attempt,
         changedFiles,
         executionMessage: concise(result.message),
@@ -861,7 +982,7 @@ export function createCodingRunGraph(
       };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "repair_failed", boundary.startedAt, error);
-      return { ...boundary.result, status: "failed", failure: infrastructureFailure("repairing", reportedError) };
+      return { ...boundary.result, ...callMetrics.result(), attempt, status: "failed", failure: infrastructureFailure("repairing", reportedError) };
     }
   };
 
@@ -887,6 +1008,7 @@ export function createCodingRunGraph(
     return {
       pendingHumanDecision: null,
       humanDecision: { request, response },
+      humanDecisionCount: state.humanDecisionCount + 1,
       updatedAt: now().toISOString(),
     };
   };
@@ -903,18 +1025,47 @@ export function createCodingRunGraph(
   };
 
   const summarize: typeof CodingRunStateSchema.Node = async (state) => {
-    const completed = state.failure === null && state.verification?.status === "passed";
-    let status: "completed" | "failed" = completed ? "completed" : "failed";
-    let summary = completed
+    const cancelled = state.status === "cancelled";
+    const completed = !cancelled && state.failure === null && state.verification?.status === "passed";
+    let status: "completed" | "failed" | "cancelled" = cancelled ? "cancelled" : completed ? "completed" : "failed";
+    let summary = cancelled
+      ? `Run cancelled. ${state.changedFiles.length} file${state.changedFiles.length === 1 ? "" : "s"} changed.`
+      : completed
       ? `${state.verification?.summary ?? "Run completed"}. ${state.changedFiles.length} file${state.changedFiles.length === 1 ? "" : "s"} changed.`
       : state.failure?.recoverable === true && state.attempt >= state.maxRepairAttempts
         ? `${state.failure.message}; exhausted ${state.maxRepairAttempts} repair attempts.`
         : `Run failed: ${state.failure?.message ?? "unknown failure"}.`;
-    if (completed && state.proposedKnowledge.length > 0) {
+    if (!cancelled && completed && state.proposedKnowledge.length > 0) {
       knowledgeStore ??= new ProjectKnowledgeStore(state.repoPath);
       await knowledgeStore.append(state.proposedKnowledge);
     }
+    const completedAt = now();
+    evaluationStore ??= new EvaluationStore(state.repoPath);
+    const modelCallTotal = state.modelCalls.planner + state.modelCalls.execute + state.modelCalls.repair;
+    const evaluation: RunEvaluation = {
+      schemaVersion: 1,
+      runId: state.runId,
+      status,
+      success: completed,
+      durationMs: Math.max(0, completedAt.getTime() - new Date(state.createdAt ?? completedAt).getTime()),
+      repairAttempts: state.attempt,
+      toolCalls: state.toolCalls,
+      modelCalls: { ...state.modelCalls, total: modelCallTotal },
+      changedFileCount: state.changedFiles.length,
+      verification: state.verification === null
+        ? { status: "not-run", commandCount: 0, durationsMs: [] }
+        : {
+            status: state.verification.status,
+            commandCount: state.verificationCommandCount,
+            durationsMs: state.verificationCommandDurationsMs,
+          },
+      humanDecisionCount: state.humanDecisionCount,
+      ...(state.missionKind === null ? {} : { mission: state.missionKind as MissionKind }),
+    };
+    let finalizationStage: "evaluation" | "trajectory" | "registry" = "evaluation";
     try {
+      await evaluationStore.write(evaluation);
+      finalizationStage = "trajectory";
       await recordTrajectory(state, "run_completed", {
         metadata: {
           status,
@@ -922,10 +1073,17 @@ export function createCodingRunGraph(
           changedFileCount: state.changedFiles.length,
         },
       });
+      finalizationStage = "registry";
       await dependencies.registry.updateStatus(state.runId, status, now().toISOString());
+      liveMetrics.delete(state.threadId);
+      cancellingThreads.delete(state.threadId);
     } catch (error) {
+      if (finalizationStage === "evaluation") throw error;
       status = "failed";
       summary = `Run failed while finalizing incomplete-run metadata: ${errorMessage(error)}.`;
+      await evaluationStore.write({ ...evaluation, status: "failed", success: false });
+      liveMetrics.delete(state.threadId);
+      cancellingThreads.delete(state.threadId);
       return {
         status,
         summary: concise(summary),
@@ -992,6 +1150,42 @@ export function createCodingRunGraph(
         safeResponse === undefined ? null : new Command({ resume: safeResponse }),
         config(threadId, resumeOptions.signal),
       );
+    },
+    async cancel(threadId) {
+      const runConfig = config(threadId);
+      let snapshot = await compiled.getState(runConfig);
+      let values = snapshot.values as CodingRunState;
+      if (["completed", "failed", "cancelled"].includes(values.status) && snapshot.next.length === 0) {
+        liveMetrics.delete(threadId);
+        cancellingThreads.delete(threadId);
+        return values;
+      }
+      cancellingThreads.add(threadId);
+      if (values.status !== "cancelled") {
+        const live = liveMetrics.get(threadId);
+        const changedFiles = values.baseline === null
+          ? values.changedFiles
+          : await actualChangedFiles(values.baseline);
+        await compiled.updateState(runConfig, {
+          status: "cancelled",
+          ...(live === undefined ? {} : {
+            toolCalls: live.toolCalls,
+            modelCalls: { ...live.modelCalls },
+          }),
+          changedFiles,
+          pendingHumanDecision: null,
+          humanDecision: null,
+          failure: null,
+          updatedAt: now().toISOString(),
+        }, "verify");
+        snapshot = await compiled.getState(runConfig);
+        values = snapshot.values as CodingRunState;
+      }
+      if (snapshot.next.length === 0) return values;
+      const cancelled = await compiled.invoke(null, runConfig);
+      liveMetrics.delete(threadId);
+      cancellingThreads.delete(threadId);
+      return cancelled;
     },
   };
 }

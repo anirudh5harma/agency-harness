@@ -8,6 +8,12 @@ import {
 } from "../repo/index.js";
 import type { TerminalRenderer } from "./renderer.js";
 import { POLICY_DISPLAY } from "../coding/tool-policy.js";
+import {
+  EvaluationStore,
+  MissionKindSchema,
+  aggregateEvaluations,
+  type MissionKind,
+} from "../evaluations/index.js";
 
 export type SlashCommandResult = "continue" | "exit";
 
@@ -26,6 +32,33 @@ export interface SlashCommandDependencies {
     requestDiscard(signal: AbortSignal): Promise<boolean>;
   };
   confirm?: (prompt: string, signal: AbortSignal) => Promise<boolean>;
+  runMission?(kind: MissionKind, intent: string, signal: AbortSignal): Promise<void>;
+  evaluations?: Pick<EvaluationStore, "listRecent">;
+}
+
+const MISSION_FOCUS: Record<MissionKind, string> = {
+  tests: "the highest-value missing or weak automated test",
+  "dead-code": "the highest-value safely removable dead-code item",
+  simplify: "the highest-value behavior-preserving simplification",
+  performance: "the highest-value measurable performance improvement",
+};
+
+export function missionIntent(kind: MissionKind): string {
+  return [
+    `Bounded ${kind} mission.`,
+    `First inspect the repository, then choose exactly ONE ${MISSION_FOCUS[kind]} and complete only that objective.`,
+    "Change at most 3 files. Preserve existing behavior except for the chosen test or measurable performance outcome.",
+    "Do not add dependencies, create migrations, publish, stage, commit, push, or open a pull request.",
+    "Follow all normal approval rules and finish with Agency's normal independent verification.",
+  ].join(" ");
+}
+
+function percentage(value: number): string {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function decimal(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }
 
 function userChangedFiles(porcelain: string): string[] {
@@ -90,8 +123,9 @@ export class SlashCommandRouter {
   }
 
   async execute(input: string, signal: AbortSignal): Promise<SlashCommandResult> {
-    const [command, ...args] = input.trim().split(/\s+/);
-    if (args.length > 0 && command !== "/checkpoint" && command !== "/undo" && command !== "/worktree") {
+    const [rawCommand, ...args] = input.trim().split(/\s+/);
+    const command = rawCommand ?? "";
+    if (args.length > 0 && !["/checkpoint", "/undo", "/worktree", "/mission", "/metrics"].includes(command)) {
       this.#dependencies.renderer.error(`${command} does not accept arguments.`);
       return "continue";
     }
@@ -106,6 +140,8 @@ export class SlashCommandRouter {
             "  /compact Compact older session context",
             "  /diff    Show the current Git diff",
             "  /verify  Run project verification",
+            "  /mission tests|dead-code|simplify|performance Run one bounded objective through the normal workflow",
+            "  /metrics [last] Show aggregate or latest run evaluation metrics",
             "  /checkpoint [label] Create a Git snapshot without changing HEAD or staging",
             "  /undo [checkpoint] Restore only unchanged Agency-owned paths",
             "  /worktree [keep|discard] Show or manage isolated worktree",
@@ -147,6 +183,48 @@ export class SlashCommandRouter {
         this.#dependencies.renderer.verification(
           await verify(this.#dependencies.projectRoot, signal),
         );
+        return "continue";
+      }
+      case "/mission": {
+        if (args.length !== 1) {
+          this.#dependencies.renderer.error("Usage: /mission tests|dead-code|simplify|performance");
+          return "continue";
+        }
+        const kind = args[0] ?? "";
+        const parsed = MissionKindSchema.safeParse(kind);
+        if (!parsed.success) {
+          this.#dependencies.renderer.error(`Unknown mission: ${kind}. Available: tests, dead-code, simplify, performance.`);
+          return "continue";
+        }
+        if (this.#dependencies.runMission === undefined) throw new Error("Mission execution is unavailable");
+        await this.#dependencies.runMission(parsed.data, missionIntent(parsed.data), signal);
+        return "continue";
+      }
+      case "/metrics": {
+        if (args.length > 1 || (args[0] !== undefined && args[0] !== "last")) {
+          this.#dependencies.renderer.error("Usage: /metrics [last]");
+          return "continue";
+        }
+        const store = this.#dependencies.evaluations ?? new EvaluationStore(this.#dependencies.projectRoot);
+        const result = await store.listRecent(args[0] === "last" ? 1 : 100);
+        if (args[0] === "last") {
+          const last = result.evaluations[0];
+          this.#dependencies.renderer.message(last === undefined
+            ? "Metrics: no evaluations recorded."
+            : [
+                `Metrics last: ${last.runId} — ${last.status}${last.mission === undefined ? "" : ` (${last.mission} mission)`}`,
+                `Duration: ${decimal(last.durationMs)}ms; repairs: ${last.repairAttempts}; tools: ${last.toolCalls}; model calls: ${last.modelCalls.total}; files: ${last.changedFileCount}`,
+                `Verification: ${last.verification.status} (${last.verification.commandCount} commands); human decisions: ${last.humanDecisionCount}`,
+              ].join("\n"));
+        } else {
+          const aggregate = aggregateEvaluations(result.evaluations);
+          this.#dependencies.renderer.message([
+            `Metrics: ${aggregate.runs} recent run${aggregate.runs === 1 ? "" : "s"}`,
+            `Success: ${percentage(aggregate.successRate)}; verification pass: ${percentage(aggregate.verificationPassRate)}`,
+            `Averages: ${decimal(aggregate.averageDurationMs)}ms; repairs ${decimal(aggregate.averageRepairAttempts)}; tools ${decimal(aggregate.averageToolCalls)}; model calls ${decimal(aggregate.averageModelCalls)}; files ${decimal(aggregate.averageChangedFiles)}`,
+            ...(result.corruptCount === 0 ? [] : [`Skipped corrupt evaluations: ${result.corruptCount}`]),
+          ].join("\n"));
+        }
         return "continue";
       }
       case "/checkpoint": {

@@ -32,6 +32,11 @@ export interface CodingRuntimeInput {
   /** Validated answer to the runtime's immediately preceding request. */
   humanDecision?: HumanDecisionResolution;
   runtimeContinuation?: RuntimeContinuation;
+  missionPolicy?: {
+    budgetId: string;
+    maxChangedFiles: 3;
+    changedPaths: string[];
+  };
 }
 
 export type CreatePlanInput = CodingRuntimeInput;

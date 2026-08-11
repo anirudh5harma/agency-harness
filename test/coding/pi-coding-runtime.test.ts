@@ -958,6 +958,11 @@ describe("PiCodingRuntime", () => {
 });
 
 describe("normalizePiEvent", () => {
+  it("normalizes each provider turn without exposing provider payload", () => {
+    const state = { calls: new Map(), changedFiles: new Set<string>(), finalMessage: "", providerError: undefined };
+    expect(normalizePiEvent({ type: "turn_start" } as AgentSessionEvent, state)).toEqual([{ type: "model_turn" }]);
+  });
+
   it("emits only exact safe AgencyEvent variants and never thinking or raw output", () => {
     const state = {
       calls: new Map(),

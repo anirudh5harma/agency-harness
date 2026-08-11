@@ -40,7 +40,7 @@ export const TrajectoryMetadataSchema = z.strictObject({
   changedFileCount: z.number().int().nonnegative().max(2_000).optional(),
   knowledgeProposalCount: z.number().int().nonnegative().max(300).optional(),
   knowledgeCategories: z.array(z.enum(["architecture", "decision", "learning"])).max(3).optional(),
-  status: z.enum(["completed", "failed"]).optional(),
+  status: z.enum(["completed", "failed", "cancelled"]).optional(),
   requestId: IdentifierSchema.optional(),
   decisionKind: z.enum(["clarification", "approval"]).optional(),
   question: z.string().trim().min(1).max(1_000).optional(),

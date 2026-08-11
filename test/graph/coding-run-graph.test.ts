@@ -56,7 +56,20 @@ async function repository(): Promise<string> {
 }
 
 function verification(status: "passed" | "failed"): VerificationResult {
-  return { status, summary: status === "passed" ? "tests passed" : "tests failed", commands: [] };
+  return {
+    status,
+    summary: status === "passed" ? "tests passed" : "tests failed",
+    commands: [{
+      command: "npm",
+      args: ["test"],
+      exitCode: status === "passed" ? 0 : 1,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      durationMs: status === "passed" ? 20 : 10,
+      timedOut: false,
+    }],
+  };
 }
 
 function skippedVerification(): VerificationResult {
@@ -112,6 +125,67 @@ afterEach(async () => {
 });
 
 describe("coding run graph", () => {
+  it("records exact failed-run model counts without estimating usage", async () => {
+    const root = await repository();
+    const runtime = new FakeCodingRuntime();
+    runtime.enqueuePlanResult(new Error("planner unavailable"));
+    runtime.createPlan = async (runtimeInput) => {
+      runtimeInput.onEvent?.({ type: "model_turn" });
+      return FakeCodingRuntime.prototype.createPlan.call(runtime, runtimeInput);
+    };
+    const deps = dependencies(runtime, [], root);
+    const write = vi.fn(async () => {});
+    deps.evaluationStore = { write };
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("failed");
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      status: "failed",
+      success: false,
+      repairAttempts: 0,
+      toolCalls: 0,
+      modelCalls: { planner: 1, execute: 0, repair: 0, total: 1 },
+      verification: { status: "not-run", commandCount: 0, durationsMs: [] },
+      humanDecisionCount: 0,
+    }));
+    expect(JSON.stringify(write.mock.calls[0]?.[0])).not.toMatch(/tokens?|cost/iu);
+  });
+
+  it("refuses mission success when measured Git delta exceeds three files", async () => {
+    const { root, runtime, deps } = await setup([]);
+    runtime.enqueueExecuteResult({ message: "too broad", changedFiles: [], sessionId: "pi-1" });
+    deps.getChangedFiles = async () => ["a", "b", "c", "d"].map((path) => ({ path, status: "added" as const }));
+    const write = vi.fn(async () => {});
+    deps.evaluationStore = { write };
+
+    const state = await createCodingRunGraph(deps).invoke({ ...input(root), missionKind: "simplify" });
+
+    expect(state).toMatchObject({
+      status: "failed",
+      changedFiles: ["a", "b", "c", "d"],
+      failure: { stage: "executing", recoverable: false },
+    });
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      status: "failed",
+      changedFileCount: 4,
+      mission: "simplify",
+    }));
+    expect(deps.runVerification).not.toHaveBeenCalled();
+  });
+
+  it("seeds mission runtime budget from authoritative Git delta before reentry", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    runtime.enqueueExecuteResult({ message: "bounded", changedFiles: [], sessionId: "pi-1" });
+    deps.getChangedFiles = async () => ["a", "b", "c"].map((path) => ({ path, status: "added" as const }));
+    await createCodingRunGraph(deps).invoke({ ...input(root), missionKind: "tests" });
+    expect(runtime.calls.execute[0]?.missionPolicy).toEqual({
+      budgetId: "run-001",
+      maxChangedFiles: 3,
+      changedPaths: ["a", "b", "c"],
+    });
+  });
+
   it("persists deduplicated proposals only after verification passes", async () => {
     const { root, runtime, deps } = await setup([verification("passed")]);
     const trajectory: Array<Parameters<TrajectoryWriter["append"]>[0]> = [];
@@ -173,6 +247,28 @@ describe("coding run graph", () => {
     await expect(deps.registry.list()).resolves.toEqual([]);
     persistence.close();
   });
+  it("keeps evaluation persistence failure recoverable at finalization", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    const write = vi.fn()
+      .mockRejectedValueOnce(new InfrastructureError("METADATA_WRITE_FAILED", "evaluations unavailable"))
+      .mockResolvedValue(undefined);
+    deps.evaluationStore = { write };
+    const persistence = await createSqliteCheckpointPersistence(root);
+    const graph = createCodingRunGraph(deps, { checkpointer: persistence.checkpointer });
+
+    await expect(graph.invoke(input(root))).rejects.toThrow("evaluations unavailable");
+    await expect(graph.getState("thread-001")).resolves.toMatchObject({
+      values: { runId: "run-001", status: "verifying", failure: null },
+      next: ["summarize"],
+    });
+    await expect(inspectIncompleteRunRecovery(deps.registry, graph)).resolves.toMatchObject([
+      { status: "resumable", entry: { runId: "run-001" } },
+    ]);
+    await expect(graph.resume("thread-001")).resolves.toMatchObject({ status: "completed" });
+    expect(write).toHaveBeenCalledTimes(2);
+    persistence.close();
+  });
   it("checkpoints a human request and resumes without duplicating execution", async () => {
     const { root, runtime, deps } = await setup([verification("passed")]);
     const request = {
@@ -217,6 +313,82 @@ describe("coding run graph", () => {
     expect(trajectory.filter((event) => event === "human_input_requested")).toHaveLength(1);
     expect(trajectory.filter((event) => event === "human_input_resolved")).toHaveLength(1);
     expect(trajectory.filter((event) => event === "execution_started")).toHaveLength(1);
+  });
+
+  it("finalizes cancellation exactly once and retries evaluation persistence", async () => {
+    const { root, runtime, deps } = await setup([]);
+    const request = {
+      id: "cancel-choice",
+      kind: "clarification" as const,
+      question: "Continue?",
+      options: [
+        { id: "yes", label: "Yes", description: "Continue." },
+        { id: "no", label: "No", description: "Stop." },
+      ],
+      allowCustom: true,
+    };
+    runtime.enqueueExecuteResult({ decisionRequest: request, message: "waiting" });
+    const write = vi.fn()
+      .mockRejectedValueOnce(new InfrastructureError("METADATA_WRITE_FAILED", "evaluation unavailable"))
+      .mockResolvedValue(undefined);
+    deps.evaluationStore = { write };
+    const trajectory: Array<Parameters<TrajectoryWriter["append"]>[0]> = [];
+    deps.trajectoryWriter = { append: async (event) => { trajectory.push(event); } };
+    const graph = createCodingRunGraph(deps, { checkpointer: new MemorySaver() });
+    await graph.invoke({ ...input(root), threadId: "cancel-thread" }, { threadId: "cancel-thread" });
+
+    await expect(graph.cancel?.("cancel-thread")).rejects.toThrow("evaluation unavailable");
+    await expect(inspectIncompleteRunRecovery(deps.registry, graph)).resolves.toMatchObject([
+      { status: "resumable", entry: { runId: "run-001" } },
+    ]);
+    const cancelled = await graph.cancel?.("cancel-thread");
+    expect(cancelled).toMatchObject({ status: "cancelled", changedFiles: [] });
+    expect(write).toHaveBeenLastCalledWith(expect.objectContaining({
+      status: "cancelled",
+      success: false,
+      changedFileCount: 0,
+    }));
+    await graph.cancel?.("cancel-thread");
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(trajectory.filter(({ event }) => event === "run_completed")).toEqual([
+      expect.objectContaining({ metadata: expect.objectContaining({ status: "cancelled" }) }),
+    ]);
+    await expect(deps.registry.list()).resolves.toEqual([]);
+  });
+
+  it("persists live execute metrics during abort cancellation", async () => {
+    const { root, runtime, deps } = await setup([]);
+    let started!: () => void;
+    const executing = new Promise<void>((resolve) => { started = resolve; });
+    runtime.execute = async (runtimeInput) => {
+      runtimeInput.onEvent?.({ type: "model_turn" });
+      runtimeInput.onEvent?.({ type: "tool", tool: "read" });
+      started();
+      await new Promise<void>((_resolve, reject) => runtimeInput.signal?.addEventListener(
+        "abort",
+        () => reject(new DOMException("aborted", "AbortError")),
+        { once: true },
+      ));
+      throw new Error("unreachable");
+    };
+    const write = vi.fn(async () => {});
+    deps.evaluationStore = { write };
+    const graph = createCodingRunGraph(deps, { checkpointer: new MemorySaver() });
+    const controller = new AbortController();
+    const invoking = graph.invoke(
+      { ...input(root), threadId: "live-cancel" },
+      { threadId: "live-cancel", signal: controller.signal },
+    ).catch(() => undefined);
+    await executing;
+    controller.abort();
+    await invoking;
+
+    await graph.cancel?.("live-cancel");
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      status: "cancelled",
+      toolCalls: 1,
+      modelCalls: { planner: 0, execute: 1, repair: 0, total: 1 },
+    }));
   });
 
   it("routes a planning response from the checkpointed planning status", async () => {
@@ -276,9 +448,28 @@ describe("coding run graph", () => {
     runtime.enqueueRepairResult({ decisionRequest: request, message: "choice needed" });
     runtime.enqueueRepairResult({ message: "first repair", changedFiles: [], sessionId: "pi-1" });
     runtime.enqueueRepairResult({ message: "second repair", changedFiles: [], sessionId: "pi-1" });
+    runtime.createPlan = async (runtimeInput) => {
+      runtimeInput.onEvent?.({ type: "model_turn" });
+      runtimeInput.onEvent?.({ type: "tool", tool: "read" });
+      return FakeCodingRuntime.prototype.createPlan.call(runtime, runtimeInput);
+    };
+    runtime.execute = async (runtimeInput) => {
+      runtimeInput.onEvent?.({ type: "model_turn" });
+      runtimeInput.onEvent?.({ type: "model_turn" });
+      runtimeInput.onEvent?.({ type: "tool", tool: "read" });
+      runtimeInput.onEvent?.({ type: "tool", tool: "edit" });
+      return FakeCodingRuntime.prototype.execute.call(runtime, runtimeInput);
+    };
+    runtime.repair = async (runtimeInput) => {
+      runtimeInput.onEvent?.({ type: "model_turn" });
+      runtimeInput.onEvent?.({ type: "tool", tool: "repair" });
+      return FakeCodingRuntime.prototype.repair.call(runtime, runtimeInput);
+    };
+    const writeEvaluation = vi.fn(async () => {});
+    deps.evaluationStore = { write: writeEvaluation };
     const runner = createCodingRunGraph(deps, { checkpointer: new MemorySaver() });
 
-    const paused = await runner.invoke(input(root, 2), { threadId: "repair-pause" });
+    const paused = await runner.invoke({ ...input(root, 2), missionKind: "tests" }, { threadId: "repair-pause" });
     expect(paused.attempt).toBe(0);
 
     const completed = await runner.resume("repair-pause", {
@@ -289,6 +480,18 @@ describe("coding run graph", () => {
     expect(completed.status).toBe("completed");
     expect(completed.attempt).toBe(2);
     expect(runtime.calls.repair.map(({ attempt }) => attempt)).toEqual([1, 1, 2]);
+    expect(writeEvaluation).toHaveBeenCalledWith(expect.objectContaining({
+      schemaVersion: 1,
+      runId: "run-001",
+      status: "completed",
+      success: true,
+      repairAttempts: 2,
+      toolCalls: 6,
+      modelCalls: { planner: 1, execute: 2, repair: 3, total: 6 },
+      humanDecisionCount: 1,
+      mission: "tests",
+      verification: { status: "passed", commandCount: 3, durationsMs: [10, 10, 20] },
+    }));
   }, 10_000);
 
   it("redacts a human response before constructing the persisted resume command", async () => {

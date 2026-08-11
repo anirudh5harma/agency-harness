@@ -287,6 +287,7 @@ export const AgencyPhaseSchema = z.enum([
 export type AgencyPhase = z.infer<typeof AgencyPhaseSchema>;
 
 export const AgencyEventSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("model_turn") }),
   z.strictObject({ type: z.literal("phase"), phase: AgencyPhaseSchema }),
   z.strictObject({
     type: z.literal("tool"),

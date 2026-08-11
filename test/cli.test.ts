@@ -289,6 +289,13 @@ describe("Agency terminal application", () => {
       close() { closeCalls += 1; },
     };
     const resume = vi.fn(async () => interrupted);
+    const cancelled = await CodingRunStateSchema.validateInput({
+      ...interrupted,
+      status: "cancelled",
+      pendingHumanDecision: null,
+      summary: "Run cancelled.",
+    });
+    const cancel = vi.fn(async () => cancelled);
     const runtime = new FakeCodingRuntime();
     const output = new BufferOutput();
     const renderer = new PlainTerminalRenderer(output, new BufferOutput());
@@ -301,6 +308,7 @@ describe("Agency terminal application", () => {
       errorOutput: new BufferOutput(),
       rendererFactory: () => renderer,
       runtimeFactory: async () => runtime,
+      createId: (() => { const ids = ["run-cli-interrupt", "thread-cli-interrupt"]; return () => ids.shift() ?? "extra"; })(),
       checkpointFactory: async () => ({
         path: join(cwd, ".devagency", "state.db"),
         checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
@@ -318,10 +326,12 @@ describe("Agency terminal application", () => {
         invoke: async () => interrupted,
         getState: async () => ({}),
         resume,
+        cancel,
       }),
     });
 
     expect(resume).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledWith("thread-cli-interrupt");
     expect(runtime.abortCalls).toBe(1);
     expect(setRunStatus).toHaveBeenLastCalledWith("cancelled");
     expect(closeCalls).toBe(1);
@@ -798,6 +808,8 @@ describe("Agency terminal application", () => {
     expect(runtime.calls.createPlan).toHaveLength(0);
     expect(runtime.calls.execute).toHaveLength(0);
     expect(output.value).toContain("Commands:");
+    expect(output.value).toContain("/mission tests|dead-code|simplify|performance");
+    expect(output.value).toContain("/metrics [last]");
     expect(output.value).toContain("-initial");
     expect(output.value).toContain("+changed");
     expect(output.value).toContain("Checkpoint ");
@@ -810,6 +822,78 @@ describe("Agency terminal application", () => {
     expect(sessions[0]).not.toBe(sessions[1]);
     expect(setRunStatus).toHaveBeenLastCalledWith("idle");
     expect(errors.value).toContain("Unknown command: /wat");
+  });
+
+  it("runs one bounded mission through the normal graph and keeps metrics read-only", async () => {
+    const cwd = await temporaryGitProject();
+    const runtime = new FakeCodingRuntime();
+    const session: SessionContext = {
+      sessionId: "mission-session",
+      olderSummary: "",
+      compactionCount: 0,
+      lastCompactedAt: null,
+      recentTurns: [],
+      runSummaries: [],
+    };
+    const recordedTurns: string[] = [];
+    const invoke = vi.fn(async (graphInput: Parameters<CodingRunGraphRunner["invoke"]>[0]) =>
+      CodingRunStateSchema.validateInput({
+        ...graphInput,
+        status: "completed",
+        summary: "mission complete",
+        verification: { status: "passed", summary: "passed", commands: [] },
+      }));
+    const output = new BufferOutput();
+    const errors = new BufferOutput();
+
+    await runAgency({
+      cwd,
+      io: new ScriptedIO(["/mission tests", "/metrics", "/metrics last", "/mission unknown", "/exit"]),
+      output,
+      errorOutput: errors,
+      runtimeFactory: async () => runtime,
+      createId: (() => { let id = 0; return () => `mission-${++id}`; })(),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => session,
+        createNew: async () => session,
+        recordUserTurn: async (content) => { recordedTurns.push(content); return session; },
+        recordRunSummary: async () => session,
+      }),
+      graphFactory: () => ({ invoke, getState: async () => ({}), resume: vi.fn() }),
+      registryFactory: () => ({ list: async () => [], upsert: async () => {}, updateStatus: async () => {} }),
+      evaluationStoreFactory: () => ({
+        write: async () => {},
+        listRecent: async () => ({
+          corruptCount: 0,
+          evaluations: [{
+            schemaVersion: 1,
+            runId: "metric-run",
+            status: "completed",
+            success: true,
+            durationMs: 40,
+            repairAttempts: 0,
+            toolCalls: 2,
+            modelCalls: { planner: 1, execute: 1, repair: 0, total: 2 },
+            changedFileCount: 1,
+            verification: { status: "passed", commandCount: 1, durationsMs: [10] },
+            humanDecisionCount: 0,
+            mission: "tests",
+          }],
+        }),
+      }),
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "mission-session",
+      missionKind: "tests",
+      userIntent: expect.stringContaining("choose exactly ONE"),
+    }), expect.any(Object));
+    expect(recordedTurns).toEqual([expect.stringContaining("Change at most 3 files")]);
+    expect(runtime.calls).toEqual({ createPlan: [], execute: [], repair: [] });
+    expect(output.value).toContain("Metrics: 1 recent run");
+    expect(output.value).toContain("Metrics last: metric-run — completed (tests mission)");
+    expect(errors.value).toContain("Unknown mission: unknown. Available: tests, dead-code, simplify, performance.");
   });
 
   it("shows unstaged, staged, and untracked changes without evaluating file names", async () => {

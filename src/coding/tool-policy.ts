@@ -385,6 +385,41 @@ function wrap(delegate: ToolDefinition, validate: (params: unknown, signal?: Abo
   };
 }
 
+export class MissionMutationBudget {
+  readonly paths = new Set<string>();
+  maxDistinctPaths: number | undefined;
+  #tail: Promise<void> = Promise.resolve();
+
+  reconcile(maxDistinctPaths: number | undefined, paths: readonly string[]): void {
+    this.maxDistinctPaths = maxDistinctPaths;
+    if (maxDistinctPaths === undefined) this.paths.clear();
+    else for (const path of paths) this.paths.add(relativePath(path));
+  }
+
+  async run<T>(path: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.#tail;
+    let release!: () => void;
+    this.#tail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    const normalized = relativePath(path);
+    const newlyReserved = !this.paths.has(normalized);
+    try {
+      if (newlyReserved && this.maxDistinctPaths !== undefined && this.paths.size >= this.maxDistinctPaths) {
+        throw policyError(`mission mutation budget is limited to ${this.maxDistinctPaths} distinct paths`);
+      }
+      if (newlyReserved) this.paths.add(normalized);
+      try {
+        return await operation();
+      } catch (error) {
+        if (newlyReserved) this.paths.delete(normalized);
+        throw error;
+      }
+    } finally {
+      release();
+    }
+  }
+}
+
 function shellWords(command: string): string[] {
   const words: string[] = [];
   let word = "";
@@ -539,6 +574,7 @@ export function createRoleFileTools(options: {
   role: ToolRole;
   factories?: ToolFactoryBoundary;
   consumeApproval?: (action: string) => boolean;
+  mutationBudget?: MissionMutationBudget;
 }): ToolDefinition[] {
   const { root, role } = options;
   const factories = options.factories ?? defaultToolFactoryBoundary;
@@ -562,26 +598,43 @@ export function createRoleFileTools(options: {
   if (role === "planner") return [readTool, grepTool, findTool, lsTool];
 
   const approveMutation = async (params: unknown, tool: "edit" | "write", signal?: AbortSignal) => {
-    await safeMutationPath(root, parameterPath(params));
+    const mutationPath = parameterPath(params);
+    await safeMutationPath(root, mutationPath);
     const approval = await mutationNeedsApproval(root, params, tool);
     if (signal?.aborted === true) throw new DOMException("File mutation aborted", "AbortError");
     if (approval !== undefined && !consumeApproval(approval)) {
       throw new Error(`Agency policy requires request_human_input explicit one-shot approval for exact action: ${approval}`);
     }
   };
-  const editTool = wrap(factories.createEditTool(root, {
+  const editDelegate = factories.createEditTool(root, {
     operations: {
       readFile: (path) => safeReadFile(root, relative(root, path), "executor"),
       writeFile: (path, content) => safeWriteFile(root, relative(root, path), content),
       access: async (path) => { await safeExistingPath(root, relative(root, path), "executor", "file"); },
     },
-  }), (params, signal) => approveMutation(params, "edit", signal));
-  const writeTool = wrap(factories.createWriteTool(root, {
+  });
+  const writeDelegate = factories.createWriteTool(root, {
     operations: {
       writeFile: (path, content) => safeWriteFile(root, relative(root, path), content),
       mkdir: (path) => safeMkdir(root, path),
     },
-  }), (params, signal) => approveMutation(params, "write", signal));
+  });
+  const mutationTool = (delegate: ToolDefinition, tool: "edit" | "write"): ToolDefinition => ({
+    ...delegate,
+    async execute(toolCallId, params, signal, onUpdate, context) {
+      const run = async () => {
+        assertNotAborted(signal, "Tool call aborted");
+        await approveMutation(params, tool, signal);
+        assertNotAborted(signal, "Tool call aborted");
+        return activeMutationSignal.run(signal, () => delegate.execute(toolCallId, params, signal, onUpdate, context));
+      };
+      return options.mutationBudget === undefined
+        ? run()
+        : options.mutationBudget.run(parameterPath(params), run);
+    },
+  });
+  const editTool = mutationTool(editDelegate, "edit");
+  const writeTool = mutationTool(writeDelegate, "write");
   return [readTool, grepTool, findTool, lsTool, editTool, writeTool];
 }
 

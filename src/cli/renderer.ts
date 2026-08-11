@@ -50,6 +50,7 @@ export class PlainTerminalRenderer implements TerminalRenderer {
     this.#errorOutput = errorOutput;
     if (eventBus !== undefined) {
       for (const type of [
+        "model_turn",
         "phase",
         "tool",
         "file_changed",
@@ -76,6 +77,7 @@ export class PlainTerminalRenderer implements TerminalRenderer {
   }
 
   event(event: AgencyEvent): void {
+    if (event.type === "model_turn") return;
     if (event.type === "assistant_text_delta") {
       this.#streamAssistant(event.delta, event.done);
       return;
@@ -278,6 +280,7 @@ function fitTerminalWidth(value: string, width: number): string {
 }
 
 function richEventLine(event: AgencyEvent): string | null {
+  if (event.type === "model_turn") return null;
   if (event.type === "phase") return `${ANSI.cyan}Phase:${ANSI.reset} ${event.phase}`;
   if (event.type === "tool") {
     return `${ANSI.yellow}Tool:${ANSI.reset} ${terminalText(event.tool)}${event.detail === undefined ? "" : ` — ${terminalText(event.detail)}`}`;
@@ -321,7 +324,7 @@ export class RichTerminalRenderer implements TerminalRenderer {
     this.#errorOutput = errorOutput;
     if (eventBus !== undefined) {
       for (const type of [
-        "phase", "tool", "file_changed", "command_started", "command_finished", "message",
+        "model_turn", "phase", "tool", "file_changed", "command_started", "command_finished", "message",
         "assistant_text_delta",
         "context_compacted", "error", "human_input_requested", "human_input_resolved",
       ] as const) {
