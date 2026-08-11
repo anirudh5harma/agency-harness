@@ -2,7 +2,14 @@ import { randomUUID } from "node:crypto";
 
 import type { CodingRuntime } from "../coding/index.js";
 import { PiCodingRuntime } from "../coding/index.js";
-import type { RunSummary, SessionContext } from "../domain/index.js";
+import {
+  HumanDecisionRequestSchema,
+  HumanDecisionResponseSchema,
+  type HumanDecisionRequest,
+  type HumanDecisionResponse,
+  type RunSummary,
+  type SessionContext,
+} from "../domain/index.js";
 import { EventBus } from "../events/index.js";
 import {
   createCodingRunGraph,
@@ -225,7 +232,7 @@ export class AgencyApplication implements ReplHandler {
     const runId = this.#createId();
     const threadId = this.#createId();
     try {
-      const state = await this.#graph.invoke(
+      let state = await this.#graph.invoke(
         {
           runId,
           threadId,
@@ -240,9 +247,14 @@ export class AgencyApplication implements ReplHandler {
         this.#renderer.message("Cancelled.");
         return "continue";
       }
+      state = await this.#resolveHumanInput(state, signal);
+      if (signal.aborted) {
+        this.#renderer.message("Cancelled.");
+        return "continue";
+      }
       await this.#recordTerminalState(state);
-      this.#renderer.run(state);
-      if (state.failure?.stage !== "finalizing") {
+      if (state.pendingHumanDecision == null) this.#renderer.run(state);
+      if (state.pendingHumanDecision == null && state.failure?.stage !== "finalizing") {
         await this.#pruneTerminalCheckpoint(state.threadId);
       }
     } catch (error) {
@@ -311,6 +323,29 @@ export class AgencyApplication implements ReplHandler {
         .sort((left, right) => right.entry.updatedAt.localeCompare(left.entry.updatedAt))[0];
       if (candidate === undefined) return;
 
+      const pendingRequest = this.#pendingRequest(candidate.snapshot);
+      if (pendingRequest !== null) {
+        activeController = new AbortController();
+        const response = await this.#promptHumanDecision(pendingRequest, activeController.signal);
+        if (response === null || activeController.signal.aborted) return;
+        let state = await this.#graph.resume(
+          candidate.entry.threadId,
+          response,
+          { signal: activeController.signal },
+        );
+        state = await this.#resolveHumanInput(state, activeController.signal);
+        if (activeController.signal.aborted) {
+          this.#renderer.message("Cancelled.");
+          return;
+        }
+        await this.#recordTerminalState(state);
+        if (state.pendingHumanDecision == null) this.#renderer.run(state);
+        if (state.pendingHumanDecision == null && state.failure?.stage !== "finalizing") {
+          await this.#pruneTerminalCheckpoint(state.threadId);
+        }
+        return;
+      }
+
       while (true) {
         const answer = await this.#io.readLine(
           `Resume incomplete task “${candidate.entry.userIntent}”? [r/n] `,
@@ -319,16 +354,17 @@ export class AgencyApplication implements ReplHandler {
         const normalized = answer.trim().toLowerCase();
         if (normalized === "r") {
           activeController = new AbortController();
-          const state = await this.#graph.resume(candidate.entry.threadId, {
+          let state = await this.#graph.resume(candidate.entry.threadId, undefined, {
             signal: activeController.signal,
           });
           if (activeController.signal.aborted) {
             this.#renderer.message("Cancelled.");
             return;
           }
+          state = await this.#resolveHumanInput(state, activeController.signal);
           await this.#recordTerminalState(state);
-          this.#renderer.run(state);
-          if (state.failure?.stage !== "finalizing") {
+          if (state.pendingHumanDecision == null) this.#renderer.run(state);
+          if (state.pendingHumanDecision == null && state.failure?.stage !== "finalizing") {
             await this.#pruneTerminalCheckpoint(state.threadId);
           }
           return;
@@ -345,6 +381,86 @@ export class AgencyApplication implements ReplHandler {
     } finally {
       detachInterrupt();
     }
+  }
+
+  #pendingRequest(snapshot: unknown): HumanDecisionRequest | null {
+    if (typeof snapshot !== "object" || snapshot === null || !("values" in snapshot)) return null;
+    const values = (snapshot as { values?: unknown }).values;
+    if (typeof values !== "object" || values === null || !("pendingHumanDecision" in values)) return null;
+    const parsed = HumanDecisionRequestSchema.safeParse(
+      (values as { pendingHumanDecision?: unknown }).pendingHumanDecision,
+    );
+    return parsed.success ? parsed.data : null;
+  }
+
+  async #resolveHumanInput(
+    initial: CodingRunState,
+    signal: AbortSignal,
+  ): Promise<CodingRunState> {
+    let state = initial;
+    while (state.pendingHumanDecision != null && !signal.aborted) {
+      const response = await this.#promptHumanDecision(state.pendingHumanDecision, signal);
+      if (response === null || signal.aborted) return state;
+      state = await this.#graph.resume(state.threadId, response, { signal });
+    }
+    return state;
+  }
+
+  async #promptHumanDecision(
+    request: HumanDecisionRequest,
+    signal: AbortSignal,
+  ): Promise<HumanDecisionResponse | null> {
+    this.#renderer.message(request.question);
+    if (request.context !== undefined) this.#renderer.message(`Context: ${request.context}`);
+    if (request.risk !== undefined) this.#renderer.message(`Risk: ${request.risk}`);
+    request.options.forEach((option, index) => {
+      const shortcut = request.kind === "approval"
+        ? ({ approve: "a", reject: "r", edit: "e" } as Record<string, string>)[option.id]
+        : undefined;
+      this.#renderer.message(
+        `  ${index + 1}. ${shortcut === undefined ? "" : `[${shortcut}] `}${option.label} — ${option.description}`,
+      );
+    });
+    while (true) {
+      const answer = await this.#readLineUntilAbort(
+        request.kind === "approval"
+          ? "Choose [a] approve, [r] reject, [e] edit: "
+          : "Choose an option number or enter a custom response: ",
+        signal,
+      );
+      if (answer === null) return null;
+      const value = answer.trim();
+      const shortcut = request.kind === "approval"
+        ? ({ a: "approve", r: "reject", e: "edit" } as Record<string, string>)[value.toLowerCase()]
+        : undefined;
+      const numeric = /^\d+$/u.test(value) ? request.options[Number(value) - 1]?.id : undefined;
+      const optionId = shortcut ?? numeric ?? request.options.find(
+        ({ id }) => id.toLowerCase() === value.toLowerCase(),
+      )?.id;
+      if (optionId === "edit") {
+        const edited = await this.#readLineUntilAbort("Edited instruction: ", signal);
+        if (edited === null) return null;
+        if (edited.trim() !== "" && request.allowCustom) {
+          return HumanDecisionResponseSchema.forRequest(request).parse({
+            requestId: request.id,
+            customText: edited.trim(),
+          });
+        }
+      } else if (optionId !== undefined) {
+        return HumanDecisionResponseSchema.forRequest(request).parse({ requestId: request.id, optionId });
+      } else if (value !== "" && request.allowCustom) {
+        return HumanDecisionResponseSchema.forRequest(request).parse({
+          requestId: request.id,
+          customText: value,
+        });
+      }
+      this.#renderer.message("Choose one of the listed options or provide an allowed custom response.");
+    }
+  }
+
+  async #readLineUntilAbort(prompt: string, signal: AbortSignal): Promise<string | null> {
+    if (signal.aborted) return null;
+    return this.#io.readLine(prompt, { signal });
   }
 
   async #recordTerminalState(state: CodingRunState): Promise<void> {

@@ -1,8 +1,10 @@
 import {
+  Command,
   END,
   START,
   StateGraph,
   StateSchema,
+  interrupt,
   type BaseCheckpointSaver,
 } from "@langchain/langgraph";
 import { readFile } from "node:fs/promises";
@@ -12,6 +14,9 @@ import { z } from "zod";
 import type { CodingRuntime } from "../coding/index.js";
 import {
   FailureContextSchema,
+  HumanDecisionRequestSchema,
+  HumanDecisionResolutionSchema,
+  HumanDecisionResponseSchema,
   PlanSchema,
   RepoContextSchema,
   SessionContextSchema,
@@ -52,6 +57,10 @@ const MAX_TEXT = 8_000;
 const MAX_REPO_INSTRUCTIONS = 12_000;
 const IdentifierSchema = z.string().trim().min(1).max(128);
 const TextSchema = z.string().max(MAX_TEXT);
+const RuntimeContinuationSchema = z.strictObject({
+  role: z.enum(["planner", "executor"]),
+  sessionFile: z.string().min(1).max(255).regex(/^[A-Za-z0-9._-]+\.jsonl$/u),
+});
 
 const BoundedPlanSchema = PlanSchema.superRefine((plan, context) => {
   const limits = [
@@ -149,6 +158,10 @@ export const CodingRunStateSchema = new StateSchema({
   maxRepairAttempts: z.number().int().positive().max(20).default(2),
   changedFiles: z.array(z.string().trim().min(1)).max(MAX_CHANGED_FILES).default([]),
   verification: BoundedVerificationSchema.nullable().default(null),
+  pendingHumanDecision: HumanDecisionRequestSchema.nullable().default(null),
+  humanDecision: HumanDecisionResolutionSchema.nullable().default(null),
+  humanDecisionOrigin: z.enum(["planning", "executing", "repairing"]).nullable().default(null),
+  runtimeContinuation: RuntimeContinuationSchema.nullable().default(null),
   failure: FailureContextSchema.nullable().default(null),
   executionMessage: TextSchema.default(""),
   summary: TextSchema.default(""),
@@ -207,7 +220,11 @@ export interface InvokeCodingRunOptions {
 export interface CodingRunGraphRunner {
   invoke(input: CodingRunInput, options?: InvokeCodingRunOptions): Promise<CodingRunState>;
   getState(threadId: string): Promise<unknown>;
-  resume(threadId: string, options?: { signal?: AbortSignal }): Promise<CodingRunState>;
+  resume(
+    threadId: string,
+    response?: import("../domain/index.js").HumanDecisionResponse,
+    options?: { signal?: AbortSignal },
+  ): Promise<CodingRunState>;
 }
 
 type PhaseStatus = Extract<
@@ -430,12 +447,36 @@ export function createCodingRunGraph(
       .slice(0, MAX_CHANGED_FILES);
   }
 
+  async function recordHumanRequest(
+    state: CodingRunState,
+    request: import("../domain/index.js").HumanDecisionRequest,
+  ): Promise<void> {
+    await recordTrajectory(state, "human_input_requested", {
+      metadata: {
+        requestId: request.id,
+        decisionKind: request.kind,
+        question: concise(request.question, 1_000),
+        optionLabels: request.options.map(({ label }) => concise(label, 80)),
+      },
+    });
+    dependencies.eventBus?.emit({
+      type: "human_input_requested",
+      requestId: request.id,
+      kind: request.kind,
+      question: request.question,
+      options: request.options.map(({ id, label }) => ({ id, label })),
+    });
+  }
+
   async function enterPhase(
     state: CodingRunState,
     status: PhaseStatus,
     phase: PhaseName,
   ): Promise<PhaseBoundary> {
     const startedAt = now();
+    if (state.status === status && state.humanDecision !== null) {
+      return { startedAt, result: { status, updatedAt: state.updatedAt ?? startedAt.toISOString() } };
+    }
     const updatedAt = startedAt.toISOString();
     try {
       await recordTrajectory(state, `${phase}_started`, { at: startedAt });
@@ -562,15 +603,38 @@ export function createCodingRunGraph(
         intent: state.userIntent,
         repo: state.repoContext,
         repoInstructions: state.repoInstructions,
+        sessionId: state.sessionId,
+        ...(state.humanDecision === null ? {} : { humanDecision: state.humanDecision }),
+        ...(state.runtimeContinuation === null ? {} : { runtimeContinuation: state.runtimeContinuation }),
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
         ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
+      if ("decisionRequest" in result) {
+        const decisionRequest = HumanDecisionRequestSchema.parse(result.decisionRequest);
+        await recordHumanRequest(state, decisionRequest);
+        return {
+          ...boundary.result,
+          pendingHumanDecision: decisionRequest,
+          humanDecision: null,
+          humanDecisionOrigin: "planning",
+          runtimeContinuation: result.runtimeContinuation ?? null,
+          executionMessage: concise(result.message),
+        };
+      }
       const codingPlan = BoundedPlanSchema.parse(result.plan);
       await recordTrajectory(state, "plan_completed", {
         startedAt: boundary.startedAt,
       });
-      return { ...boundary.result, codingPlan, executionMessage: concise(result.message) };
+      return {
+        ...boundary.result,
+        codingPlan,
+        pendingHumanDecision: null,
+        humanDecision: null,
+        humanDecisionOrigin: null,
+        runtimeContinuation: null,
+        executionMessage: concise(result.message),
+      };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "plan_failed", boundary.startedAt, error);
       return { ...boundary.result, status: "failed", failure: infrastructureFailure("planning", reportedError) };
@@ -593,10 +657,24 @@ export function createCodingRunGraph(
         repoInstructions: state.repoInstructions,
         plan: state.codingPlan,
         sessionId: state.sessionId,
+        ...(state.humanDecision === null ? {} : { humanDecision: state.humanDecision }),
+        ...(state.runtimeContinuation === null ? {} : { runtimeContinuation: state.runtimeContinuation }),
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
         ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
+      if ("decisionRequest" in result) {
+        const decisionRequest = HumanDecisionRequestSchema.parse(result.decisionRequest);
+        await recordHumanRequest(state, decisionRequest);
+        return {
+          ...boundary.result,
+          pendingHumanDecision: decisionRequest,
+          humanDecision: null,
+          humanDecisionOrigin: "executing",
+          runtimeContinuation: result.runtimeContinuation ?? null,
+          executionMessage: concise(result.message),
+        };
+      }
       const changedFiles = await actualChangedFiles(state.baseline);
       await recordTrajectory(state, "execution_completed", {
         startedAt: boundary.startedAt,
@@ -607,6 +685,10 @@ export function createCodingRunGraph(
         changedFiles,
         executionMessage: concise(result.message),
         failure: null,
+        pendingHumanDecision: null,
+        humanDecision: null,
+        humanDecisionOrigin: null,
+        runtimeContinuation: null,
       };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "execution_failed", boundary.startedAt, error);
@@ -708,10 +790,24 @@ export function createCodingRunGraph(
         attempt,
         failure: state.failure,
         changedFiles: [...state.changedFiles],
+        ...(state.humanDecision === null ? {} : { humanDecision: state.humanDecision }),
+        ...(state.runtimeContinuation === null ? {} : { runtimeContinuation: state.runtimeContinuation }),
         ...(state.sessionContext === null ? {} : { sessionContext: state.sessionContext }),
         signal: runtime.signal ?? new AbortController().signal,
         ...(forwardRuntimeEvent === undefined ? {} : { onEvent: forwardRuntimeEvent }),
       });
+      if ("decisionRequest" in result) {
+        const decisionRequest = HumanDecisionRequestSchema.parse(result.decisionRequest);
+        await recordHumanRequest(state, decisionRequest);
+        return {
+          ...boundary.result,
+          pendingHumanDecision: decisionRequest,
+          humanDecision: null,
+          humanDecisionOrigin: "repairing",
+          runtimeContinuation: result.runtimeContinuation ?? null,
+          executionMessage: concise(result.message),
+        };
+      }
       const changedFiles = await actualChangedFiles(state.baseline);
       await recordTrajectory(state, "repair_completed", {
         startedAt: boundary.startedAt,
@@ -723,11 +819,49 @@ export function createCodingRunGraph(
         changedFiles,
         executionMessage: concise(result.message),
         failure: null,
+        pendingHumanDecision: null,
+        humanDecision: null,
+        humanDecisionOrigin: null,
+        runtimeContinuation: null,
       };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "repair_failed", boundary.startedAt, error);
-      return { ...boundary.result, attempt, status: "failed", failure: infrastructureFailure("repairing", reportedError) };
+      return { ...boundary.result, status: "failed", failure: infrastructureFailure("repairing", reportedError) };
     }
+  };
+
+  const requestHumanInput: typeof CodingRunStateSchema.Node = async (state) => {
+    if (state.pendingHumanDecision === null || state.humanDecisionOrigin === null) {
+      throw new Error("Human decision state is incomplete");
+    }
+    const request = HumanDecisionRequestSchema.parse(state.pendingHumanDecision);
+    const response = HumanDecisionResponseSchema.forRequest(request).parse(
+      interrupt(request),
+    );
+    await recordTrajectory(state, "human_input_resolved", {
+      metadata: {
+        requestId: request.id,
+        resolution: response.optionId ?? "custom",
+      },
+    });
+    dependencies.eventBus?.emit({
+      type: "human_input_resolved",
+      requestId: request.id,
+      resolution: response.optionId ?? "custom",
+    });
+    return {
+      pendingHumanDecision: null,
+      humanDecision: { request, response },
+      updatedAt: now().toISOString(),
+    };
+  };
+
+  const routeAfterRuntime = (state: CodingRunState): "human" | "continue" =>
+    state.pendingHumanDecision === null ? "continue" : "human";
+  const routeAfterHuman = (state: CodingRunState): "plan" | "execute" | "repair" => {
+    if (state.humanDecisionOrigin === "planning") return "plan";
+    if (state.humanDecisionOrigin === "repairing") return "repair";
+    return "execute";
   };
 
   const summarize: typeof CodingRunStateSchema.Node = async (state) => {
@@ -766,16 +900,22 @@ export function createCodingRunGraph(
     .addNode("execute", execute)
     .addNode("verify", verify)
     .addNode("repair", repair)
+    .addNode("human", requestHumanInput)
     .addNode("summarize", summarize)
     .addEdge(START, "prepare")
     .addEdge("prepare", "plan")
-    .addEdge("plan", "execute")
-    .addEdge("execute", "verify")
+    .addConditionalEdges("plan", routeAfterRuntime, { human: "human", continue: "execute" })
+    .addConditionalEdges("execute", routeAfterRuntime, { human: "human", continue: "verify" })
     .addConditionalEdges("verify", routeAfterVerification, {
       repair: "repair",
       summarize: "summarize",
     })
-    .addEdge("repair", "verify")
+    .addConditionalEdges("repair", routeAfterRuntime, { human: "human", continue: "verify" })
+    .addConditionalEdges("human", routeAfterHuman, {
+      plan: "plan",
+      execute: "execute",
+      repair: "repair",
+    })
     .addEdge("summarize", END)
     .compile({
       ...(options.checkpointer === undefined ? {} : { checkpointer: options.checkpointer }),
@@ -795,8 +935,21 @@ export function createCodingRunGraph(
     getState(threadId) {
       return compiled.getState(config(threadId));
     },
-    resume(threadId, resumeOptions = {}) {
-      return compiled.invoke(null, config(threadId, resumeOptions.signal));
+    async resume(threadId, response, resumeOptions = {}) {
+      let safeResponse = response;
+      if (response !== undefined) {
+        const snapshot = await compiled.getState(config(threadId));
+        const values = snapshot.values as Partial<CodingRunState>;
+        const request = HumanDecisionRequestSchema.safeParse(values.pendingHumanDecision);
+        if (!request.success) {
+          throw new Error("Cannot resume without a matching pending human request");
+        }
+        safeResponse = HumanDecisionResponseSchema.forRequest(request.data).parse(response);
+      }
+      return compiled.invoke(
+        safeResponse === undefined ? null : new Command({ resume: safeResponse }),
+        config(threadId, resumeOptions.signal),
+      );
     },
   };
 }

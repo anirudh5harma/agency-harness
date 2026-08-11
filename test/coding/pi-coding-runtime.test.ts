@@ -83,6 +83,7 @@ function providerErrorMessage(errorMessage: string): Extract<AgentSessionEvent, 
 }
 
 class StubSession implements PiSession {
+  readonly agent = {} as NonNullable<PiSession["agent"]>;
   readonly abort = vi.fn(async () => {});
   readonly dispose = vi.fn(() => {});
   readonly prompts: string[] = [];
@@ -92,6 +93,9 @@ class StubSession implements PiSession {
     readonly sessionId: string,
     readonly onPrompt: (session: StubSession, prompt: string) => Promise<void>,
   ) {}
+  get sessionFile(): string {
+    return `/workspace/agency/.devagency/pi-sessions/${this.sessionId}/${this.sessionId}.jsonl`;
+  }
 
   subscribe(listener: (event: AgentSessionEvent) => void): () => void {
     this.#listeners.add(listener);
@@ -137,6 +141,7 @@ function createBoundary(options: {
     createModelRuntime: vi.fn(async () => modelRuntime as never),
     inMemorySessionManager: vi.fn(() => inMemoryManager as never),
     createSessionManager: vi.fn(() => persistentManager as never),
+    openSessionManager: vi.fn(() => persistentManager as never),
     createResourceLoader: vi.fn(async () => resourceLoader as never),
     createBashTool: vi.fn(() => bashTool as never),
     createAgentSession: vi.fn(async (sessionOptionsInput) => {
@@ -192,7 +197,257 @@ function createBoundary(options: {
 }
 
 describe("PiCodingRuntime", () => {
-  it("uses one model runtime and an in-memory read-only planner with submit_plan", async () => {
+  it("pauses and continues the same planner session for human clarification", async () => {
+    let prompts = 0;
+    const boundary = createBoundary({
+      plannerPrompt: async () => {
+        prompts += 1;
+        if (prompts === 1) {
+          const tool = boundary.sessionOptions[0]?.customTools?.find(
+            ({ name }) => name === "request_human_input",
+          );
+          await tool!.execute("human-1", {
+            id: "storage-choice",
+            kind: "clarification",
+            question: "Which storage backend should be used?",
+            options: [
+              { id: "sqlite", label: "SQLite", description: "Use a local file." },
+              { id: "postgres", label: "Postgres", description: "Use the service database." },
+            ],
+            allowCustom: true,
+          }, undefined, undefined, {} as never);
+          return;
+        }
+        const submit = boundary.sessionOptions[0]?.customTools?.find(
+          ({ name }) => name === "submit_plan",
+        );
+        await submit!.execute("plan-2", { plan }, undefined, undefined, {} as never);
+      },
+    });
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+
+    const paused = await runtime.createPlan({
+      intent: "Build",
+      repo,
+      sessionId: "agency-1",
+    });
+    expect(paused).toMatchObject({ decisionRequest: { id: "storage-choice" } });
+
+    await expect(runtime.createPlan({
+      intent: "Build",
+      repo,
+      sessionId: "agency-1",
+      humanDecision: {
+        request: (paused as { decisionRequest: import("../../src/domain/index.js").HumanDecisionRequest }).decisionRequest,
+        response: { requestId: "storage-choice", optionId: "sqlite" },
+      },
+    })).resolves.toEqual({ plan, message: "Plan ready for execution." });
+
+    expect(boundary.sessions).toHaveLength(1);
+    expect(boundary.sessions[0]?.prompts[1]).toContain('"optionId":"sqlite"');
+    expect(boundary.sessions[0]?.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("reopens the exact persisted planner after constructing a new runtime", async () => {
+    let prompts = 0;
+    const boundary = createBoundary({
+      plannerPrompt: async () => {
+        prompts += 1;
+        const tools = boundary.sessionOptions.at(-1)?.customTools ?? [];
+        if (prompts === 1) {
+          await tools.find(({ name }) => name === "request_human_input")!.execute(
+            "human-1",
+            {
+              id: "restart-choice",
+              kind: "clarification",
+              question: "Which implementation should continue?",
+              options: [
+                { id: "one", label: "One", description: "Use the first implementation." },
+                { id: "two", label: "Two", description: "Use the second implementation." },
+              ],
+              allowCustom: true,
+            },
+            undefined,
+            undefined,
+            {} as never,
+          );
+        } else {
+          await tools.find(({ name }) => name === "submit_plan")!.execute(
+            "plan-2", { plan }, undefined, undefined, {} as never,
+          );
+        }
+      },
+    });
+    const firstRuntime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    const paused = await firstRuntime.createPlan({
+      intent: "Build",
+      repo,
+      sessionId: "agency-restart",
+    });
+    expect(paused).toMatchObject({
+      runtimeContinuation: { role: "planner", sessionFile: "planner.jsonl" },
+    });
+
+    const secondRuntime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    await expect(secondRuntime.createPlan({
+      intent: "Build",
+      repo,
+      sessionId: "agency-restart",
+      runtimeContinuation: (paused as import("../../src/coding/index.js").HumanDecisionResult).runtimeContinuation,
+      humanDecision: {
+        request: (paused as import("../../src/coding/index.js").HumanDecisionResult).decisionRequest,
+        response: { requestId: "restart-choice", optionId: "one" },
+      },
+    })).resolves.toEqual({ plan, message: "Plan ready for execution." });
+
+    expect(boundary.sdk.openSessionManager).toHaveBeenCalledWith(
+      repo.rootPath,
+      "/workspace/agency/.devagency/pi-sessions/planner",
+      "/workspace/agency/.devagency/pi-sessions/planner/planner.jsonl",
+    );
+    expect(boundary.sessions).toHaveLength(2);
+  });
+
+  it("scopes consequential shell approval to the exact command for one use", async () => {
+    const action = "rm -rf build";
+    let prompts = 0;
+    let firstRun: unknown;
+    let secondError: unknown;
+    let rejectedError: unknown;
+    const boundary = createBoundary({
+      executorPrompt: async () => {
+        prompts += 1;
+        const tools = boundary.sessionOptions[0]?.customTools ?? [];
+        if (prompts === 1) {
+          const request = tools.find(({ name }) => name === "request_human_input");
+          await request!.execute("human-1", {
+            id: "migration-approval",
+            kind: "approval",
+            question: "Approve the migration?",
+            risk: "This changes the database schema.",
+            action,
+            options: [
+              { id: "approve", label: "Approve", description: "Run it once." },
+              { id: "reject", label: "Reject", description: "Cancel it." },
+              { id: "edit", label: "Edit", description: "Change the instruction." },
+            ],
+            allowCustom: true,
+          }, undefined, undefined, {} as never);
+          return;
+        }
+        const bash = tools.find(({ name }) => name === "bash")!;
+        if (prompts === 2) {
+          firstRun = await bash.execute("bash-1", { command: action }, undefined, undefined, {} as never);
+          try {
+            await bash.execute("bash-2", { command: action }, undefined, undefined, {} as never);
+          } catch (error) {
+            secondError = error;
+          }
+        } else {
+          try {
+            await bash.execute("bash-3", { command: action }, undefined, undefined, {} as never);
+          } catch (error) {
+            rejectedError = error;
+          }
+        }
+      },
+    });
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    const paused = await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-1" });
+    const request = (paused as { decisionRequest: import("../../src/domain/index.js").HumanDecisionRequest }).decisionRequest;
+
+    await runtime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-1",
+      humanDecision: {
+        request,
+        response: { requestId: request.id, optionId: "approve" },
+      },
+    });
+
+    expect(firstRun).toBeDefined();
+    expect(secondError).toBeInstanceOf(Error);
+    expect((secondError as Error).message).toContain("one-shot approval");
+
+    await runtime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-1",
+      humanDecision: {
+        request,
+        response: { requestId: request.id, optionId: "reject" },
+      },
+    });
+    expect(rejectedError).toBeInstanceOf(Error);
+    expect((rejectedError as Error).message).toContain("explicit one-shot approval");
+  });
+
+  it("reopens the exact persisted executor after constructing a new runtime", async () => {
+    let prompts = 0;
+    const boundary = createBoundary({
+      executorPrompt: async () => {
+        prompts += 1;
+        if (prompts !== 1) return;
+        const request = boundary.sessionOptions.at(-1)?.customTools?.find(
+          ({ name }) => name === "request_human_input",
+        );
+        await request!.execute("human-1", {
+          id: "executor-restart",
+          kind: "clarification",
+          question: "Which implementation?",
+          options: [
+            { id: "one", label: "One", description: "Choose one." },
+            { id: "two", label: "Two", description: "Choose two." },
+          ],
+          allowCustom: true,
+        }, undefined, undefined, {} as never);
+      },
+    });
+    const firstRuntime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    const paused = await firstRuntime.execute({ intent: "Build", repo, plan, sessionId: "agency-restart" });
+    expect(paused).toMatchObject({
+      runtimeContinuation: { role: "executor", sessionFile: "executor.jsonl" },
+    });
+
+    const secondRuntime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    const human = paused as import("../../src/coding/index.js").HumanDecisionResult;
+    await expect(secondRuntime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-restart",
+      ...(human.runtimeContinuation === undefined ? {} : { runtimeContinuation: human.runtimeContinuation }),
+      humanDecision: {
+        request: human.decisionRequest,
+        response: { requestId: "executor-restart", optionId: "one" },
+      },
+    })).resolves.toMatchObject({ sessionId: "executor" });
+
+    expect(boundary.sdk.openSessionManager).toHaveBeenCalledWith(
+      repo.rootPath,
+      "/workspace/agency/.devagency/pi-sessions/executor",
+      "/workspace/agency/.devagency/pi-sessions/executor/executor.jsonl",
+    );
+  });
+
+  it("rejects runtime continuation paths outside Agency-owned storage", async () => {
+    const boundary = createBoundary({});
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+
+    await expect(runtime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-restart",
+      runtimeContinuation: { role: "executor", sessionFile: "../outside.jsonl" },
+    })).rejects.toMatchObject({ code: "PI_SESSION_CREATION_FAILED" });
+    expect(boundary.sdk.openSessionManager).not.toHaveBeenCalled();
+  });
+
+  it("uses one model runtime and a persistent read-only planner with submit_plan", async () => {
     const boundary = createBoundary({});
     const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
     const events: AgencyEvent[] = [];
@@ -207,13 +462,16 @@ describe("PiCodingRuntime", () => {
     ).resolves.toEqual({ plan, message: "Plan ready for execution." });
 
     expect(boundary.sdk.createModelRuntime).toHaveBeenCalledOnce();
-    expect(boundary.sdk.inMemorySessionManager).toHaveBeenCalledWith(repo.rootPath);
+    expect(boundary.sdk.createSessionManager).toHaveBeenCalledWith(
+      repo.rootPath,
+      "/workspace/agency/.devagency/pi-sessions/planner",
+    );
     expect(boundary.sessionOptions[0]).toMatchObject({
       cwd: repo.rootPath,
       modelRuntime: boundary.modelRuntime,
-      sessionManager: boundary.inMemoryManager,
+      sessionManager: boundary.persistentManager,
       resourceLoader: boundary.resourceLoader,
-      tools: ["read", "grep", "find", "ls", "submit_plan"],
+      tools: ["read", "grep", "find", "ls", "submit_plan", "request_human_input"],
     });
     expect(boundary.sessionOptions[0]?.tools).not.toEqual(
       expect.arrayContaining(["bash", "edit", "write"]),
@@ -307,13 +565,13 @@ describe("PiCodingRuntime", () => {
     expect(boundary.sdk.createSessionManager).toHaveBeenCalledOnce();
     expect(boundary.sdk.createSessionManager).toHaveBeenCalledWith(
       repo.rootPath,
-      "/workspace/agency/.devagency/pi-sessions",
+      "/workspace/agency/.devagency/pi-sessions/executor",
     );
     expect(boundary.sessionOptions[0]).toMatchObject({
       cwd: repo.rootPath,
       modelRuntime: boundary.modelRuntime,
       sessionManager: boundary.persistentManager,
-      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+      tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "request_human_input"],
       resourceLoader: boundary.resourceLoader,
     });
     expect(execution).toEqual({
@@ -419,6 +677,35 @@ describe("PiCodingRuntime", () => {
 
     await expect(invoke("npm test -- --runInBand")).resolves.toBeDefined();
     await expect(invoke("git diff -- src/coding/runtime.ts")).resolves.toBeDefined();
+
+    for (const destructive of ["rm -rf build", "rm -fr build", "rm --recursive build"]) {
+      await expect(invoke(destructive), destructive).rejects.toThrow("one-shot approval");
+    }
+  });
+
+  it("blocks every sibling when human input is requested in a mixed tool batch", async () => {
+    const boundary = createBoundary({});
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-1" });
+    const hook = boundary.sessions[0]?.agent.beforeToolCall;
+    expect(hook).toBeDefined();
+
+    for (const names of [
+      ["request_human_input", "edit", "bash"],
+      ["bash", "edit", "request_human_input"],
+    ]) {
+      const content = names.map((name) => ({ type: "toolCall", name }));
+      for (const name of ["edit", "bash"]) {
+        await expect(hook!({
+          assistantMessage: { content },
+          toolCall: { name },
+        } as never)).resolves.toEqual(expect.objectContaining({ block: true, terminate: true }));
+      }
+      await expect(hook!({
+        assistantMessage: { content },
+        toolCall: { name: "request_human_input" },
+      } as never)).resolves.toBeUndefined();
+    }
   });
 
   it("does not load target-project context files", async () => {

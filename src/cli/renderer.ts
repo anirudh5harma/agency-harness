@@ -46,6 +46,8 @@ export class PlainTerminalRenderer implements TerminalRenderer {
         "command_finished",
         "message",
         "error",
+        "human_input_requested",
+        "human_input_resolved",
       ] as const) {
         this.#unsubscribe.push(eventBus.subscribe(type, (event) => this.event(event)));
       }
@@ -68,6 +70,10 @@ export class PlainTerminalRenderer implements TerminalRenderer {
     else if (event.type === "command_started") line(this.#output, `Running: ${event.command}`);
     else if (event.type === "command_finished") {
       line(this.#output, `Command ${event.exitCode === 0 ? "passed" : "failed"}: ${event.command}`);
+    } else if (event.type === "human_input_requested") {
+      line(this.#output, `${event.kind === "approval" ? "Approval needed" : "Clarification needed"}: ${event.question}`);
+    } else if (event.type === "human_input_resolved") {
+      line(this.#output, `Human input resolved: ${event.resolution}`);
     } else if (event.type === "message") line(this.#output, event.content);
     else if (event.type === "error") this.error(event.message);
   }

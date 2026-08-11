@@ -1,6 +1,8 @@
 import type {
   AgencyEvent,
   FailureContext,
+  HumanDecisionRequest,
+  HumanDecisionResolution,
   Plan,
   RepoContext,
   SessionContext,
@@ -9,6 +11,12 @@ import { InfrastructureError } from "../process/index.js";
 
 export type CodingEventSink = (event: AgencyEvent) => void;
 
+export interface RuntimeContinuation {
+  role: "planner" | "executor";
+  /** Basename only; resolved and validated beneath Agency-owned session storage. */
+  sessionFile: string;
+}
+
 export interface CodingRuntimeInput {
   intent: string;
   repo: RepoContext;
@@ -16,6 +24,11 @@ export interface CodingRuntimeInput {
   sessionContext?: SessionContext;
   onEvent?: CodingEventSink;
   signal?: AbortSignal;
+  /** Stable conversation identity for continuing a paused model session. */
+  sessionId?: string;
+  /** Validated answer to the runtime's immediately preceding request. */
+  humanDecision?: HumanDecisionResolution;
+  runtimeContinuation?: RuntimeContinuation;
 }
 
 export type CreatePlanInput = CodingRuntimeInput;
@@ -38,6 +51,12 @@ export interface CreatePlanResult {
   message: string;
 }
 
+export interface HumanDecisionResult {
+  decisionRequest: HumanDecisionRequest;
+  message: string;
+  runtimeContinuation?: RuntimeContinuation;
+}
+
 export interface CodingResult {
   message: string;
   changedFiles: string[];
@@ -45,9 +64,9 @@ export interface CodingResult {
 }
 
 export interface CodingRuntime {
-  createPlan(input: CreatePlanInput): Promise<CreatePlanResult>;
-  execute(input: ExecuteInput): Promise<CodingResult>;
-  repair(input: RepairInput): Promise<CodingResult>;
+  createPlan(input: CreatePlanInput): Promise<CreatePlanResult | HumanDecisionResult>;
+  execute(input: ExecuteInput): Promise<CodingResult | HumanDecisionResult>;
+  repair(input: RepairInput): Promise<CodingResult | HumanDecisionResult>;
   abort(): Promise<void>;
   dispose(): Promise<void> | void;
 }
@@ -73,35 +92,35 @@ export class FakeCodingRuntime implements CodingRuntime {
     repair: RepairInput[];
   } = { createPlan: [], execute: [], repair: [] };
 
-  readonly #planResults: Array<Queued<CreatePlanResult>> = [];
-  readonly #executeResults: Array<Queued<CodingResult>> = [];
-  readonly #repairResults: Array<Queued<CodingResult>> = [];
+  readonly #planResults: Array<Queued<CreatePlanResult | HumanDecisionResult>> = [];
+  readonly #executeResults: Array<Queued<CodingResult | HumanDecisionResult>> = [];
+  readonly #repairResults: Array<Queued<CodingResult | HumanDecisionResult>> = [];
   abortCalls = 0;
   isDisposed = false;
 
-  enqueuePlanResult(result: Queued<CreatePlanResult>): void {
+  enqueuePlanResult(result: Queued<CreatePlanResult | HumanDecisionResult>): void {
     this.#planResults.push(result);
   }
 
-  enqueueExecuteResult(result: Queued<CodingResult>): void {
+  enqueueExecuteResult(result: Queued<CodingResult | HumanDecisionResult>): void {
     this.#executeResults.push(result);
   }
 
-  enqueueRepairResult(result: Queued<CodingResult>): void {
+  enqueueRepairResult(result: Queued<CodingResult | HumanDecisionResult>): void {
     this.#repairResults.push(result);
   }
 
-  async createPlan(input: CreatePlanInput): Promise<CreatePlanResult> {
+  async createPlan(input: CreatePlanInput): Promise<CreatePlanResult | HumanDecisionResult> {
     this.calls.createPlan.push(input);
     return take(this.#planResults, "createPlan");
   }
 
-  async execute(input: ExecuteInput): Promise<CodingResult> {
+  async execute(input: ExecuteInput): Promise<CodingResult | HumanDecisionResult> {
     this.calls.execute.push(input);
     return take(this.#executeResults, "execute");
   }
 
-  async repair(input: RepairInput): Promise<CodingResult> {
+  async repair(input: RepairInput): Promise<CodingResult | HumanDecisionResult> {
     this.calls.repair.push(input);
     return take(this.#repairResults, "repair");
   }

@@ -4,6 +4,8 @@ import {
   AgencyEventSchema,
   CommandResultSchema,
   FailureContextSchema,
+  HumanDecisionRequestSchema,
+  HumanDecisionResponseSchema,
   PlanSchema,
   RepoContextSchema,
   SessionContextSchema,
@@ -11,6 +13,87 @@ import {
   type AgencyEvent,
   type Plan,
 } from "../../src/domain/index.js";
+
+describe("human decision contracts", () => {
+  it("accepts bounded clarification and consequential approval requests", () => {
+    expect(HumanDecisionRequestSchema.parse({
+      id: "decision-1",
+      kind: "clarification",
+      question: "Which storage backend should be used?",
+      context: "The repository supports either local SQLite or Postgres.",
+      options: [
+        { id: "sqlite", label: "SQLite", description: "Keep setup local and simple." },
+        { id: "postgres", label: "Postgres", description: "Use the deployed database." },
+      ],
+      allowCustom: true,
+    })).toMatchObject({ id: "decision-1", kind: "clarification" });
+
+    expect(HumanDecisionRequestSchema.parse({
+      id: "decision-2",
+      kind: "approval",
+      question: "Approve replacing the database dependency?",
+      risk: "This replaces a core dependency and can change persisted data behavior.",
+      action: "npm uninstall sqlite3 && npm install better-sqlite3",
+      options: [
+        { id: "approve", label: "Approve", description: "Run this exact action once." },
+        { id: "reject", label: "Reject", description: "Cancel this action." },
+        { id: "edit", label: "Edit", description: "Provide a safer replacement instruction." },
+      ],
+      allowCustom: true,
+    })).toMatchObject({ id: "decision-2", kind: "approval" });
+  });
+
+  it("rejects malformed or semantically invalid decisions", () => {
+    const request = {
+      id: "decision-1",
+      kind: "approval",
+      question: "Choose one",
+      action: "npm uninstall sqlite3",
+      options: [
+        { id: "approve", label: "Approve", description: "Run once" },
+        { id: "reject", label: "Reject", description: "Cancel" },
+        { id: "edit", label: "Edit", description: "Change it" },
+      ],
+      allowCustom: true,
+    } as const;
+    expect(() => HumanDecisionRequestSchema.parse({ ...request, secret: "nope" })).toThrow();
+    expect(() => HumanDecisionRequestSchema.parse({ ...request, options: [request.options[0]] })).toThrow();
+    expect(() => HumanDecisionRequestSchema.parse({ ...request, allowCustom: false })).toThrow();
+    expect(() => HumanDecisionResponseSchema.parse({ requestId: request.id, optionId: "a", customText: "also" })).toThrow();
+    expect(() => HumanDecisionResponseSchema.parse({ requestId: request.id })).toThrow();
+    expect(HumanDecisionResponseSchema.parse({
+      requestId: request.id,
+      customText: "use token=super-secret-value",
+    })).toEqual({ requestId: request.id, customText: "use token=[REDACTED]" });
+  });
+
+  it("validates a response against its request", () => {
+    const request = HumanDecisionRequestSchema.parse({
+      id: "decision-1",
+      kind: "approval",
+      question: "Choose one",
+      action: "npm uninstall sqlite3",
+      options: [
+        { id: "approve", label: "Approve", description: "Run once" },
+        { id: "reject", label: "Reject", description: "Cancel" },
+        { id: "edit", label: "Edit", description: "Change it" },
+      ],
+      allowCustom: true,
+    });
+    expect(HumanDecisionResponseSchema.forRequest(request).parse({
+      requestId: request.id,
+      optionId: "approve",
+    })).toEqual({ requestId: request.id, optionId: "approve" });
+    expect(() => HumanDecisionResponseSchema.forRequest(request).parse({
+      requestId: request.id,
+      optionId: "missing",
+    })).toThrow();
+    expect(HumanDecisionResponseSchema.forRequest(request).parse({
+      requestId: request.id,
+      customText: "Something else",
+    })).toEqual({ requestId: request.id, customText: "Something else" });
+  });
+});
 
 describe("PlanSchema", () => {
   const planInput = {

@@ -188,6 +188,83 @@ describe("Agency terminal application", () => {
     expect(io.closeCalls).toBe(0);
   });
 
+  it("cancels a pending human decision read without resuming the graph", async () => {
+    const cwd = await temporaryGitProject();
+    const request = {
+      id: "interrupt-choice",
+      kind: "clarification" as const,
+      question: "Which option?",
+      options: [
+        { id: "one", label: "One", description: "Choose one." },
+        { id: "two", label: "Two", description: "Choose two." },
+      ],
+      allowCustom: true,
+    };
+    const session = { sessionId: "session-interrupt", recentTurns: [], runSummaries: [] };
+    const interrupted = await CodingRunStateSchema.validateInput({
+      runId: "run-interrupt",
+      threadId: "thread-interrupt",
+      sessionId: session.sessionId,
+      repoPath: cwd,
+      userIntent: "task",
+      status: "executing",
+      codingPlan: plan,
+      pendingHumanDecision: request,
+      humanDecisionOrigin: "executing",
+    });
+    const listeners = new Set<() => void>();
+    let reads = 0;
+    let closeCalls = 0;
+    const io: TerminalIO = {
+      async readLine(_prompt, options) {
+        reads += 1;
+        if (reads === 1) return "task";
+        if (reads > 2) return null;
+        queueMicrotask(() => { for (const listener of listeners) listener(); });
+        return new Promise<null>((resolve) => {
+          options?.signal?.addEventListener("abort", () => resolve(null), { once: true });
+        });
+      },
+      onInterrupt(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      close() { closeCalls += 1; },
+    };
+    const resume = vi.fn(async () => interrupted);
+    const runtime = new FakeCodingRuntime();
+
+    await runAgency({
+      cwd,
+      io,
+      output: new BufferOutput(),
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => runtime,
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread: async () => {},
+        close: () => {},
+      }),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => session,
+        createNew: async () => session,
+        recordUserTurn: async () => session,
+        recordRunSummary: async () => session,
+      }),
+      registryFactory: () => ({ list: async () => [], upsert: async () => {}, updateStatus: async () => {} }),
+      graphFactory: () => ({
+        invoke: async () => interrupted,
+        getState: async () => ({}),
+        resume,
+      }),
+    });
+
+    expect(resume).not.toHaveBeenCalled();
+    expect(runtime.abortCalls).toBe(1);
+    expect(closeCalls).toBe(1);
+  });
+
   it("keeps a clean repository clean after repeated metadata startup", async () => {
     const cwd = await temporaryGitProject();
     const beforeIgnore = await readFile(join(cwd, ".gitignore"), "utf8").catch(
@@ -286,9 +363,110 @@ describe("Agency terminal application", () => {
       }],
     });
 
-    expect(graph.resume).toHaveBeenCalledWith("old-thread", expect.any(Object));
+    expect(graph.resume).toHaveBeenCalledWith("old-thread", undefined, expect.any(Object));
     expect(recordRunSummary).not.toHaveBeenCalled();
     expect(output.value).toContain("belongs to session original-session; the current session was left unchanged");
+  });
+
+  it("renders and resolves a pending approval during startup recovery", async () => {
+    const cwd = await temporaryGitProject();
+    const session: SessionContext = {
+      sessionId: "session-1",
+      recentTurns: [],
+      runSummaries: [],
+    };
+    const request = {
+      id: "migration-approval",
+      kind: "approval" as const,
+      question: "Approve the database migration?",
+      risk: "It changes the schema.",
+      action: "npx prisma migrate deploy",
+      options: [
+        { id: "approve", label: "Approve", description: "Run this exact action once." },
+        { id: "reject", label: "Reject", description: "Cancel the action." },
+        { id: "edit", label: "Edit", description: "Provide safer guidance." },
+      ],
+      allowCustom: true,
+    };
+    const interrupted = await CodingRunStateSchema.validateInput({
+      runId: "run-approval",
+      threadId: "thread-approval",
+      sessionId: session.sessionId,
+      repoPath: cwd,
+      userIntent: "migrate database",
+      status: "executing",
+      codingPlan: plan,
+      changedFiles: [],
+      verificationCommands: [
+        { name: "test", command: "npm", args: ["run", "test"], required: true },
+      ],
+      pendingHumanDecision: request,
+      humanDecisionOrigin: "executing",
+    });
+    const completed = {
+      ...interrupted,
+      status: "completed" as const,
+      pendingHumanDecision: null,
+      humanDecisionOrigin: null,
+      verification: { status: "passed" as const, summary: "tests passed", commands: [] },
+      summary: "migration guidance applied",
+    };
+    const resume = vi.fn(async () => completed);
+    const io = new ScriptedIO(["e", "Use a dry-run migration", "/exit"]);
+    const output = new BufferOutput();
+
+    await runAgency({
+      cwd,
+      io,
+      output,
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => new FakeCodingRuntime(),
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread: async () => {},
+        close: () => {},
+      }),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => session,
+        createNew: async () => session,
+        recordUserTurn: async () => session,
+        recordRunSummary: async () => session,
+      }),
+      registryFactory: () => ({
+        list: async () => [],
+        upsert: async () => {},
+        updateStatus: async () => {},
+      }),
+      graphFactory: () => ({
+        invoke: async () => completed,
+        getState: async () => ({}),
+        resume,
+      }),
+      inspectRecovery: async () => [{
+        status: "resumable",
+        entry: {
+          runId: interrupted.runId,
+          threadId: interrupted.threadId,
+          sessionId: interrupted.sessionId,
+          userIntent: interrupted.userIntent,
+          status: "executing",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+        snapshot: { values: interrupted, next: ["human"], tasks: [] },
+      }],
+    });
+
+    expect(io.prompts).toContain("Choose [a] approve, [r] reject, [e] edit: ");
+    expect(io.prompts).toContain("Edited instruction: ");
+    expect(resume).toHaveBeenCalledWith(
+      "thread-approval",
+      { requestId: request.id, customText: "Use a dry-run migration" },
+      expect.any(Object),
+    );
+    expect(output.value).toContain("[a] Approve");
+    expect(output.value).toContain("Done: migration guidance applied");
   });
 
   it("renders a terminal result before warning when checkpoint pruning fails", async () => {

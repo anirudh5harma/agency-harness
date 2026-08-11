@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -23,7 +23,7 @@ import type {
   TrajectoryLifecycleEvent,
   TrajectoryWriter,
 } from "../../src/observability/index.js";
-import { IncompleteRunRegistry } from "../../src/persistence/index.js";
+import { createSqliteCheckpointPersistence, IncompleteRunRegistry } from "../../src/persistence/index.js";
 import { InfrastructureError } from "../../src/process/index.js";
 import { EventBus } from "../../src/events/index.js";
 import {
@@ -112,6 +112,120 @@ afterEach(async () => {
 });
 
 describe("coding run graph", () => {
+  it("checkpoints a human request and resumes without duplicating execution", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    const request = {
+      id: "approve-migration-1",
+      kind: "approval" as const,
+      question: "Approve this database migration?",
+      risk: "It changes the database schema.",
+      action: "npx prisma migrate deploy",
+      options: [
+        { id: "approve", label: "Approve", description: "Run this exact action once." },
+        { id: "reject", label: "Reject", description: "Cancel the migration." },
+        { id: "edit", label: "Edit", description: "Provide a different instruction." },
+      ],
+      allowCustom: true,
+    };
+    runtime.enqueueExecuteResult({ decisionRequest: request, message: "approval needed" });
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    const trajectory: TrajectoryLifecycleEvent[] = [];
+    deps.trajectoryWriter = { append: async (event) => { trajectory.push(event.event); } };
+    const runner = createCodingRunGraph(deps, { checkpointer: new MemorySaver() });
+
+    const interrupted = await runner.invoke(input(root), { threadId: "human-thread" });
+
+    expect(interrupted.pendingHumanDecision).toEqual(request);
+    expect(runtime.calls.execute).toHaveLength(1);
+    await expect(runner.getState("human-thread")).resolves.toMatchObject({
+      values: { pendingHumanDecision: request, humanDecisionOrigin: "executing" },
+      next: ["human"],
+    });
+
+    const completed = await runner.resume("human-thread", {
+      requestId: request.id,
+      optionId: "approve",
+    });
+
+    expect(completed.status).toBe("completed");
+    expect(runtime.calls.execute).toHaveLength(2);
+    expect(runtime.calls.execute[1]?.humanDecision).toEqual({
+      request,
+      response: { requestId: request.id, optionId: "approve" },
+    });
+    expect(trajectory.filter((event) => event === "human_input_requested")).toHaveLength(1);
+    expect(trajectory.filter((event) => event === "human_input_resolved")).toHaveLength(1);
+    expect(trajectory.filter((event) => event === "execution_started")).toHaveLength(1);
+  });
+
+  it("counts a paused repair exactly once after it completes", async () => {
+    const { root, runtime, deps } = await setup([
+      verification("failed"),
+      verification("failed"),
+      verification("passed"),
+    ]);
+    const request = {
+      id: "repair-choice",
+      kind: "clarification" as const,
+      question: "Which repair should be applied?",
+      options: [
+        { id: "small", label: "Small", description: "Apply the narrow repair." },
+        { id: "broad", label: "Broad", description: "Apply the broader repair." },
+      ],
+      allowCustom: true,
+    };
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    runtime.enqueueRepairResult({ decisionRequest: request, message: "choice needed" });
+    runtime.enqueueRepairResult({ message: "first repair", changedFiles: [], sessionId: "pi-1" });
+    runtime.enqueueRepairResult({ message: "second repair", changedFiles: [], sessionId: "pi-1" });
+    const runner = createCodingRunGraph(deps, { checkpointer: new MemorySaver() });
+
+    const paused = await runner.invoke(input(root, 2), { threadId: "repair-pause" });
+    expect(paused.attempt).toBe(0);
+
+    const completed = await runner.resume("repair-pause", {
+      requestId: request.id,
+      optionId: "small",
+    });
+
+    expect(completed.status).toBe("completed");
+    expect(completed.attempt).toBe(2);
+    expect(runtime.calls.repair.map(({ attempt }) => attempt)).toEqual([1, 1, 2]);
+  });
+
+  it("redacts a human response before constructing the persisted resume command", async () => {
+    const { root, runtime, deps } = await setup([verification("passed")]);
+    const request = {
+      id: "secret-guidance",
+      kind: "clarification" as const,
+      question: "What guidance should be used?",
+      options: [
+        { id: "one", label: "One", description: "Use option one." },
+        { id: "two", label: "Two", description: "Use option two." },
+      ],
+      allowCustom: true,
+    };
+    runtime.enqueueExecuteResult({ decisionRequest: request, message: "guidance needed" });
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    const persistence = await createSqliteCheckpointPersistence(root);
+    const runner = createCodingRunGraph(deps, { checkpointer: persistence.checkpointer });
+    await runner.invoke(input(root), { threadId: "secret-resume" });
+
+    await runner.resume("secret-resume", {
+      requestId: request.id,
+      customText: "token=super-secret continue safely",
+    });
+    expect(runtime.calls.execute[1]?.humanDecision?.response.customText).toBe(
+      "token=[REDACTED] continue safely",
+    );
+    await expect(runner.resume("missing-request", {
+      requestId: request.id,
+      optionId: "one",
+    })).rejects.toThrow("matching pending human request");
+    persistence.close();
+    expect((await readFile(persistence.path)).includes(Buffer.from("super-secret"))).toBe(false);
+  });
+
   it("records the successful lifecycle in order without UI event payloads", async () => {
     const { root, runtime, deps } = await setup([verification("passed")]);
     const events: TrajectoryLifecycleEvent[] = [];

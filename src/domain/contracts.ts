@@ -1,6 +1,111 @@
 import { z } from "zod";
 
 const NonEmptyStringSchema = z.string().trim().min(1);
+function redactSecrets(value: string): string {
+  return value
+    .replace(/\bBearer\s+[^\s,;]+/giu, "Bearer [REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gu, "[REDACTED]")
+    .replace(
+      /(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
+      "$1[REDACTED]",
+    );
+}
+const HumanDecisionIdSchema = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u);
+const HumanDecisionTextSchema = z.string().trim().min(1).max(1_000).transform(redactSecrets);
+
+export const HumanDecisionOptionSchema = z.strictObject({
+  id: HumanDecisionIdSchema,
+  label: z.string().trim().min(1).max(80).transform(redactSecrets),
+  description: z.string().trim().min(1).max(240).transform(redactSecrets),
+});
+export type HumanDecisionOption = z.infer<typeof HumanDecisionOptionSchema>;
+
+export const HumanDecisionRequestSchema = z
+  .strictObject({
+    id: HumanDecisionIdSchema,
+    kind: z.enum(["clarification", "approval"]),
+    question: HumanDecisionTextSchema,
+    context: HumanDecisionTextSchema.optional(),
+    risk: HumanDecisionTextSchema.optional(),
+    /** Exact normalized command or action governed by an approval. */
+    action: HumanDecisionTextSchema.optional(),
+    options: z.array(HumanDecisionOptionSchema).min(2).max(3),
+    allowCustom: z.boolean(),
+  })
+  .superRefine((request, context) => {
+    const ids = request.options.map(({ id }) => id);
+    if (new Set(ids).size !== ids.length) {
+      context.addIssue({ code: "custom", path: ["options"], message: "option ids must be unique" });
+    }
+    if (request.kind === "clarification" && !request.allowCustom) {
+      context.addIssue({ code: "custom", path: ["allowCustom"], message: "clarifications must allow custom input" });
+    }
+    if (request.kind === "approval") {
+      if (!request.allowCustom) {
+        context.addIssue({ code: "custom", path: ["allowCustom"], message: "approval edits require custom input" });
+      }
+      if (request.action === undefined) {
+        context.addIssue({ code: "custom", path: ["action"], message: "approvals require an exact action" });
+      }
+      if (ids.length !== 3 || !["approve", "reject", "edit"].every((id) => ids.includes(id))) {
+        context.addIssue({
+          code: "custom",
+          path: ["options"],
+          message: "approvals require approve, reject, and edit options",
+        });
+      }
+    }
+  });
+export type HumanDecisionRequest = z.infer<typeof HumanDecisionRequestSchema>;
+
+const HumanDecisionResponseBaseSchema = z
+  .strictObject({
+    requestId: HumanDecisionIdSchema,
+    optionId: HumanDecisionIdSchema.optional(),
+    customText: HumanDecisionTextSchema.optional(),
+  })
+  .superRefine((response, context) => {
+    if ((response.optionId === undefined) === (response.customText === undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "choose exactly one option or provide custom text",
+      });
+    }
+  });
+
+export const HumanDecisionResponseSchema = Object.assign(HumanDecisionResponseBaseSchema, {
+  forRequest(request: HumanDecisionRequest) {
+    return HumanDecisionResponseBaseSchema.superRefine((response, context) => {
+      if (response.requestId !== request.id) {
+        context.addIssue({ code: "custom", path: ["requestId"], message: "request id does not match" });
+      }
+      if (
+        response.optionId !== undefined &&
+        !request.options.some(({ id }) => id === response.optionId)
+      ) {
+        context.addIssue({ code: "custom", path: ["optionId"], message: "unknown option" });
+      }
+      if (response.customText !== undefined && !request.allowCustom) {
+        context.addIssue({ code: "custom", path: ["customText"], message: "custom input is not allowed" });
+      }
+    });
+  },
+});
+export type HumanDecisionResponse = z.infer<typeof HumanDecisionResponseBaseSchema>;
+
+export const HumanDecisionResolutionSchema = z.strictObject({
+  request: HumanDecisionRequestSchema,
+  response: HumanDecisionResponseBaseSchema,
+}).superRefine(({ request, response }, context) => {
+  const parsed = HumanDecisionResponseSchema.forRequest(request).safeParse(response);
+  for (const issue of parsed.success ? [] : parsed.error.issues) {
+    context.addIssue({ code: "custom", path: issue.path, message: issue.message });
+  }
+});
+export type HumanDecisionResolution = z.infer<typeof HumanDecisionResolutionSchema>;
 
 export const PlanStepSchema = z.strictObject({
   id: NonEmptyStringSchema,
@@ -150,5 +255,20 @@ export const AgencyEventSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({ type: z.literal("message"), content: NonEmptyStringSchema }),
   z.strictObject({ type: z.literal("error"), message: NonEmptyStringSchema }),
+  z.strictObject({
+    type: z.literal("human_input_requested"),
+    requestId: HumanDecisionIdSchema,
+    kind: z.enum(["clarification", "approval"]),
+    question: HumanDecisionTextSchema,
+    options: z.array(z.strictObject({
+      id: HumanDecisionIdSchema,
+      label: z.string().trim().min(1).max(80).transform(redactSecrets),
+    })).min(2).max(3),
+  }),
+  z.strictObject({
+    type: z.literal("human_input_resolved"),
+    requestId: HumanDecisionIdSchema,
+    resolution: HumanDecisionIdSchema.or(z.literal("custom")),
+  }),
 ]);
 export type AgencyEvent = z.infer<typeof AgencyEventSchema>;

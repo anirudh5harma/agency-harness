@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { basename as pathBasename, resolve, sep } from "node:path";
 
 import {
   DefaultResourceLoader,
@@ -9,6 +9,7 @@ import {
   createAgentSession,
   getAgentDir,
   type AgentSessionEvent,
+  type CreateAgentSessionResult,
   type CreateAgentSessionOptions,
   type ResourceLoader,
   type ToolDefinition,
@@ -16,9 +17,11 @@ import {
 
 import {
   AgencyEventSchema,
+  HumanDecisionRequestSchema,
   PlanSchema,
   type AgencyEvent,
   type FailureContext,
+  type HumanDecisionRequest,
   type Plan,
   type RepoContext,
   type SessionContext,
@@ -32,10 +35,11 @@ import type {
   CreatePlanResult,
   ExecuteInput,
   RepairInput,
+  RuntimeContinuation,
 } from "./coding-runtime.js";
 
-const PLANNER_TOOLS = ["read", "grep", "find", "ls", "submit_plan"];
-const EXECUTOR_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const PLANNER_TOOLS = ["read", "grep", "find", "ls", "submit_plan", "request_human_input"];
+const EXECUTOR_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "request_human_input"];
 const MAX_INSTRUCTIONS_CHARS = 6_000;
 const MAX_CONTEXT_ITEMS = 6;
 const MAX_CONTEXT_ITEM_CHARS = 800;
@@ -46,10 +50,55 @@ const PI_NO_API_KEY_ERROR = "No API key found for the selected model.";
 
 export interface PiSession {
   readonly sessionId: string;
+  readonly sessionFile: string | undefined;
+  readonly agent?: CreateAgentSessionResult["session"]["agent"];
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
   prompt(text: string): Promise<void>;
   abort(): Promise<void>;
   dispose(): void;
+}
+
+function enforceExclusiveHumanRequest(session: PiSession): void {
+  if (session.agent === undefined) return;
+  const previous = session.agent.beforeToolCall;
+  session.agent.beforeToolCall = async (context, signal) => {
+    const hasHumanRequest = context.assistantMessage.content.some(
+      (content) => content.type === "toolCall" && content.name === "request_human_input",
+    );
+    if (hasHumanRequest && context.toolCall.name !== "request_human_input") {
+      return {
+        block: true,
+        reason: "A human-input request must be the only tool in its assistant tool batch",
+        terminate: true,
+      };
+    }
+    return previous?.(context, signal);
+  };
+}
+
+function sessionDirectory(repo: RepoContext, role: RuntimeContinuation["role"]): string {
+  return resolve(repo.rootPath, ".devagency", "pi-sessions", role);
+}
+
+function continuationPath(repo: RepoContext, continuation: RuntimeContinuation): string {
+  if (
+    continuation.sessionFile.length > 255 ||
+    continuation.sessionFile !== pathBasename(continuation.sessionFile) ||
+    !/^[A-Za-z0-9._-]+\.jsonl$/u.test(continuation.sessionFile)
+  ) {
+    throw new Error("Invalid Pi runtime continuation identity");
+  }
+  const directory = sessionDirectory(repo, continuation.role);
+  const path = resolve(directory, continuation.sessionFile);
+  if (!path.startsWith(`${directory}${sep}`)) throw new Error("Invalid Pi runtime continuation path");
+  return path;
+}
+
+function runtimeContinuation(session: PiSession, role: RuntimeContinuation["role"]): RuntimeContinuation {
+  if (session.sessionFile === undefined) {
+    throw new Error("Persistent Pi session did not expose a continuation file");
+  }
+  return { role, sessionFile: pathBasename(session.sessionFile) };
 }
 
 type PiBashToolDefinition = ReturnType<typeof createBashToolDefinition>;
@@ -58,6 +107,7 @@ export interface PiSdkBoundary {
   createModelRuntime(): Promise<ModelRuntime>;
   inMemorySessionManager(cwd: string): SessionManager;
   createSessionManager(cwd: string, sessionDir: string): SessionManager;
+  openSessionManager(cwd: string, sessionDir: string, sessionFile: string): SessionManager;
   createResourceLoader(cwd: string): Promise<ResourceLoader>;
   createBashTool(cwd: string): PiBashToolDefinition;
   createAgentSession(
@@ -85,6 +135,8 @@ const defaultSdk: PiSdkBoundary = {
   createModelRuntime: () => ModelRuntime.create(),
   inMemorySessionManager: (cwd) => SessionManager.inMemory(cwd),
   createSessionManager: (cwd, sessionDir) => SessionManager.create(cwd, sessionDir),
+  openSessionManager: (cwd, sessionDir, sessionFile) =>
+    SessionManager.open(sessionFile, sessionDir, cwd),
   createResourceLoader: createSafeResourceLoader,
   createBashTool: (cwd) => createBashToolDefinition(cwd),
   createAgentSession,
@@ -145,7 +197,30 @@ function isUnsafeGitInvocation(words: string[], gitIndex: number): boolean {
   return subcommand === undefined || !SAFE_GIT_COMMANDS.has(subcommand);
 }
 
-function assertAllowedBash(command: string): void {
+function normalizedAction(command: string): string {
+  return command.replace(/\s+/gu, " ").trim();
+}
+
+function isRecursiveRm(words: readonly string[]): boolean {
+  return words.some((word, index) => {
+    if (basename(word) !== "rm") return false;
+    return words.slice(index + 1).some((argument) => {
+      const option = argument.toLowerCase();
+      if (option === "--recursive" || option.startsWith("--recursive=")) return true;
+      return /^-[^-]*r[^-]*$/u.test(option);
+    });
+  });
+}
+
+function isConsequentialShell(command: string, words = shellWords(command)): boolean {
+  const normalized = normalizedAction(command).toLowerCase();
+  return isRecursiveRm(words) ||
+    /(?:^|\s)(?:drop\s+(?:database|table)|truncate\s+table)(?:\s|$)/u.test(normalized) ||
+    /(?:prisma|knex|sequelize|typeorm|rails|rake|django-admin|alembic)[^\n]*(?:migrate|migration)/u.test(normalized) ||
+    /(?:npm|pnpm|yarn|bun)\s+(?:remove|uninstall|install|add|update|up)(?:\s|$)/u.test(normalized);
+}
+
+function assertAllowedBash(command: string, consumeApproval: (action: string) => boolean): void {
   const words = shellWords(command);
   const lower = words.map((word) => word.toLowerCase());
   const hasUnsafeGit = words.some(
@@ -171,13 +246,22 @@ function assertAllowedBash(command: string): void {
       "Agency policy blocks Git staging, commits, pushes, and pull-request creation",
     );
   }
+  const action = normalizedAction(command);
+  if (isConsequentialShell(action, words) && !consumeApproval(action)) {
+    throw new Error(
+      "Agency policy requires explicit one-shot approval for this exact consequential command",
+    );
+  }
 }
 
-function protectedBashTool(delegate: PiBashToolDefinition): PiBashToolDefinition {
+function protectedBashTool(
+  delegate: PiBashToolDefinition,
+  consumeApproval: (action: string) => boolean,
+): PiBashToolDefinition {
   return {
     ...delegate,
     async execute(toolCallId, params, signal, onUpdate, context) {
-      assertAllowedBash(stringProperty(params, "command") ?? "");
+      assertAllowedBash(stringProperty(params, "command") ?? "", consumeApproval);
       return delegate.execute(toolCallId, params, signal, onUpdate, context);
     },
   };
@@ -350,6 +434,10 @@ function plannerPrompt(input: CreatePlanInput): string {
     `Intent: ${concise(input.intent, MAX_INSTRUCTIONS_CHARS)}`,
     `Bounded prior context: ${sessionSummary(input.sessionContext)}`,
     "Inspect only as needed. You have no shell or mutation tools.",
+    "Use request_human_input only for material ambiguity or a consequential approval; never elevate trivial choices.",
+    ...(input.humanDecision === undefined
+      ? []
+      : [`Validated human response to your prior request: ${JSON.stringify(input.humanDecision.response)}`]),
     "Finish by calling submit_plan exactly once with the structured plan; do not print the plan or continue afterward.",
   ].join("\n\n");
 }
@@ -363,6 +451,11 @@ function executorPrompt(input: ExecuteInput): string {
     `Validated plan: ${JSON.stringify(PlanSchema.parse(input.plan))}`,
     `Bounded prior context: ${sessionSummary(input.sessionContext)}`,
     "Stay within the plan. Do not commit, stage, push, or open a pull request.",
+    "Use request_human_input only for material ambiguity or a consequential action (dangerous shell, dependency replacement, database migration, or large destructive change); never elevate trivial choices.",
+    "An approval is scoped to its exact normalized action and can be consumed only once. Rejection or edited guidance must cancel or replan the original action.",
+    ...(input.humanDecision === undefined
+      ? []
+      : [`Validated human response to your prior request: ${JSON.stringify(input.humanDecision.response)}`]),
     "Run only focused self-checks needed while implementing. Stop when the change is ready for independent verification.",
     "End with one concise summary of what changed and any verification caveat; do not include hidden reasoning or raw command output.",
   ].join("\n\n");
@@ -405,6 +498,10 @@ function repairPrompt(input: RepairInput): string {
     "Diagnose the failure before editing, then address only the observed failure.",
     "Never weaken or delete tests, lint rules, typecheck settings, configuration, or scripts to make verification pass.",
     "Do not commit, stage, push, or open a pull request.",
+    "Use request_human_input only for material ambiguity or a consequential action; never elevate trivial choices. Rejection or edited guidance must not execute the original action.",
+    ...(input.humanDecision === undefined
+      ? []
+      : [`Validated human response to your prior request: ${JSON.stringify(input.humanDecision.response)}`]),
     "Stop when the repair is ready for independent verification. End with one concise summary, without hidden reasoning or raw output.",
   ].join("\n\n");
 }
@@ -464,6 +561,62 @@ function submitPlanTool(onPlan: (value: unknown) => void): ToolDefinition {
   };
 }
 
+const humanDecisionParameters = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "kind", "question", "context", "risk", "action", "options", "allowCustom"],
+  properties: {
+    id: { type: "string", minLength: 1, maxLength: 128 },
+    kind: { type: "string", enum: ["clarification", "approval"] },
+    question: { type: "string", minLength: 1, maxLength: 1_000 },
+    context: { anyOf: [{ type: "string", minLength: 1, maxLength: 1_000 }, { type: "null" }] },
+    risk: { anyOf: [{ type: "string", minLength: 1, maxLength: 1_000 }, { type: "null" }] },
+    action: { anyOf: [{ type: "string", minLength: 1, maxLength: 1_000 }, { type: "null" }] },
+    options: {
+      type: "array",
+      minItems: 2,
+      maxItems: 3,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "label", "description"],
+        properties: {
+          id: { type: "string", minLength: 1, maxLength: 128 },
+          label: { type: "string", minLength: 1, maxLength: 80 },
+          description: { type: "string", minLength: 1, maxLength: 240 },
+        },
+      },
+    },
+    allowCustom: { type: "boolean" },
+  },
+} as ToolDefinition["parameters"];
+
+function requestHumanInputTool(onRequest: (request: HumanDecisionRequest) => void): ToolDefinition {
+  return {
+    name: "request_human_input",
+    label: "Request human input",
+    description: "Pause for a material clarification or exact consequential-action approval.",
+    parameters: humanDecisionParameters,
+    constrainedSampling: { type: "json_schema", strict: "prefer" },
+    executionMode: "sequential",
+    async execute(_toolCallId, params) {
+      const raw = params as Record<string, unknown>;
+      const request = HumanDecisionRequestSchema.parse({
+        ...raw,
+        ...(raw.context === null ? { context: undefined } : {}),
+        ...(raw.risk === null ? { risk: undefined } : {}),
+        ...(raw.action === null ? { action: undefined } : {}),
+      });
+      onRequest(request);
+      return {
+        content: [{ type: "text", text: "Human input requested. Stop now." }],
+        details: {},
+        terminate: true,
+      };
+    },
+  };
+}
+
 function infrastructure(
   code:
     | "PI_RUNTIME_INITIALIZATION_FAILED"
@@ -509,6 +662,10 @@ export class PiCodingRuntime implements CodingRuntime {
   readonly #sdk: PiSdkBoundary;
   readonly #modelRuntime: ModelRuntime;
   readonly #executors = new Map<string, PiSession>();
+  readonly #planners = new Map<string, PiSession>();
+  readonly #planHandlers = new Map<string, (value: unknown) => void>();
+  readonly #humanRequestHandlers = new Map<string, (request: HumanDecisionRequest) => void>();
+  readonly #approvedActions = new Map<string, string>();
   readonly #activeSessions = new Set<PiSession>();
   #disposed = false;
 
@@ -530,32 +687,53 @@ export class PiCodingRuntime implements CodingRuntime {
     }
   }
 
-  async createPlan(input: CreatePlanInput): Promise<CreatePlanResult> {
+  async createPlan(input: CreatePlanInput): Promise<CreatePlanResult | import("./coding-runtime.js").HumanDecisionResult> {
     this.#assertUsable();
     assertNotAborted(input.signal);
     let submittedPlan: Plan | undefined;
     let submittedError: InfrastructureError | undefined;
+    let decisionRequest: HumanDecisionRequest | undefined;
     let planner: PiSession | undefined;
-    const tool = submitPlanTool((value) => {
+    const plannerKey = input.sessionId ?? "__single_planner__";
+    if (input.runtimeContinuation !== undefined && input.runtimeContinuation.role !== "planner") {
+      throw infrastructure("PI_SESSION_CREATION_FAILED", "Invalid planner continuation role");
+    }
+    const requestHandlerKey = `planner:${plannerKey}`;
+    this.#humanRequestHandlers.set(requestHandlerKey, (request) => { decisionRequest = request; });
+    this.#planHandlers.set(plannerKey, (value) => {
       try {
         submittedPlan = PlanSchema.parse(value);
       } catch (error) {
         submittedError = infrastructure("PI_PLAN_INVALID", "Pi submitted an invalid plan", error);
       }
     });
+    const tool = submitPlanTool((value) => this.#planHandlers.get(plannerKey)?.(value));
 
     try {
-      planner = (
+      planner = this.#planners.get(plannerKey) ?? (
         await this.#sdk.createAgentSession({
           cwd: input.repo.rootPath,
           modelRuntime: this.#modelRuntime,
-          sessionManager: this.#sdk.inMemorySessionManager(input.repo.rootPath),
+          sessionManager: input.runtimeContinuation === undefined
+            ? this.#sdk.createSessionManager(input.repo.rootPath, sessionDirectory(input.repo, "planner"))
+            : this.#sdk.openSessionManager(
+                input.repo.rootPath,
+                sessionDirectory(input.repo, "planner"),
+                continuationPath(input.repo, input.runtimeContinuation),
+              ),
           resourceLoader: await this.#sdk.createResourceLoader(input.repo.rootPath),
           tools: PLANNER_TOOLS,
-          customTools: [tool],
+          customTools: [
+            tool,
+            requestHumanInputTool((request) => this.#humanRequestHandlers.get(requestHandlerKey)?.(request)),
+          ],
         })
       ).session;
+      enforceExclusiveHumanRequest(planner);
+      this.#planners.set(plannerKey, planner);
     } catch (error) {
+      this.#humanRequestHandlers.delete(requestHandlerKey);
+      this.#planHandlers.delete(plannerKey);
       throw infrastructure("PI_SESSION_CREATION_FAILED", "Failed to create Pi planner session", error);
     }
 
@@ -568,7 +746,7 @@ export class PiCodingRuntime implements CodingRuntime {
       try {
         await planner.prompt(plannerPrompt(input));
       } catch (error) {
-        if (submittedPlan === undefined && submittedError === undefined) {
+        if (submittedPlan === undefined && submittedError === undefined && decisionRequest === undefined) {
           assertNotAborted(input.signal);
           const providerError = state.eventState.providerError ?? knownPublicPiError(error);
           throw infrastructure(
@@ -581,6 +759,13 @@ export class PiCodingRuntime implements CodingRuntime {
         }
       }
       if (submittedError !== undefined) throw submittedError;
+      if (decisionRequest !== undefined) {
+        return {
+          decisionRequest,
+          message: "Waiting for human input.",
+          runtimeContinuation: runtimeContinuation(planner, "planner"),
+        };
+      }
       if (submittedPlan === undefined && state.eventState.providerError !== undefined) {
         throw infrastructure(
           "PI_PROVIDER_REQUEST_FAILED",
@@ -598,45 +783,74 @@ export class PiCodingRuntime implements CodingRuntime {
       await abortState.completion();
       state.unsubscribe();
       this.#activeSessions.delete(planner);
-      planner.dispose();
+      this.#humanRequestHandlers.delete(requestHandlerKey);
+      this.#planHandlers.delete(plannerKey);
+      if (decisionRequest === undefined) {
+        const ownsPlanner = this.#planners.get(plannerKey) === planner;
+        this.#planners.delete(plannerKey);
+        if (ownsPlanner) planner.dispose();
+      }
     }
   }
 
-  async execute(input: ExecuteInput): Promise<CodingResult> {
+  async execute(input: ExecuteInput): Promise<CodingResult | import("./coding-runtime.js").HumanDecisionResult> {
     emit(input.onEvent, { type: "phase", phase: "executing" });
     return this.#runExecutor(input, executorPrompt(input));
   }
 
-  async repair(input: RepairInput): Promise<CodingResult> {
+  async repair(input: RepairInput): Promise<CodingResult | import("./coding-runtime.js").HumanDecisionResult> {
     emit(input.onEvent, { type: "phase", phase: "repairing" });
     return this.#runExecutor(input, repairPrompt(input));
   }
 
   async abort(): Promise<void> {
-    const sessions = new Set([...this.#activeSessions, ...this.#executors.values()]);
+    const sessions = new Set([
+      ...this.#activeSessions,
+      ...this.#executors.values(),
+      ...this.#planners.values(),
+    ]);
     const executors = new Set(this.#executors.values());
+    const planners = new Set(this.#planners.values());
+    const persistentSessions = new Set([...executors, ...planners]);
     // An aborted Pi session is not safe to reuse for a later Agency turn.
     this.#executors.clear();
+    this.#planners.clear();
+    this.#humanRequestHandlers.clear();
+    this.#planHandlers.clear();
+    this.#approvedActions.clear();
     await Promise.allSettled([...sessions].map((session) => session.abort()));
-    for (const session of executors) session.dispose();
+    for (const session of persistentSessions) session.dispose();
+    this.#activeSessions.clear();
   }
 
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
     await this.abort();
-    for (const session of this.#executors.values()) session.dispose();
-    this.#executors.clear();
-    this.#activeSessions.clear();
   }
 
-  async #runExecutor(input: ExecuteInput, prompt: string): Promise<CodingResult> {
+  async #runExecutor(input: ExecuteInput, prompt: string): Promise<CodingResult | import("./coding-runtime.js").HumanDecisionResult> {
     this.#assertUsable();
     assertNotAborted(input.signal);
-    const session = await this.#executor(input.repo, input.sessionId, input.signal);
+    const session = await this.#executor(
+      input.repo,
+      input.sessionId,
+      input.signal,
+      input.runtimeContinuation,
+    );
     const state = this.#subscribe(session, input.onEvent);
     this.#activeSessions.add(session);
     const executorKey = this.#executorKey(input.repo, input.sessionId);
+    let decisionRequest: HumanDecisionRequest | undefined;
+    this.#humanRequestHandlers.set(executorKey, (request) => { decisionRequest = request; });
+    this.#approvedActions.delete(executorKey);
+    if (
+      input.humanDecision?.request.kind === "approval" &&
+      input.humanDecision.response.optionId === "approve" &&
+      input.humanDecision.request.action !== undefined
+    ) {
+      this.#approvedActions.set(executorKey, normalizedAction(input.humanDecision.request.action));
+    }
     const abortState = this.#attachAbort(input.signal, session, () => {
       if (this.#executors.get(executorKey) === session) this.#executors.delete(executorKey);
     });
@@ -644,6 +858,13 @@ export class PiCodingRuntime implements CodingRuntime {
       assertNotAborted(input.signal);
       await session.prompt(prompt);
       assertNotAborted(input.signal);
+      if (decisionRequest !== undefined) {
+        return {
+          decisionRequest,
+          message: "Waiting for human input.",
+          runtimeContinuation: runtimeContinuation(session, "executor"),
+        };
+      }
       if (state.eventState.providerError !== undefined) {
         throw infrastructure(
           "PI_PROVIDER_REQUEST_FAILED",
@@ -666,6 +887,7 @@ export class PiCodingRuntime implements CodingRuntime {
       if (input.signal?.aborted === true) session.dispose();
       state.unsubscribe();
       this.#activeSessions.delete(session);
+      this.#humanRequestHandlers.delete(executorKey);
     }
   }
 
@@ -673,22 +895,42 @@ export class PiCodingRuntime implements CodingRuntime {
     repo: RepoContext,
     agencySessionId: string,
     signal: AbortSignal | undefined,
+    continuation: RuntimeContinuation | undefined,
   ): Promise<PiSession> {
     const executorKey = this.#executorKey(repo, agencySessionId);
     const existing = this.#executors.get(executorKey);
     if (existing !== undefined) return existing;
+    if (continuation !== undefined && continuation.role !== "executor") {
+      throw infrastructure("PI_SESSION_CREATION_FAILED", "Invalid executor continuation role");
+    }
     try {
-      const sessionDir = resolve(repo.rootPath, ".devagency/pi-sessions");
+      const sessionDir = sessionDirectory(repo, "executor");
       const { session } = await this.#sdk.createAgentSession({
         cwd: repo.rootPath,
         modelRuntime: this.#modelRuntime,
-        sessionManager: this.#sdk.createSessionManager(repo.rootPath, sessionDir),
+        sessionManager: continuation === undefined
+          ? this.#sdk.createSessionManager(repo.rootPath, sessionDir)
+          : this.#sdk.openSessionManager(
+              repo.rootPath,
+              sessionDir,
+              continuationPath(repo, continuation),
+            ),
         resourceLoader: await this.#sdk.createResourceLoader(repo.rootPath),
         tools: EXECUTOR_TOOLS,
         customTools: [
-          protectedBashTool(this.#sdk.createBashTool(repo.rootPath)) as unknown as ToolDefinition,
+          protectedBashTool(
+            this.#sdk.createBashTool(repo.rootPath),
+            (action) => {
+              const approved = this.#approvedActions.get(executorKey);
+              if (approved !== action) return false;
+              this.#approvedActions.delete(executorKey);
+              return true;
+            },
+          ) as unknown as ToolDefinition,
+          requestHumanInputTool((request) => this.#humanRequestHandlers.get(executorKey)?.(request)),
         ],
       });
+      enforceExclusiveHumanRequest(session);
       if (signal?.aborted === true) {
         await session.abort();
         session.dispose();

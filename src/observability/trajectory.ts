@@ -27,6 +27,8 @@ export const TrajectoryLifecycleEventSchema = z.enum([
   "repair_started",
   "repair_completed",
   "repair_failed",
+  "human_input_requested",
+  "human_input_resolved",
   "run_completed",
 ]);
 export type TrajectoryLifecycleEvent = z.infer<
@@ -37,6 +39,11 @@ export const TrajectoryMetadataSchema = z.strictObject({
   attempt: z.number().int().nonnegative().max(20).optional(),
   changedFileCount: z.number().int().nonnegative().max(2_000).optional(),
   status: z.enum(["completed", "failed"]).optional(),
+  requestId: IdentifierSchema.optional(),
+  decisionKind: z.enum(["clarification", "approval"]).optional(),
+  question: z.string().trim().min(1).max(1_000).optional(),
+  optionLabels: z.array(z.string().trim().min(1).max(80)).min(2).max(3).optional(),
+  resolution: z.string().trim().min(1).max(128).optional(),
 });
 export type TrajectoryMetadata = z.infer<typeof TrajectoryMetadataSchema>;
 

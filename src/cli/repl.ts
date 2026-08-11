@@ -2,7 +2,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 
 export interface TerminalIO {
-  readLine(prompt: string): Promise<string | null>;
+  readLine(prompt: string, options?: { signal?: AbortSignal }): Promise<string | null>;
   onInterrupt(listener: () => void): () => void;
   close(): void;
 }
@@ -22,12 +22,17 @@ export class ReadlineTerminalIO implements TerminalIO {
     });
   }
 
-  async readLine(prompt: string): Promise<string | null> {
+  async readLine(prompt: string, options: { signal?: AbortSignal } = {}): Promise<string | null> {
     if (this.#closed) return null;
     try {
-      return await this.#readline.question(prompt);
+      return await this.#readline.question(prompt, options);
     } catch (error) {
-      if (this.#closed || (error as NodeJS.ErrnoException).code === "ERR_USE_AFTER_CLOSE") {
+      if (
+        this.#closed ||
+        (error instanceof DOMException && error.name === "AbortError") ||
+        (error as NodeJS.ErrnoException).code === "ABORT_ERR" ||
+        (error as NodeJS.ErrnoException).code === "ERR_USE_AFTER_CLOSE"
+      ) {
         return null;
       }
       throw error;
