@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import { InfrastructureError, runCommand } from "../process/index.js";
+import {
+  ensurePrivateMetadataDirectory,
+  readPrivateMetadataFile,
+  writePrivateMetadataFileAtomic,
+} from "../persistence/metadata-root.js";
 import { AGENCY_LOCAL_EXCLUDE_RULE, AGENCY_WORKTREE_EXCLUDE_RULE, ensureLocalExcludeRules } from "./local-exclude.js";
 import { findGitRoot } from "./repository-inspector.js";
 import { withRepositoryLock } from "./repository-lock.js";
@@ -41,16 +47,19 @@ function metadataPath(sourceRoot: string): string {
 }
 
 async function ensureMetadataDirectory(sourceRoot: string): Promise<void> {
-  const directory = join(sourceRoot, ".devagency");
-  await mkdir(directory, { recursive: true });
-  const stats = await lstat(directory);
-  if (!stats.isDirectory() || stats.isSymbolicLink()) throw new InfrastructureError("GIT_WORKTREE_NOT_OWNED", "Agency metadata directory must be a real contained directory");
+  try {
+    await ensurePrivateMetadataDirectory(sourceRoot);
+  } catch (cause) {
+    throw new InfrastructureError("GIT_WORKTREE_NOT_OWNED", "Agency metadata directory must be a private real contained directory", { cause });
+  }
 }
 
 async function load(sourceRoot: string): Promise<WorktreeMetadata> {
   await ensureMetadataDirectory(sourceRoot);
   try {
-    const parsed = JSON.parse(await readFile(metadataPath(sourceRoot), "utf8")) as WorktreeMetadata;
+    const contents = await readPrivateMetadataFile(sourceRoot, metadataPath(sourceRoot), 1024 * 1024);
+    if (contents === null) return { version: 1, worktrees: [] };
+    const parsed = JSON.parse(contents) as WorktreeMetadata;
     if (parsed.version !== 1 || !Array.isArray(parsed.worktrees)) throw new Error("invalid shape");
     return parsed;
   } catch (cause) {
@@ -62,10 +71,18 @@ async function load(sourceRoot: string): Promise<WorktreeMetadata> {
 async function save(sourceRoot: string, metadata: WorktreeMetadata): Promise<void> {
   await ensureMetadataDirectory(sourceRoot);
   const path = metadataPath(sourceRoot);
-  await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await rename(temporary, path);
+  await writePrivateMetadataFileAtomic(sourceRoot, path, `${JSON.stringify(metadata, null, 2)}\n`);
+}
+
+async function readOwnershipMarker(path: string): Promise<string> {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1 || info.size > 256) return "";
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function createAgencyWorktree(
@@ -132,7 +149,7 @@ export async function discardAgencyWorktree(
   if (resolve(context.markerPath) !== join(adminDir, "agency-owner")) {
     throw new InfrastructureError("GIT_WORKTREE_NOT_OWNED", "Worktree marker is not in its Git admin directory");
   }
-  const marker = await readFile(context.markerPath, "utf8").catch(() => "");
+  const marker = await readOwnershipMarker(context.markerPath).catch(() => "");
   if (owned.markerPath !== context.markerPath || owned.ownerToken !== context.ownerToken || marker.trim() !== context.ownerToken) {
     throw new InfrastructureError("GIT_WORKTREE_NOT_OWNED", "Worktree private ownership marker does not match source metadata");
   }
@@ -154,7 +171,7 @@ export async function discardAgencyWorktree(
     throw new InfrastructureError("GIT_WORKTREE_DIRTY", "Worktree is dirty; destructive confirmation must explicitly cover its contents");
   }
   const finalAdmin = await lstat(adminDir);
-  const finalMarker = await readFile(context.markerPath, "utf8").catch(() => "");
+  const finalMarker = await readOwnershipMarker(context.markerPath).catch(() => "");
   const finalRegistrations = (await git(context.sourceRoot, ["worktree", "list", "--porcelain"])) ?? "";
   const finalRegistered = finalRegistrations.split(/\n\n/u).some((block) => block.split("\n").includes(`worktree ${context.path}`) && block.split("\n").includes(`branch refs/heads/${context.branch}`));
   if (finalAdmin.dev !== context.adminDevice || finalAdmin.ino !== context.adminInode || finalAdmin.isSymbolicLink() || finalMarker.trim() !== context.ownerToken || !finalRegistered) {

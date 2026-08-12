@@ -1,10 +1,10 @@
-import { mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
 
 import { InfrastructureError } from "../process/infrastructure-error.js";
+import { ensurePrivateMetadataDirectory, validatePrivateMetadataFile } from "./metadata-root.js";
 
 export interface SqliteCheckpointPersistence {
   readonly path: string;
@@ -19,8 +19,10 @@ export async function createSqliteCheckpointPersistence(
   const path = join(projectRoot, ".devagency", "state.db");
   let saver: SqliteSaver;
   try {
-    await mkdir(dirname(path), { recursive: true });
+    await ensurePrivateMetadataDirectory(projectRoot);
+    await validatePrivateMetadataFile(projectRoot, path);
     saver = SqliteSaver.fromConnString(path);
+    await validatePrivateMetadataFile(projectRoot, path);
   } catch (cause) {
     throw new InfrastructureError(
       "CHECKPOINT_INITIALIZATION_FAILED",

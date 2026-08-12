@@ -48,6 +48,33 @@ import {
 
 const MAX_USER_INTENT_CHARS = 8_000;
 
+async function closeResources(
+  actions: readonly (() => void | Promise<void>)[],
+  primaryError?: unknown,
+): Promise<void> {
+  const cleanupErrors: unknown[] = [];
+  for (const action of actions) {
+    try {
+      await action();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (primaryError !== undefined) {
+    if (cleanupErrors.length === 0) throw primaryError;
+    const message = primaryError instanceof Error
+      ? primaryError.message
+      : "Application initialization failed";
+    throw new AggregateError([primaryError, ...cleanupErrors], message, {
+      cause: primaryError,
+    });
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "Multiple application resources failed to close");
+  }
+}
+
 export interface SessionStoreBoundary {
   loadOrCreate(): Promise<SessionContext>;
   createNew(): Promise<SessionContext>;
@@ -257,10 +284,12 @@ export class AgencyApplication implements ReplHandler {
         evaluationStore,
       });
     } catch (error) {
-      await runtime?.dispose();
-      checkpoint?.close();
-      renderer.dispose();
-      throw error;
+      await closeResources([
+        async () => await runtime?.dispose(),
+        () => checkpoint?.close(),
+        () => renderer.dispose(),
+      ], error);
+      throw error; // unreachable; keeps control-flow narrowing explicit
     }
   }
 
@@ -355,11 +384,13 @@ export class AgencyApplication implements ReplHandler {
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
-    this.#io.close();
-    this.#detachMutationTracking();
-    await this.#runtime.dispose();
-    this.#checkpoint.close();
-    this.#renderer.dispose();
+    await closeResources([
+      () => this.#io.close(),
+      () => this.#detachMutationTracking(),
+      async () => await this.#runtime.dispose(),
+      () => this.#checkpoint.close(),
+      () => this.#renderer.dispose(),
+    ]);
   }
 
   async #offerRecovery(): Promise<void> {
@@ -370,7 +401,7 @@ export class AgencyApplication implements ReplHandler {
         this.#io.close();
       } else {
         activeController.abort();
-        void this.#runtime.abort();
+        void this.#runtime.abort().catch(() => undefined);
       }
     });
     try {
@@ -536,6 +567,7 @@ export class AgencyApplication implements ReplHandler {
     this.#renderer.message(request.question);
     if (request.context !== undefined) this.#renderer.message(`Context: ${request.context}`);
     if (request.risk !== undefined) this.#renderer.message(`Risk: ${request.risk}`);
+    if (request.kind === "approval") this.#renderer.message(`Exact action: ${request.action}`);
     request.options.forEach((option, index) => {
       const shortcut = request.kind === "approval"
         ? ({ approve: "a", reject: "r", edit: "e" } as Record<string, string>)[option.id]

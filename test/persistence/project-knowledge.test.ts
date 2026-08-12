@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -135,6 +135,17 @@ describe("ProjectKnowledgeStore", () => {
     });
   });
 
+  it("serializes concurrent appends across store instances", async () => {
+    const project = await root();
+    const first = new ProjectKnowledgeStore(project);
+    const second = new ProjectKnowledgeStore(project);
+    await Promise.all([
+      first.append([{ category: "decision", text: "Use SQLite." }]),
+      second.append([{ category: "learning", text: "Keep verification independent." }]),
+    ]);
+    expect((await first.load()).entries).toHaveLength(2);
+  });
+
   it("does not replace unchanged files or write a duplicate-only no-op", async () => {
     const project = await root();
     const replacements: string[] = [];
@@ -187,5 +198,33 @@ describe("ProjectKnowledgeStore", () => {
     await mkdir(join(third, ".devagency/knowledge"), { recursive: true });
     await symlink(externalFile, join(third, ".devagency/knowledge/architecture.md"));
     await expect(new ProjectKnowledgeStore(third).load()).rejects.toMatchObject({ code: "METADATA_INVALID" });
+  });
+
+  it("rejects an in-repository symlinked knowledge directory without overwriting source", async () => {
+    const project = await root();
+    await mkdir(join(project, "src"));
+    const source = join(project, "src", "architecture.md");
+    await writeFile(source, "source must remain unchanged\n");
+    await mkdir(join(project, ".devagency"));
+    await symlink(join(project, "src"), join(project, ".devagency", "knowledge"));
+
+    await expect(new ProjectKnowledgeStore(project).append([
+      { category: "architecture", text: "Must not escape." },
+    ])).rejects.toMatchObject({ code: "METADATA_INVALID" });
+    await expect(readFile(source, "utf8")).resolves.toBe("source must remain unchanged\n");
+  });
+
+  it("creates private single-link knowledge directories and files", async () => {
+    const project = await root();
+    const store = new ProjectKnowledgeStore(project);
+    await store.append([{ category: "learning", text: "Private metadata." }]);
+
+    expect((await lstat(join(project, ".devagency"))).mode & 0o777).toBe(0o700);
+    expect((await lstat(store.directory)).mode & 0o777).toBe(0o700);
+    for (const name of ["architecture.md", "decisions.md", "learnings.md"]) {
+      const info = await lstat(join(store.directory, name));
+      expect(info.mode & 0o777).toBe(0o600);
+      expect(info.nlink).toBe(1);
+    }
   });
 });

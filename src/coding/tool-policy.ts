@@ -17,6 +17,8 @@ import { dirname, isAbsolute, matchesGlob, relative, resolve, sep } from "node:p
 import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 
+import { runCommand } from "../process/index.js";
+
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -39,6 +41,9 @@ export const ROLE_TOOL_POLICY = Object.freeze({
 } as const);
 
 const PRIVATE_PATHS = new Set([".git", ".devagency", ".agency-worktrees"]);
+const IGNORED_SEARCH_DIRECTORIES = new Set([
+  "node_modules", "dist", "build", "coverage", ".next", "vendor", "target",
+]);
 const SAFE_GIT_COMMANDS = new Set(["diff", "log", "ls-files", "rev-parse", "show", "status"]);
 const GIT_OPTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
   status: new Set(["--short", "--porcelain", "--branch", "--untracked-files=no", "--untracked-files=normal", "--untracked-files=all"]),
@@ -49,7 +54,15 @@ const GIT_OPTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
   "rev-parse": new Set(["--show-toplevel", "--show-prefix", "--is-inside-work-tree", "--verify", "--abbrev-ref"]),
 };
 const MAX_SAFE_REPLACEMENT_BYTES = 64 * 1024;
+const MAX_DIRECT_READ_BYTES = 1024 * 1024;
+const MAX_INTERNAL_READ_BYTES = 16 * 1024 * 1024;
+const MAX_SEARCH_DEPTH = 32;
+const MAX_SEARCH_FILES = 20_000;
+const MAX_SEARCH_ENTRIES = 40_000;
+const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
+const MAX_SEARCH_TOTAL_BYTES = 32 * 1024 * 1024;
 const activeMutationSignal = new AsyncLocalStorage<AbortSignal | undefined>();
+const activeToolSignal = new AsyncLocalStorage<AbortSignal | undefined>();
 
 export const POLICY_DISPLAY = [
   "Agency tool policy (application-enforced; not an OS sandbox)",
@@ -116,6 +129,9 @@ function assertPathClass(path: string, mutation: boolean): string {
   if (privateSegment) {
     throw policyError(mutation ? "repository control paths cannot be changed" : "private Agency and Git data cannot be read");
   }
+  if (!mutation && isCredentialPath(normalized)) {
+    throw policyError("credential-like paths cannot be read");
+  }
   return normalized;
 }
 
@@ -123,6 +139,9 @@ function assertCanonicalNotPrivate(root: string, canonical: string, mutation: bo
   const rel = relative(root, canonical);
   if (rel.split(sep).some((segment) => PRIVATE_PATHS.has(segment.toLowerCase()))) {
     throw policyError(mutation ? "repository control paths cannot be changed" : "private Agency and Git data cannot be read through an alias");
+  }
+  if (!mutation && isCredentialPath(rel.split(sep).join("/"))) {
+    throw policyError("credential-like paths cannot be read through an alias");
   }
 }
 
@@ -135,9 +154,10 @@ async function safeExistingPath(
   input: string,
   role: ToolRole,
   expected: "file" | "directory" | "either",
+  knownCanonicalRoot?: string,
 ): Promise<string> {
   const normalized = assertPathClass(input, false);
-  const canonicalRoot = await repositoryRoot(root);
+  const canonicalRoot = knownCanonicalRoot ?? await repositoryRoot(root);
   const lexical = resolve(canonicalRoot, normalized);
   if (!isWithin(canonicalRoot, lexical)) throw policyError("path escapes repository");
   let canonical: string;
@@ -188,14 +208,28 @@ async function safeMutationPath(root: string, input: string): Promise<string> {
   return lexical;
 }
 
-async function safeReadFile(root: string, input: string, role: ToolRole): Promise<Buffer> {
-  const path = await safeExistingPath(root, input, role, "file");
+async function safeReadFile(
+  root: string,
+  input: string,
+  role: ToolRole,
+  options: { signal?: AbortSignal; maxBytes?: number; canonicalRoot?: string } = {},
+): Promise<Buffer> {
+  const signal = options.signal ?? activeToolSignal.getStore();
+  const maxBytes = options.maxBytes ?? MAX_INTERNAL_READ_BYTES;
+  assertNotAborted(signal, "File read aborted");
+  const path = await safeExistingPath(root, input, role, "file", options.canonicalRoot);
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const info = await handle.stat();
     if (!info.isFile()) throw policyError("read target must be a regular file");
     if (info.nlink !== 1) throw policyError("hard-linked files are not allowed");
-    return await handle.readFile();
+    if (info.size > maxBytes) {
+      throw policyError(`read target exceeds ${maxBytes} byte limit`);
+    }
+    assertNotAborted(signal, "File read aborted");
+    const contents = await handle.readFile();
+    assertNotAborted(signal, "File read aborted");
+    return contents;
   } finally {
     await handle.close();
   }
@@ -274,27 +308,53 @@ function assertSearchDoesNotTargetPrivate(params: unknown, includePattern: boole
   }
 }
 
-async function safeSearchFiles(root: string, input: string, role: ToolRole): Promise<{ searchRoot: string; files: string[] }> {
-  const searchRoot = await safeExistingPath(root, input, role, "either");
+interface SearchFile { path: string; size: number }
+
+async function safeSearchFiles(
+  root: string,
+  input: string,
+  role: ToolRole,
+  signal?: AbortSignal,
+): Promise<{ canonicalRoot: string; searchRoot: string; files: SearchFile[] }> {
+  assertNotAborted(signal, "Search aborted");
+  const canonicalRoot = await repositoryRoot(root);
+  const searchRoot = await safeExistingPath(root, input, role, "either", canonicalRoot);
   const rootInfo = await lstat(searchRoot);
-  if (rootInfo.isFile()) return { searchRoot: dirname(searchRoot), files: [searchRoot] };
-  const files: string[] = [];
-  const walk = async (directory: string): Promise<void> => {
-    const entries = (await readdir(directory, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      if (PRIVATE_PATHS.has(entry.name.toLowerCase())) continue;
-      const path = resolve(directory, entry.name);
-      const info = await lstat(path);
-      if (info.isSymbolicLink()) continue;
-      if (info.isDirectory()) await walk(path);
-      else if (info.isFile()) {
-        if (info.nlink !== 1) throw policyError("search trees cannot contain hard-linked files");
-        files.push(path);
-      } else throw policyError("search trees cannot contain special files");
-    }
-  };
-  await walk(searchRoot);
-  return { searchRoot, files };
+  if (rootInfo.isFile()) return { canonicalRoot, searchRoot: dirname(searchRoot), files: [{ path: searchRoot, size: rootInfo.size }] };
+  const relativeSearchRoot = relative(canonicalRoot, searchRoot).split(sep).join("/");
+  const listed = await runCommand({
+    command: "git",
+    args: ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", relativeSearchRoot === "" ? "." : relativeSearchRoot],
+    cwd: canonicalRoot,
+    timeoutMs: 10_000,
+    maxOutputBytes: 8 * 1024 * 1024,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  if (listed.exitCode !== 0) throw policyError("could not enumerate Git-visible search files");
+  const files: SearchFile[] = [];
+  const candidates = listed.stdout.split("\0").filter(Boolean).sort();
+  if (candidates.length > MAX_SEARCH_ENTRIES) throw policyError(`search entry limit is ${MAX_SEARCH_ENTRIES}`);
+  for (const candidate of candidates) {
+    assertNotAborted(signal, "Search aborted");
+    const normalized = candidate.split("/");
+    if (normalized.length > MAX_SEARCH_DEPTH) throw policyError(`search depth limit is ${MAX_SEARCH_DEPTH}`);
+    if (normalized.some((segment) =>
+      PRIVATE_PATHS.has(segment.toLowerCase()) || IGNORED_SEARCH_DIRECTORIES.has(segment.toLowerCase())) ||
+      isCredentialPath(candidate)) continue;
+    const lexicalPath = resolve(canonicalRoot, candidate);
+    const lexicalInfo = await lstat(lexicalPath);
+    // Search never follows aliases. Direct reads report a policy error, while
+    // repository-wide discovery omits links so a single unrelated alias cannot
+    // make every safe search unusable.
+    if (lexicalInfo.isSymbolicLink()) continue;
+    if (!lexicalInfo.isFile()) throw policyError("search trees can contain only regular files");
+    const path = await safeExistingPath(root, candidate, role, "file", canonicalRoot);
+    if (!path.startsWith(`${searchRoot}${sep}`)) continue;
+    const info = await lstat(path);
+    if (files.length >= MAX_SEARCH_FILES) throw policyError(`search file limit is ${MAX_SEARCH_FILES}`);
+    files.push({ path, size: info.size });
+  }
+  return { canonicalRoot, searchRoot, files };
 }
 
 function finiteInteger(value: unknown, fallback: number, label: string, minimum: number, maximum: number): number {
@@ -306,8 +366,23 @@ function finiteInteger(value: unknown, fallback: number, label: string, minimum:
 }
 
 function safeGrepTool(delegate: ToolDefinition, root: string, role: ToolRole): ToolDefinition {
+  const parameters = delegate.parameters as unknown as {
+    required?: string[];
+    properties?: Record<string, unknown>;
+  };
   return {
     ...delegate,
+    description: "Search file contents for a literal string. Set literal to true. Regular expressions are not supported.",
+    promptSnippet: "Search file contents for literal strings (literal must be true)",
+    parameters: {
+      ...parameters,
+      required: [...new Set([...(parameters.required ?? []), "literal"])],
+      properties: {
+        ...(parameters.properties ?? {}),
+        pattern: { type: "string", description: "Literal string to search for" },
+        literal: { type: "boolean", const: true, description: "Must be true; regex search is disabled" },
+      },
+    } as never,
     async execute(_toolCallId, params, signal) {
       assertNotAborted(signal, "Grep aborted");
       if (typeof params !== "object" || params === null) throw policyError("invalid grep parameters");
@@ -316,26 +391,35 @@ function safeGrepTool(delegate: ToolDefinition, root: string, role: ToolRole): T
         (raw.ignoreCase !== undefined && typeof raw.ignoreCase !== "boolean") || (raw.literal !== undefined && typeof raw.literal !== "boolean")) {
         throw policyError("invalid grep parameters");
       }
+      if (raw.literal !== true) throw policyError("grep requires literal: true; regular expressions are not supported");
       assertSearchDoesNotTargetPrivate(params, false);
       const context = finiteInteger(raw.context, 0, "grep context", 0, 100);
       const limit = finiteInteger(raw.limit, 100, "grep limit", 1, 10_000);
-      const { searchRoot, files } = await safeSearchFiles(root, parameterPath(params), role);
-      let expression: RegExp | undefined;
-      try {
-        expression = raw.literal === true ? undefined : new RegExp(raw.pattern, raw.ignoreCase === true ? "iu" : "u");
-      } catch {
-        throw policyError("invalid grep regular expression");
-      }
+      const { canonicalRoot, searchRoot, files } = await safeSearchFiles(root, parameterPath(params), role, signal);
       const literalPattern = raw.ignoreCase === true ? raw.pattern.toLowerCase() : raw.pattern;
       const output: string[] = [];
       let matches = 0;
+      let searchedBytes = 0;
+      let searchByteLimitReached = false;
       for (const file of files) {
-        const rel = relative(searchRoot, file).split(sep).join("/") || file.slice(file.lastIndexOf(sep) + 1);
+        assertNotAborted(signal, "Grep aborted");
+        const rel = relative(searchRoot, file.path).split(sep).join("/") || file.path.slice(file.path.lastIndexOf(sep) + 1);
         if (typeof raw.glob === "string" && !matchesGlob(rel, raw.glob)) continue;
-        const lines = (await safeReadFile(root, relative(await repositoryRoot(root), file), role)).toString("utf8").replace(/\r\n?/gu, "\n").split("\n");
+        if (file.size > MAX_SEARCH_FILE_BYTES) continue;
+        if (searchedBytes + file.size > MAX_SEARCH_TOTAL_BYTES) {
+          searchByteLimitReached = true;
+          break;
+        }
+        searchedBytes += file.size;
+        const lines = (await safeReadFile(root, relative(canonicalRoot, file.path), role, {
+          ...(signal === undefined ? {} : { signal }),
+          maxBytes: MAX_SEARCH_FILE_BYTES,
+          canonicalRoot,
+        })).toString("utf8").replace(/\r\n?/gu, "\n").split("\n");
         for (let index = 0; index < lines.length; index += 1) {
+          assertNotAborted(signal, "Grep aborted");
           const candidate = raw.ignoreCase === true ? lines[index]!.toLowerCase() : lines[index]!;
-          if (expression !== undefined ? !expression.test(lines[index]!) : !candidate.includes(literalPattern)) continue;
+          if (!candidate.includes(literalPattern)) continue;
           matches += 1;
           const start = Math.max(0, index - context);
           const end = Math.min(lines.length - 1, index + context);
@@ -344,9 +428,13 @@ function safeGrepTool(delegate: ToolDefinition, root: string, role: ToolRole): T
         }
         if (matches >= limit) break;
       }
+      const details = {
+        ...(matches >= limit ? { matchLimitReached: limit } : {}),
+        ...(searchByteLimitReached ? { searchByteLimitReached: MAX_SEARCH_TOTAL_BYTES } : {}),
+      };
       return {
         content: [{ type: "text", text: output.length === 0 ? "No matches found" : output.join("\n").slice(0, 256 * 1024) }],
-        details: matches >= limit ? { matchLimitReached: limit } : undefined,
+        details: Object.keys(details).length === 0 ? undefined : details,
       };
     },
   };
@@ -362,8 +450,8 @@ function safeFindTool(delegate: ToolDefinition, root: string, role: ToolRole): T
       if (typeof raw.pattern !== "string") throw policyError("find requires a glob pattern");
       assertSearchDoesNotTargetPrivate(params, true);
       const limit = finiteInteger(raw.limit, 1_000, "find limit", 1, 100_000);
-      const { searchRoot, files } = await safeSearchFiles(root, parameterPath(params), role);
-      const results = files.map((file) => relative(searchRoot, file).split(sep).join("/"))
+      const { searchRoot, files } = await safeSearchFiles(root, parameterPath(params), role, signal);
+      const results = files.map((file) => relative(searchRoot, file.path).split(sep).join("/"))
         .filter((path) => matchesGlob(path, raw.pattern as string)).slice(0, limit);
       return {
         content: [{ type: "text", text: results.length === 0 ? "No files found matching pattern" : results.join("\n").slice(0, 256 * 1024) }],
@@ -380,7 +468,8 @@ function wrap(delegate: ToolDefinition, validate: (params: unknown, signal?: Abo
       assertNotAborted(signal, "Tool call aborted");
       await validate(params, signal);
       assertNotAborted(signal, "Tool call aborted");
-      return activeMutationSignal.run(signal, () => delegate.execute(toolCallId, params, signal, onUpdate, context));
+      return activeToolSignal.run(signal, () =>
+        activeMutationSignal.run(signal, () => delegate.execute(toolCallId, params, signal, onUpdate, context)));
     },
   };
 }
@@ -447,7 +536,7 @@ function digest(value: unknown): string {
 }
 
 export function bashApprovalAction(argv: readonly string[]): string {
-  return `bash:${argv[0] ?? "command"} sha256:${digest(argv)}`;
+  return `bash:${argv[0] ?? "command"} argv:${argv.map(shellQuote).join(" ")} sha256:${digest(argv)}`;
 }
 
 function shellQuote(word: string): string {
@@ -460,8 +549,14 @@ function assertSafeGit(words: readonly string[]): string[] {
   if (subcommand === undefined || !SAFE_GIT_COMMANDS.has(subcommand)) throw policyError("only enumerated read-only Git subcommands are allowed");
   const allowedOptions = GIT_OPTIONS[subcommand] ?? new Set<string>();
   let afterSeparator = false;
+  const contentCommand = ["diff", "log", "show"].includes(subcommand);
+  const pathArguments: string[] = [];
   for (const argument of words.slice(2)) {
-    if (argument === "--") { afterSeparator = true; continue; }
+    if (argument === "--") {
+      if (afterSeparator) throw policyError("Git accepts exactly one path separator");
+      afterSeparator = true;
+      continue;
+    }
     if (!afterSeparator && argument.startsWith("-")) {
       if (!allowedOptions.has(argument)) throw policyError(`Git option is not allowed for ${subcommand}`);
       continue;
@@ -474,6 +569,13 @@ function assertSafeGit(words: readonly string[]): string[] {
     }
     const pathCandidate = argument.includes(":") ? argument.slice(argument.lastIndexOf(":") + 1) : argument;
     if (isCredentialPath(pathCandidate)) throw policyError("Git cannot inspect credential-like paths");
+    if (afterSeparator) pathArguments.push(argument);
+  }
+  if (contentCommand && (!afterSeparator || pathArguments.length === 0)) {
+    throw policyError(`${subcommand} requires -- followed by one or more exact repository file paths`);
+  }
+  if (contentCommand && pathArguments.some((path) => path === "." || path.endsWith("/") || /[*?[\]{}]/u.test(path))) {
+    throw policyError("Git content paths must be exact file literals, not directories or wildcards");
   }
   const hardened = [...words];
   if (["diff", "log", "show"].includes(subcommand)) {
@@ -518,6 +620,58 @@ function prepareAllowedBash(
   throw policyError("executable and argv are not on Agency's exact allowlist");
 }
 
+async function assertSafeRmTargets(root: string, command: string): Promise<void> {
+  const words = shellWords(command);
+  if (words[0] !== "rm") return;
+  const canonicalRoot = await repositoryRoot(root);
+  for (const input of words.slice(1).filter((argument) => !argument.startsWith("-"))) {
+    const normalized = assertPathClass(input, true);
+    const target = resolve(canonicalRoot, normalized);
+    if (!isWithin(canonicalRoot, target) || target === canonicalRoot) {
+      throw policyError("rm target must stay inside repository");
+    }
+    let cursor = canonicalRoot;
+    const segments = relative(canonicalRoot, target).split(sep);
+    for (const [index, segment] of segments.entries()) {
+      cursor = resolve(cursor, segment);
+      let info;
+      try {
+        info = await lstat(cursor);
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw cause;
+      }
+      if (info.isSymbolicLink()) throw policyError("rm cannot traverse or delete symlinks");
+      if (index < segments.length - 1 && !info.isDirectory()) {
+        throw policyError("rm parent must be a real directory");
+      }
+      if (index === segments.length - 1 && info.isFile() && info.nlink !== 1) {
+        throw policyError("rm cannot delete hard-linked files");
+      }
+    }
+    try {
+      const canonical = await realpath(target);
+      if (!isWithin(canonicalRoot, canonical)) throw policyError("rm target resolves outside repository");
+      assertCanonicalNotPrivate(canonicalRoot, canonical, true);
+    } catch (cause) {
+      if (cause instanceof Error && cause.message.startsWith("Agency policy")) throw cause;
+      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+    }
+  }
+}
+
+async function assertSafeGitTargets(root: string, command: string): Promise<void> {
+  const words = shellWords(command);
+  if (words[0] !== "git") return;
+  const subcommand = words[1]?.toLowerCase();
+  if (subcommand === undefined || !["diff", "log", "show"].includes(subcommand)) return;
+  assertSafeGit(words);
+  const separator = words.indexOf("--");
+  for (const path of words.slice(separator + 1)) {
+    await safeExistingPath(root, path, "executor", "file");
+  }
+}
+
 export function assertAllowedBash(
   command: string,
   consumeApproval: (action: string) => boolean,
@@ -537,7 +691,17 @@ function isSensitivePath(path: string): boolean {
 
 function isCredentialPath(path: string): boolean {
   const normalized = path.toLowerCase();
-  return /(?:^|\/)(?:\.env(?:\..*)?|credentials?|secrets?|.*\.(?:pem|key|p12))$/u.test(normalized);
+  const name = normalized.split("/").at(-1) ?? "";
+  const segments = normalized.split("/");
+  return /^\.env(?:\..*)?$/u.test(name) || name === ".envrc" ||
+    (segments.includes(".docker") && name === "config.json") ||
+    /^(?:\.npmrc|\.yarnrc\.yml|\.pypirc|\.netrc|\.git-credentials|auth\.json|kubeconfig)$/u.test(name) ||
+    /^(?:application_default_credentials|client_secret_.+|token|serviceaccountkey)\.json$/u.test(name) ||
+    /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)$/u.test(name) ||
+    /(?:^|[._-])service[._-]?account(?:[._-].*)?\.json$/u.test(name) ||
+    /\.tfvars(?:\.json)?$/u.test(name) ||
+    /^(?:credentials?|secrets?)(?:\..*)?$/u.test(name) ||
+    /\.(?:pem|key|p12|pfx)$/u.test(name);
 }
 
 async function mutationNeedsApproval(root: string, params: unknown, tool: "edit" | "write"): Promise<string | undefined> {
@@ -581,7 +745,7 @@ export function createRoleFileTools(options: {
   const consumeApproval = options.consumeApproval ?? (() => false);
   const readTool = wrap(factories.createReadTool(root, {
     operations: {
-      readFile: (path) => safeReadFile(root, relative(root, path), role),
+      readFile: (path) => safeReadFile(root, relative(root, path), role, { maxBytes: MAX_DIRECT_READ_BYTES }),
       access: async (path) => { await safeExistingPath(root, relative(root, path), role, "file"); },
     },
   }), async (params) => { await safeExistingPath(root, parameterPath(params), role, "file"); });
@@ -592,13 +756,16 @@ export function createRoleFileTools(options: {
       exists: async (path) => { try { await safeExistingPath(root, relative(root, path), role, "either"); return true; } catch { return false; } },
       stat: async (path): Promise<Stats> => stat(await safeAbsolute(root, path, role)),
       readdir: async (path) => readdir(await safeAbsolute(root, path, role), { withFileTypes: true }).then((items: Dirent[]) =>
-        items.map(({ name }) => name).filter((name) => !PRIVATE_PATHS.has(name.toLowerCase()))),
+        items.map(({ name }) => name).filter((name) => !PRIVATE_PATHS.has(name.toLowerCase()) && !isCredentialPath(name))),
     },
   }), async (params) => { await safeExistingPath(root, parameterPath(params), role, "directory"); });
   if (role === "planner") return [readTool, grepTool, findTool, lsTool];
 
   const approveMutation = async (params: unknown, tool: "edit" | "write", signal?: AbortSignal) => {
     const mutationPath = parameterPath(params);
+    if (isCredentialPath(mutationPath)) {
+      throw policyError("credential-like paths cannot be changed by model tools");
+    }
     await safeMutationPath(root, mutationPath);
     const approval = await mutationNeedsApproval(root, params, tool);
     if (signal?.aborted === true) throw new DOMException("File mutation aborted", "AbortError");
@@ -688,6 +855,8 @@ export function createProtectedBashTool(options: {
       if (timeout !== undefined && (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0 || timeout > 2_147_483.647)) {
         throw policyError("bash timeout must be a finite positive number no greater than 2147483.647 seconds");
       }
+      await assertSafeGitTargets(options.root, (params as { command: string }).command);
+      await assertSafeRmTargets(options.root, (params as { command: string }).command);
       const command = prepareAllowedBash(
         (params as { command: string }).command,
         options.consumeApproval ?? (() => false),

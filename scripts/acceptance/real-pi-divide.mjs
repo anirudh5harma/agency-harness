@@ -128,6 +128,7 @@ export function boundedAgencyDiagnostic(message, result) {
 export function validateAgencyTranscript(result) {
   const failures = [];
   const stdout = normalizedAgencyOutput(result.stdout);
+  const stderr = normalizedAgencyOutput(result.stderr);
   const lines = stdout.split("\n");
   const runVerification = [];
   let verificationPassed = false;
@@ -139,7 +140,15 @@ export function validateAgencyTranscript(result) {
     }
   }
   const doneCount = runVerification.length;
-  if (result.stderr.trim() !== "") failures.push("stderr was not empty");
+  // Pi may run a focused command that fails, then self-correct and pass Agency's
+  // independent verification. Only terminal stderr failures invalidate the run.
+  const completedSuccessfully = doneCount === 2 && /^Status:\s+completed\b/mu.test(stdout) &&
+    runVerification.every(Boolean);
+  const terminalErrors = stderr.split("\n").filter((line) => {
+    const message = line.trim();
+    return message !== "" && !(message === "Error: bash failed" && completedSuccessfully);
+  });
+  if (terminalErrors.length > 0) failures.push("stderr contained a terminal error");
   if (doneCount !== 2) failures.push(`expected exactly two completed runs, observed ${doneCount}`);
   if (/^Status:\s+failed\b/gmu.test(stdout)) failures.push("/status reported failed");
   if (!/^Status:\s+completed\b/mu.test(stdout)) failures.push("completed /status missing");

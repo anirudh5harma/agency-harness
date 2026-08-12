@@ -1,4 +1,4 @@
-import { mkdtemp, stat, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, stat, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -301,5 +301,20 @@ describe("SQLite checkpoint persistence", () => {
     await expect(persistence.deleteThread("thread-1")).rejects.toMatchObject({
       code: "CHECKPOINT_DELETE_FAILED",
     });
+  });
+
+  it("rejects a symlinked metadata root and creates a private database", async () => {
+    const linkedRoot = await temporaryProject();
+    const outside = await temporaryProject();
+    await symlink(outside, join(linkedRoot, ".devagency"));
+    await expect(createSqliteCheckpointPersistence(linkedRoot)).rejects.toMatchObject({
+      code: "CHECKPOINT_INITIALIZATION_FAILED",
+    });
+
+    const projectRoot = await temporaryProject();
+    const persistence = await createSqliteCheckpointPersistence(projectRoot);
+    expect((await stat(join(projectRoot, ".devagency"))).mode & 0o777).toBe(0o700);
+    expect((await stat(persistence.path)).mode & 0o777).toBe(0o600);
+    persistence.close();
   });
 });

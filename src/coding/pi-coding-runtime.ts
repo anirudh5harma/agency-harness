@@ -30,16 +30,21 @@ import {
   type SessionContext,
 } from "../domain/index.js";
 import { detectNodeVerificationCommands, InfrastructureError, type VerificationCommand } from "../process/index.js";
-import type {
-  CodingEventSink,
-  CodingResult,
-  CodingRuntime,
-  CreatePlanInput,
-  CreatePlanResult,
-  ExecuteInput,
-  RepairInput,
-  RuntimeContinuation,
+import {
+  MAX_REPOSITORY_INSTRUCTIONS_CHARS,
+  type CodingEventSink,
+  type CodingResult,
+  type CodingRuntime,
+  type CreatePlanInput,
+  type CreatePlanResult,
+  type ExecuteInput,
+  type RepairInput,
+  type RuntimeContinuation,
 } from "./coding-runtime.js";
+/*
+ * Keep prompt construction on same repository-instruction contract as graph
+ * loading/checkpoint validation. User intent retains its separate prompt cap.
+ */
 import {
   ROLE_TOOL_POLICY,
   MissionMutationBudget,
@@ -51,13 +56,15 @@ import {
 
 const PLANNER_TOOLS = [...ROLE_TOOL_POLICY.planner];
 const EXECUTOR_TOOLS = [...ROLE_TOOL_POLICY.executor];
-const MAX_INSTRUCTIONS_CHARS = 6_000;
+const MAX_INSTRUCTIONS_CHARS = MAX_REPOSITORY_INSTRUCTIONS_CHARS;
 const MAX_CONTEXT_ITEMS = 6;
 const MAX_CONTEXT_ITEM_CHARS = 800;
 const MAX_FAILURE_CHARS = 1_500;
 const MAX_MESSAGE_CHARS = 2_000;
 const MAX_PROVIDER_ERROR_CHARS = 500;
 const PI_NO_API_KEY_ERROR = "No API key found for the selected model.";
+const DEFAULT_PROMPT_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_ABORT_TIMEOUT_MS = 5_000;
 
 export interface PiSession {
   readonly sessionId: string;
@@ -154,7 +161,7 @@ const defaultSdk: PiSdkBoundary = {
   createAgentSession,
 };
 function normalizedAction(command: string): string {
-  return command.replace(/\s+/gu, " ").trim();
+  return command.trim();
 }
 
 interface ActiveCall {
@@ -727,6 +734,8 @@ function infrastructure(
   code:
     | "PI_RUNTIME_INITIALIZATION_FAILED"
     | "PI_SESSION_CREATION_FAILED"
+    | "PI_SESSION_ABORT_FAILED"
+    | "PI_REQUEST_TIMED_OUT"
     | "PI_PROVIDER_REQUEST_FAILED"
     | "PI_PLAN_INVALID"
     | "PI_PLAN_MISSING",
@@ -765,6 +774,41 @@ function assertNotAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw abortError();
 }
 
+function positiveDeadline(value: number | undefined, fallback: number, name: string): number {
+  const deadline = value ?? fallback;
+  if (!Number.isFinite(deadline) || deadline <= 0) {
+    throw new RangeError(`${name} must be a positive finite number`);
+  }
+  return deadline;
+}
+
+async function withDeadline<T>(
+  operation: () => Promise<T>,
+  timeoutMs: number,
+  error: () => InfrastructureError,
+  signal?: AbortSignal,
+): Promise<T> {
+  assertNotAborted(signal);
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(error()), timeoutMs);
+  });
+  let rejectAbort: ((reason: DOMException) => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const onAbort = (): void => rejectAbort?.(abortError());
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const pending = Promise.resolve().then(async () => {
+      assertNotAborted(signal);
+      return await operation();
+    });
+    return await Promise.race([pending, deadline, aborted]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 export class PiCodingRuntime implements CodingRuntime {
   readonly #sdk: PiSdkBoundary;
   readonly #modelRuntime: ModelRuntime;
@@ -776,17 +820,37 @@ export class PiCodingRuntime implements CodingRuntime {
   readonly #knowledgeHandlers = new Map<string, (entry: ProjectKnowledgeEntry) => void>();
   readonly #approvedActions = new Map<string, string>();
   readonly #activeSessions = new Set<PiSession>();
+  readonly #promptTimeoutMs: number;
+  readonly #abortTimeoutMs: number;
   #disposed = false;
 
-  private constructor(sdk: PiSdkBoundary, modelRuntime: ModelRuntime) {
+  private constructor(
+    sdk: PiSdkBoundary,
+    modelRuntime: ModelRuntime,
+    options: { promptTimeoutMs?: number; abortTimeoutMs?: number },
+  ) {
     this.#sdk = sdk;
     this.#modelRuntime = modelRuntime;
+    this.#promptTimeoutMs = positiveDeadline(
+      options.promptTimeoutMs,
+      DEFAULT_PROMPT_TIMEOUT_MS,
+      "promptTimeoutMs",
+    );
+    this.#abortTimeoutMs = positiveDeadline(
+      options.abortTimeoutMs,
+      DEFAULT_ABORT_TIMEOUT_MS,
+      "abortTimeoutMs",
+    );
   }
 
-  static async create(options: { sdk?: PiSdkBoundary } = {}): Promise<PiCodingRuntime> {
+  static async create(options: {
+    sdk?: PiSdkBoundary;
+    promptTimeoutMs?: number;
+    abortTimeoutMs?: number;
+  } = {}): Promise<PiCodingRuntime> {
     const sdk = options.sdk ?? defaultSdk;
     try {
-      return new PiCodingRuntime(sdk, await sdk.createModelRuntime());
+      return new PiCodingRuntime(sdk, await sdk.createModelRuntime(), options);
     } catch (error) {
       throw infrastructure(
         "PI_RUNTIME_INITIALIZATION_FAILED",
@@ -858,8 +922,11 @@ export class PiCodingRuntime implements CodingRuntime {
       assertNotAborted(input.signal);
       emit(input.onEvent, { type: "phase", phase: "planning" });
       try {
-        await planner.prompt(plannerPrompt(input));
+        await this.#prompt(planner, plannerPrompt(input), "planning", input.signal);
       } catch (error) {
+        if (error instanceof InfrastructureError && error.code === "PI_REQUEST_TIMED_OUT") {
+          throw error;
+        }
         if (submittedPlan === undefined && submittedError === undefined && decisionRequest === undefined) {
           assertNotAborted(input.signal);
           const providerError = state.eventState.providerError ?? knownPublicPiError(error);
@@ -934,9 +1001,11 @@ export class PiCodingRuntime implements CodingRuntime {
     this.#planHandlers.clear();
     this.#approvedActions.clear();
     this.#mutationBudgets.clear();
-    await Promise.allSettled([...sessions].map((session) => session.abort()));
+    const aborts = await Promise.allSettled([...sessions].map((session) => this.#abortSession(session)));
     for (const session of persistentSessions) session.dispose();
     this.#activeSessions.clear();
+    const failure = aborts.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure !== undefined) throw failure.reason;
   }
 
   async dispose(): Promise<void> {
@@ -986,7 +1055,7 @@ export class PiCodingRuntime implements CodingRuntime {
     });
     try {
       assertNotAborted(input.signal);
-      await session.prompt(prompt);
+      await this.#prompt(session, prompt, "execution", input.signal);
       assertNotAborted(input.signal);
       if (decisionRequest !== undefined) {
         return {
@@ -1013,6 +1082,10 @@ export class PiCodingRuntime implements CodingRuntime {
         ...(proposedKnowledge.length === 0 ? {} : { proposedKnowledge }),
       };
     } catch (error) {
+      if (error instanceof InfrastructureError && error.code === "PI_REQUEST_TIMED_OUT") {
+        if (this.#executors.get(executorKey) === session) this.#executors.delete(executorKey);
+        session.dispose();
+      }
       if (error instanceof DOMException && error.name === "AbortError") throw error;
       throw infrastructure("PI_PROVIDER_REQUEST_FAILED", "Pi execution request failed", error);
     } finally {
@@ -1081,7 +1154,7 @@ export class PiCodingRuntime implements CodingRuntime {
       });
       enforceExclusiveHumanRequest(session);
       if (signal?.aborted === true) {
-        await session.abort();
+        await this.#abortSession(session).catch(() => undefined);
         session.dispose();
         throw abortError();
       }
@@ -1118,7 +1191,7 @@ export class PiCodingRuntime implements CodingRuntime {
     if (signal === undefined) return { detach: () => {}, completion: async () => {} };
     const abort = () => {
       onAbort();
-      completion ??= session.abort();
+      completion ??= this.#abortSession(session);
     };
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
@@ -1126,6 +1199,41 @@ export class PiCodingRuntime implements CodingRuntime {
       detach: () => signal.removeEventListener("abort", abort),
       completion: async () => { await completion?.catch(() => {}); },
     };
+  }
+
+  async #prompt(
+    session: PiSession,
+    prompt: string,
+    phase: "planning" | "execution",
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    try {
+      await withDeadline(
+        async () => await session.prompt(prompt),
+        this.#promptTimeoutMs,
+        () => infrastructure(
+          "PI_REQUEST_TIMED_OUT",
+          `Pi ${phase} request exceeded its deadline`,
+        ),
+        signal,
+      );
+    } catch (error) {
+      if (error instanceof InfrastructureError && error.code === "PI_REQUEST_TIMED_OUT") {
+        await this.#abortSession(session).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  async #abortSession(session: PiSession): Promise<void> {
+    await withDeadline(
+      async () => await session.abort(),
+      this.#abortTimeoutMs,
+      () => infrastructure(
+        "PI_SESSION_ABORT_FAILED",
+        "Pi session abort exceeded its deadline",
+      ),
+    );
   }
 
   #executorKey(repo: RepoContext, agencySessionId: string): string {

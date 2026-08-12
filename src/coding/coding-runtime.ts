@@ -12,6 +12,7 @@ import type {
 import { InfrastructureError } from "../process/index.js";
 
 export type CodingEventSink = (event: AgencyEvent) => void;
+export const MAX_REPOSITORY_INSTRUCTIONS_CHARS = 6_000;
 
 export interface RuntimeContinuation {
   role: "planner" | "executor";

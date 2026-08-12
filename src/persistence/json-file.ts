@@ -1,10 +1,16 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { rename, rm, writeFile } from "node:fs/promises";
 import { dirname, basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { ZodType } from "zod";
 
 import { InfrastructureError } from "../process/infrastructure-error.js";
+import {
+  ensurePrivateMetadataDirectory,
+  PRIVATE_METADATA_FILE_MODE,
+  readPrivateMetadataFile,
+  validatePrivateMetadataFile,
+} from "./metadata-root.js";
 
 export function isMissingFile(cause: unknown): boolean {
   return (
@@ -15,12 +21,15 @@ export function isMissingFile(cause: unknown): boolean {
 }
 
 export async function readJsonFile<T>(
+  projectRoot: string,
   path: string,
   schema: ZodType<T>,
 ): Promise<T | null> {
   let contents: string;
   try {
-    contents = await readFile(path, "utf8");
+    const value = await readPrivateMetadataFile(projectRoot, path);
+    if (value === null) return null;
+    contents = value;
   } catch (cause) {
     if (isMissingFile(cause)) return null;
     throw new InfrastructureError(
@@ -42,6 +51,7 @@ export async function readJsonFile<T>(
 }
 
 export async function writeJsonFileAtomic(
+  projectRoot: string,
   path: string,
   value: unknown,
 ): Promise<void> {
@@ -52,12 +62,15 @@ export async function writeJsonFileAtomic(
   );
 
   try {
-    await mkdir(directory, { recursive: true });
+    await ensurePrivateMetadataDirectory(projectRoot, directory);
+    await validatePrivateMetadataFile(projectRoot, path);
     await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {
       encoding: "utf8",
       flag: "wx",
+      mode: PRIVATE_METADATA_FILE_MODE,
     });
     await rename(temporaryPath, path);
+    await validatePrivateMetadataFile(projectRoot, path);
   } catch (cause) {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
     throw new InfrastructureError(

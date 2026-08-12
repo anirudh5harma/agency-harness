@@ -1,9 +1,14 @@
-import { appendFile, mkdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 
 import { z } from "zod";
 
 import { InfrastructureError } from "../process/index.js";
+import {
+  ensurePrivateMetadataDirectory,
+  PRIVATE_METADATA_FILE_MODE,
+} from "../persistence/metadata-root.js";
 
 const IdentifierSchema = z
   .string()
@@ -43,9 +48,8 @@ export const TrajectoryMetadataSchema = z.strictObject({
   status: z.enum(["completed", "failed", "cancelled"]).optional(),
   requestId: IdentifierSchema.optional(),
   decisionKind: z.enum(["clarification", "approval"]).optional(),
-  question: z.string().trim().min(1).max(1_000).optional(),
-  optionLabels: z.array(z.string().trim().min(1).max(80)).min(2).max(3).optional(),
-  resolution: z.string().trim().min(1).max(128).optional(),
+  optionCount: z.number().int().min(2).max(3).optional(),
+  resolution: z.enum(["option", "custom"]).optional(),
 });
 export type TrajectoryMetadata = z.infer<typeof TrajectoryMetadataSchema>;
 
@@ -65,9 +69,10 @@ export interface TrajectoryWriter {
 
 export class JsonlTrajectoryWriter implements TrajectoryWriter {
   readonly runsPath: string;
-  private initialization: Promise<string | undefined> | undefined;
+  readonly #projectRoot: string;
 
   constructor(projectRoot: string) {
+    this.#projectRoot = projectRoot;
     this.runsPath = join(projectRoot, ".devagency", "runs");
   }
 
@@ -79,13 +84,29 @@ export class JsonlTrajectoryWriter implements TrajectoryWriter {
     let parsed: TrajectoryEvent;
     try {
       parsed = TrajectoryEventSchema.parse(event);
-      this.initialization ??= mkdir(this.runsPath, { recursive: true });
-      await this.initialization;
-      await appendFile(
-        this.pathFor(parsed.runId),
-        `${JSON.stringify(parsed)}\n`,
-        "utf8",
+      // Revalidate on every append: an earlier validated directory can be
+      // replaced between events by another local process.
+      await ensurePrivateMetadataDirectory(
+        this.#projectRoot,
+        this.runsPath,
       );
+      const handle = await open(
+        this.pathFor(parsed.runId),
+        constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
+        PRIVATE_METADATA_FILE_MODE,
+      );
+      try {
+        const info = await handle.stat();
+        if (!info.isFile() || info.nlink !== 1) {
+          throw new Error("trajectory files must be single-link regular files");
+        }
+        if ((info.mode & 0o777) !== PRIVATE_METADATA_FILE_MODE) {
+          await handle.chmod(PRIVATE_METADATA_FILE_MODE);
+        }
+        await handle.writeFile(`${JSON.stringify(parsed)}\n`, "utf8");
+      } finally {
+        await handle.close();
+      }
     } catch (cause) {
       throw new InfrastructureError(
         "TRAJECTORY_WRITE_FAILED",

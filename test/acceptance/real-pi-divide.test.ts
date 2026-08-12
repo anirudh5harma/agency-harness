@@ -22,7 +22,7 @@ describe("real-Pi acceptance diagnostics", () => {
       diagnostic = error instanceof Error ? error.message : String(error);
     }
 
-    expect(diagnostic).toContain("stderr was not empty");
+    expect(diagnostic).toContain("stderr contained a terminal error");
     expect(diagnostic).toContain("expected exactly two completed runs, observed 1");
     expect(diagnostic).toContain("/status reported failed");
     expect(diagnostic).toContain("passed verification missing");
@@ -36,8 +36,15 @@ describe("real-Pi acceptance diagnostics", () => {
   it("accepts exactly two completed runs with passed verification", () => {
     expect(() => validateAgencyTranscript({
       stdout: "Verification: passed\nDone: first\nVerification: passed\nDone: second\nStatus: completed\nVerification: passed\n",
-      stderr: "",
+      stderr: "Error: bash failed\n",
     })).not.toThrow();
+  });
+
+  it("does not ignore a terminal bash failure without successful completion", () => {
+    expect(() => validateAgencyTranscript({
+      stdout: "Verification: passed\nDone: first\nStatus: failed\n",
+      stderr: "Error: bash failed\n",
+    })).toThrow(/stderr contained a terminal error/);
   });
 
   it("rejects a global verification marker that does not belong to both completed runs", () => {

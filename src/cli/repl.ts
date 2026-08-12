@@ -180,7 +180,7 @@ export class AgencyRepl {
         return;
       }
       this.#active.abort();
-      void this.#handler.interruptActive();
+      void this.#handler.interruptActive().catch(() => undefined);
     });
     const detachClear = this.#io.onClear?.(() => this.#handler.redraw?.()) ?? (() => {});
     try {

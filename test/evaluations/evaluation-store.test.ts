@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -89,16 +89,34 @@ describe("EvaluationStore", () => {
     expect(result.corruptCount).toBe(2);
   });
 
-  it("fails with a typed error before scanning an excessive directory", async () => {
+  it("retains a bounded owned history and stays readable with excessive unrelated entries", async () => {
     const root = await mkdtemp(join(tmpdir(), "agency-evals-"));
     directories.push(root);
     const store = new EvaluationStore(root);
     await store.write(evaluation("seed"));
     const directory = join(root, ".devagency", "evaluations");
+    await rm(join(directory, "seed.json"));
+    for (let offset = 0; offset < 1_000; offset += 100) {
+      await Promise.all(Array.from({ length: 100 }, (_, batchIndex) => {
+        const index = offset + batchIndex;
+        const record = evaluation(`run-${String(index).padStart(4, "0")}`);
+        return writeFile(join(directory, `${record.runId}.json`), JSON.stringify(record));
+      }));
+    }
+    await writeFile(join(directory, "unknown.json"), "{not agency metadata");
+    await symlink("unknown.json", join(directory, "linked.json"));
+    await store.write(evaluation("run-new"));
+    const owned = (await readdir(directory)).filter((name) => /^run-(?:\d|new)/u.test(name));
+    expect(owned).toHaveLength(1_000);
+    expect(await readFile(join(directory, "unknown.json"), "utf8")).toBe("{not agency metadata");
+    expect(await readlink(join(directory, "linked.json"))).toBe("unknown.json");
+
     for (let index = 0; index < 1_000; index += 1) {
       await writeFile(join(directory, `noise-${index}`), "");
     }
-    await expect(store.listRecent()).rejects.toMatchObject({ code: "METADATA_READ_FAILED" });
+    const result = await store.listRecent(100);
+    expect(result.evaluations).toHaveLength(100);
+    expect(result.corruptCount).toBe(2);
   });
 });
 

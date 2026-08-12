@@ -11,7 +11,10 @@ import { readFile } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { z } from "zod";
 
-import type { CodingRuntime } from "../coding/index.js";
+import {
+  MAX_REPOSITORY_INSTRUCTIONS_CHARS,
+  type CodingRuntime,
+} from "../coding/index.js";
 import {
   FailureContextSchema,
   HumanDecisionRequestSchema,
@@ -56,6 +59,7 @@ import {
   ensureAgencyMetadataIgnored,
   getChangedFiles,
   inspectRepository,
+  readSafeRepositoryFile,
   type GitBaseline,
   type GitFileChange,
   type RepositoryInspection,
@@ -65,7 +69,7 @@ const MAX_CHANGED_FILES = 2_000;
 const MAX_BASELINE_PATHS = 100_000;
 const MAX_COMMANDS = 20;
 const MAX_TEXT = 8_000;
-const MAX_REPO_INSTRUCTIONS = 12_000;
+const MAX_REPO_INSTRUCTIONS = MAX_REPOSITORY_INSTRUCTIONS_CHARS;
 const IdentifierSchema = z.string().trim().min(1).max(128);
 const TextSchema = z.string().max(MAX_TEXT);
 const RuntimeContinuationSchema = z.strictObject({
@@ -332,7 +336,7 @@ export async function loadRepositoryInstructions(
     }
     let content: string;
     try {
-      content = await readFile(filePath, "utf8");
+      content = await readSafeRepositoryFile(rootPath, filePath, remaining);
     } catch (cause) {
       throw new InfrastructureError(
         "METADATA_READ_FAILED",
@@ -530,8 +534,7 @@ export function createCodingRunGraph(
       metadata: {
         requestId: request.id,
         decisionKind: request.kind,
-        question: concise(request.question, 1_000),
-        optionLabels: request.options.map(({ label }) => concise(label, 80)),
+        optionCount: request.options.length,
       },
     });
     dependencies.eventBus?.emit({
@@ -997,7 +1000,7 @@ export function createCodingRunGraph(
     await recordTrajectory(state, "human_input_resolved", {
       metadata: {
         requestId: request.id,
-        resolution: response.optionId ?? "custom",
+        resolution: response.optionId === undefined ? "custom" : "option",
       },
     });
     dependencies.eventBus?.emit({

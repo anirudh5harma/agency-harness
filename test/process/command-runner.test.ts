@@ -1,11 +1,17 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { runCommand } from "../../src/process/index.js";
-import { terminatePosixProcessGroup } from "../../src/process/command-runner.js";
+import {
+  runCommandWithDependencies,
+  terminatePosixProcessGroup,
+  terminateWindowsProcessTree,
+} from "../../src/process/command-runner.js";
 
 async function waitForPid(path: string, timeoutMs = 5_000): Promise<number> {
   const deadline = Date.now() + timeoutMs;
@@ -22,6 +28,35 @@ async function waitForPid(path: string, timeoutMs = 5_000): Promise<number> {
 }
 
 describe("runCommand", () => {
+  it("rejects promptly when termination fails before a child closes", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 1234,
+      exitCode: null,
+      signalCode: null,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+
+    await expect(runCommandWithDependencies({
+      command: "stuck-command",
+      cwd: process.cwd(),
+      timeoutMs: 5,
+    }, {
+      spawn: () => child as never,
+      terminate: async () => { throw new Error("survived"); },
+    })).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "COMMAND_TERMINATION_FAILED",
+      message: "Could not terminate command: stuck-command",
+    });
+    expect(child.listenerCount("error")).toBe(0);
+    expect(child.listenerCount("close")).toBe(0);
+    expect(child.stdout.listenerCount("data")).toBe(0);
+    expect(child.stderr.listenerCount("data")).toBe(0);
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+  });
+
   it.skipIf(process.platform === "win32")(
     "fails deterministically when a process group survives the termination deadline",
     async () => {
@@ -48,6 +83,30 @@ describe("runCommand", () => {
       expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
     },
   );
+
+  it("bounds a stuck Windows taskkill process and force-kills both processes", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 1234,
+      kill: vi.fn(),
+    });
+    const killer = Object.assign(new EventEmitter(), {
+      kill: vi.fn(),
+    });
+
+    await expect(terminateWindowsProcessTree(child as never, {
+      spawnTaskkill: () => killer as never,
+      scheduleDeadline: (callback) => {
+        callback();
+        return () => {};
+      },
+      waitForExit: async () => {},
+    })).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "COMMAND_TERMINATION_FAILED",
+    });
+    expect(killer.kill).toHaveBeenCalledTimes(1);
+    expect(child.kill).toHaveBeenCalledTimes(1);
+  });
 
   it("rejects spawn failures as typed infrastructure errors", async () => {
     await expect(

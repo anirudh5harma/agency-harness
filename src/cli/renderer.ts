@@ -148,9 +148,9 @@ export class PlainTerminalRenderer implements TerminalRenderer {
     line(this.#output, `Context: ${input.session.recentTurns.length} recent turns, ${input.session.runSummaries.length} recent runs, ${input.session.olderSummary === "" ? "no" : "yes"} older summary (${input.session.compactionCount} compactions)`);
     line(
       this.#output,
-      (last?.changedFiles ?? input.changedFiles).length === 0
+      input.changedFiles.length === 0
         ? "Changed files: none"
-        : `Changed files: ${(last?.changedFiles ?? input.changedFiles).join(", ")}`,
+        : `Changed files: ${input.changedFiles.join(", ")}`,
     );
   }
 
@@ -406,9 +406,9 @@ export class RichTerminalRenderer implements TerminalRenderer {
       `Status: ${last?.status ?? "idle"}`,
       `Verification: ${last?.verification?.status ?? "none"}`,
       `Context: ${input.session.recentTurns.length} recent turns, ${input.session.runSummaries.length} recent runs, ${input.session.olderSummary === "" ? "no" : "yes"} older summary (${input.session.compactionCount} compactions)`,
-      (last?.changedFiles ?? input.changedFiles).length === 0
+      input.changedFiles.length === 0
         ? "Changed files: none"
-        : `Changed files: ${terminalText((last?.changedFiles ?? input.changedFiles).join(", "))}`,
+        : `Changed files: ${terminalText(input.changedFiles.join(", "))}`,
     ].join("\n"), true);
   }
 

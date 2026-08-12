@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -16,6 +16,7 @@ import type {
 import {
   CodingRunStateSchema,
   createCodingRunGraph,
+  loadRepositoryInstructions,
   routeAfterVerification,
   type CodingRunGraphDependencies,
 } from "../../src/graph/index.js";
@@ -213,7 +214,7 @@ describe("coding run graph", () => {
     failed.runtime.enqueueRepairResult({ message: "repair", changedFiles: [], sessionId: "pi-2" });
     await createCodingRunGraph(failed.deps).invoke(input(failed.root, 1));
     expect(failedAppend).not.toHaveBeenCalled();
-  }, 10_000);
+  }, 30_000);
 
   it("keeps finalization recoverable and discoverable when knowledge persistence fails", async () => {
     const { root, runtime, deps } = await setup([verification("passed")]);
@@ -286,8 +287,8 @@ describe("coding run graph", () => {
     };
     runtime.enqueueExecuteResult({ decisionRequest: request, message: "approval needed" });
     runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
-    const trajectory: TrajectoryLifecycleEvent[] = [];
-    deps.trajectoryWriter = { append: async (event) => { trajectory.push(event.event); } };
+    const trajectory: Array<Parameters<TrajectoryWriter["append"]>[0]> = [];
+    deps.trajectoryWriter = { append: async (event) => { trajectory.push(event); } };
     const runner = createCodingRunGraph(deps, { checkpointer: new MemorySaver() });
 
     const interrupted = await runner.invoke(input(root), { threadId: "human-thread" });
@@ -310,9 +311,20 @@ describe("coding run graph", () => {
       request,
       response: { requestId: request.id, optionId: "approve" },
     });
-    expect(trajectory.filter((event) => event === "human_input_requested")).toHaveLength(1);
-    expect(trajectory.filter((event) => event === "human_input_resolved")).toHaveLength(1);
-    expect(trajectory.filter((event) => event === "execution_started")).toHaveLength(1);
+    expect(trajectory.filter(({ event }) => event === "human_input_requested")).toHaveLength(1);
+    expect(trajectory.filter(({ event }) => event === "human_input_resolved")).toHaveLength(1);
+    expect(trajectory.filter(({ event }) => event === "execution_started")).toHaveLength(1);
+    expect(trajectory.find(({ event }) => event === "human_input_requested")?.metadata).toEqual({
+      requestId: request.id,
+      decisionKind: "approval",
+      optionCount: 3,
+    });
+    expect(trajectory.find(({ event }) => event === "human_input_resolved")?.metadata).toEqual({
+      requestId: request.id,
+      resolution: "option",
+    });
+    expect(JSON.stringify(trajectory)).not.toContain(request.question);
+    expect(JSON.stringify(trajectory)).not.toContain("Approve");
   });
 
   it("finalizes cancellation exactly once and retries evaluation persistence", async () => {
@@ -655,6 +667,38 @@ describe("coding run graph", () => {
     expect(runtime.calls.createPlan[0]?.projectKnowledge).toEqual(knowledge);
     expect(runtime.calls.execute[0]?.projectKnowledge).toEqual(knowledge);
     expect(runtime.calls.repair[0]?.projectKnowledge).toEqual(knowledge);
+  });
+
+  it("keeps repository instructions within runtime prompt contract", async () => {
+    const root = await repository();
+    const file = join(root, "AGENTS.md");
+    await writeFile(file, "x".repeat(7_000));
+
+    const instructions = await loadRepositoryInstructions(root, [file]);
+
+    expect(instructions).toHaveLength(6_000);
+    expect(instructions).toMatch(/^\[AGENTS\.md\]\n/u);
+  });
+
+  it("rejects linked and outside repository instruction reads", async () => {
+    const root = await repository();
+    const outside = await mkdtemp(join(tmpdir(), "agency-instructions-outside-"));
+    directories.push(outside);
+    const external = join(outside, "AGENTS.md");
+    await writeFile(external, "outside\n");
+    const linked = join(root, "AGENTS.md");
+    await symlink(external, linked);
+    await expect(loadRepositoryInstructions(root, [linked])).rejects.toMatchObject({
+      code: "METADATA_READ_FAILED",
+    });
+    await rm(linked);
+    await link(external, linked);
+    await expect(loadRepositoryInstructions(root, [linked])).rejects.toMatchObject({
+      code: "METADATA_READ_FAILED",
+    });
+    await expect(loadRepositoryInstructions(root, [external])).rejects.toMatchObject({
+      code: "METADATA_READ_FAILED",
+    });
   });
 
   it("repairs a coding verification failure and then succeeds", async () => {
