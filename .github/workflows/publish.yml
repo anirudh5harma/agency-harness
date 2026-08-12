@@ -66,19 +66,5 @@ jobs:
           ')"
           npm version "$version" --no-git-tag-version
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - id: promote
-        if: steps.source.outputs.current == 'true'
-        name: Reconfirm source is current main
-        shell: bash
-        env:
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          current_main="$(git ls-remote origin refs/heads/main | cut -f1)"
-          if [[ "$SOURCE_SHA" == "$current_main" ]]; then
-            echo "current=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "current=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping publish because main advanced to $current_main."
-          fi
-      - if: steps.promote.outputs.current == 'true'
+      - if: steps.source.outputs.current == 'true'
         run: npm publish --access public --tag latest
