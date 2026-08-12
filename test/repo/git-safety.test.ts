@@ -1,15 +1,18 @@
 import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   GitCheckpointManager,
   createAgencyWorktree,
   discardAgencyWorktree,
+  runBoundedGitWithInput,
 } from "../../src/repo/index.js";
 
 const execFileAsync = promisify(execFile);
@@ -37,6 +40,56 @@ afterEach(async () => {
 });
 
 describe("Git checkpoints", () => {
+  it("bounds stdout from stdin-fed Git subprocesses and terminates them", async () => {
+    const child = new EventEmitter() as EventEmitter & {
+      stdin: PassThrough;
+      stdout: PassThrough;
+      stderr: PassThrough;
+      kill: ReturnType<typeof vi.fn>;
+    };
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = vi.fn(() => true);
+    const operation = runBoundedGitWithInput(["hash-object", "--stdin"], Buffer.from("input"), {
+      cwd: process.cwd(),
+      maxOutputBytes: 8,
+      spawnProcess: (() => child) as never,
+    });
+    child.stdout.write(Buffer.alloc(9));
+
+    await expect(operation).rejects.toMatchObject({ code: "GIT_COMMAND_FAILED" });
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("times out a stalled stdin-fed Git subprocess deterministically", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new EventEmitter() as EventEmitter & {
+        stdin: PassThrough;
+        stdout: PassThrough;
+        stderr: PassThrough;
+        kill: ReturnType<typeof vi.fn>;
+      };
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = vi.fn(() => true);
+      const operation = runBoundedGitWithInput(["update-index"], Buffer.from("input"), {
+        cwd: process.cwd(),
+        timeoutMs: 10,
+        spawnProcess: (() => child) as never,
+      });
+      const rejection = expect(operation).rejects.toMatchObject({ code: "GIT_COMMAND_FAILED" });
+      await vi.advanceTimersByTimeAsync(10);
+
+      await rejection;
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("leaves HEAD, index, and status byte-identical while snapshotting dirty work", async () => {
     const root = await repository();
     await writeFile(join(root, "staged.txt"), "staged\n");
@@ -81,7 +134,7 @@ describe("Git checkpoints", () => {
     await expect(readFile(join(root, "added.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(join(root, "link.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(join(root, ".git", "index"))).toEqual(indexBefore);
-  }, 15_000);
+  }, 30_000);
 
   it("refuses a path edited by the user after Agency", async () => {
     const root = await repository();

@@ -24,7 +24,7 @@
   },
   "type": "module",
   "bin": {
-    "agency": "./dist/cli/index.js"
+    "agency": "dist/cli/index.js"
   },
   "files": [
     "dist"

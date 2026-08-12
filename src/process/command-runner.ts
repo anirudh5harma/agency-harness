@@ -124,6 +124,67 @@ async function waitForProcessExit(pid: number): Promise<void> {
   }
 }
 
+interface WindowsTerminationOptions {
+  spawnTaskkill?: typeof spawn;
+  deadlineMs?: number;
+  scheduleDeadline?: (callback: () => void, milliseconds: number) => () => void;
+  waitForExit?: (pid: number) => Promise<void>;
+}
+
+/** @internal Exported only to permit deterministic Windows termination tests. */
+export async function terminateWindowsProcessTree(
+  child: ReturnType<typeof spawn>,
+  options: WindowsTerminationOptions = {},
+): Promise<void> {
+  if (child.pid === undefined) return;
+  const spawnTaskkill = options.spawnTaskkill ?? spawn;
+  const deadlineMs = options.deadlineMs ?? 2_000;
+  const scheduleDeadline = options.scheduleDeadline ?? ((callback, milliseconds) => {
+    const timeout = setTimeout(callback, milliseconds);
+    timeout.unref();
+    return () => clearTimeout(timeout);
+  });
+  const waitForExit = options.waitForExit ?? waitForProcessExit;
+
+  await new Promise<void>((resolve, reject) => {
+    const killer = spawnTaskkill("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    let settled = false;
+    let cancelDeadline = (): void => {};
+    const cleanup = (): void => {
+      cancelDeadline();
+      killer.removeListener("error", onError);
+      killer.removeListener("close", onClose);
+    };
+    const finish = (fallback: boolean): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (fallback) child.kill();
+      resolve();
+    };
+    const onError = (): void => finish(true);
+    const onClose = (exitCode: number | null): void => finish(exitCode !== 0);
+    killer.once("error", onError);
+    killer.once("close", onClose);
+    cancelDeadline = scheduleDeadline(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try { killer.kill(); } catch { /* best-effort force stop */ }
+      try { child.kill(); } catch { /* best-effort fallback */ }
+      reject(new InfrastructureError(
+        "COMMAND_TERMINATION_FAILED",
+        `taskkill for process ${child.pid} survived its termination deadline`,
+      ));
+    }, deadlineMs);
+    if (settled) cancelDeadline();
+  });
+  await waitForExit(child.pid);
+}
+
 /** @internal Exported only to permit deterministic termination failure tests. */
 export async function terminatePosixProcessGroup(
   pid: number,
@@ -183,21 +244,7 @@ async function terminateProcessTree(
 ): Promise<void> {
   if (child.pid === undefined) return;
   if (process.platform === "win32") {
-    await new Promise<void>((resolve) => {
-      const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-      killer.once("error", () => {
-        child.kill();
-        resolve();
-      });
-      killer.once("close", (exitCode) => {
-        if (exitCode !== 0) child.kill();
-        resolve();
-      });
-    });
-    await waitForProcessExit(child.pid);
+    await terminateWindowsProcessTree(child);
     return;
   }
 
@@ -206,6 +253,19 @@ async function terminateProcessTree(
 
 export async function runCommand(
   options: RunCommandOptions,
+): Promise<CommandResult> {
+  return await runCommandWithDependencies(options);
+}
+
+interface CommandRunnerDependencies {
+  spawn?: typeof spawn;
+  terminate?: (child: ReturnType<typeof spawn>) => Promise<void>;
+}
+
+/** @internal Exported only to permit deterministic process-lifecycle tests. */
+export async function runCommandWithDependencies(
+  options: RunCommandOptions,
+  dependencies: CommandRunnerDependencies = {},
 ): Promise<CommandResult> {
   if (options.cwd.trim() === "") throw new TypeError("runCommand requires cwd");
   const args = [...(options.args ?? [])];
@@ -222,9 +282,11 @@ export async function runCommand(
   const stderr = new BoundedOutput(maxOutputBytes);
   const startedAt = performance.now();
   let timedOut = false;
+  const spawnCommand = dependencies.spawn ?? spawn;
+  const terminateTree = dependencies.terminate ?? terminateProcessTree;
 
   return await new Promise<CommandResult>((resolve, reject) => {
-    const child = spawn(options.command, args, {
+    const child = spawnCommand(options.command, args, {
       cwd: options.cwd,
       env: options.env,
       shell: options.shell ?? false,
@@ -234,9 +296,38 @@ export async function runCommand(
     let settled = false;
     let termination: Promise<void> | undefined;
 
+    const onStdoutData = (chunk: Buffer): void => stdout.append(chunk);
+    const onStderrData = (chunk: Buffer): void => stderr.append(chunk);
+    const cleanup = (destroyStreams: boolean): void => {
+      clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", onAbort);
+      child.removeListener("error", onError);
+      child.removeListener("close", onClose);
+      child.stdout.removeListener("data", onStdoutData);
+      child.stderr.removeListener("data", onStderrData);
+      if (destroyStreams) {
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
+    };
+
+    const rejectTermination = (cause: unknown): void => {
+      if (settled) return;
+      settled = true;
+      cleanup(true);
+      reject(
+        new InfrastructureError(
+          "COMMAND_TERMINATION_FAILED",
+          `Could not terminate command: ${options.command}`,
+          { cause },
+        ),
+      );
+    };
+
     const terminate = (): void => {
       if (child.exitCode === null && child.signalCode === null) {
-        termination ??= terminateProcessTree(child);
+        termination ??= Promise.resolve().then(async () => await terminateTree(child));
+        void termination.catch(rejectTermination);
       }
     };
     const onAbort = (): void => terminate();
@@ -249,13 +340,10 @@ export async function runCommand(
     }, timeoutMs);
     timeout.unref();
 
-    child.stdout.on("data", (chunk: Buffer) => stdout.append(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
-    child.on("error", (cause) => {
+    const onError = (cause: Error): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
-      options.signal?.removeEventListener("abort", onAbort);
+      cleanup(true);
       reject(
         new InfrastructureError(
           "COMMAND_SPAWN_FAILED",
@@ -263,12 +351,11 @@ export async function runCommand(
           { cause },
         ),
       );
-    });
-    child.on("close", async (exitCode, signal) => {
+    };
+    const onClose = async (exitCode: number | null, signal: NodeJS.Signals | null): Promise<void> => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
-      options.signal?.removeEventListener("abort", onAbort);
+      cleanup(false);
       try {
         await termination;
       } catch (cause) {
@@ -291,6 +378,10 @@ export async function runCommand(
         durationMs: performance.now() - startedAt,
         timedOut,
       });
-    });
+    };
+    child.stdout.on("data", onStdoutData);
+    child.stderr.on("data", onStderrData);
+    child.on("error", onError);
+    child.on("close", onClose);
   });
 }

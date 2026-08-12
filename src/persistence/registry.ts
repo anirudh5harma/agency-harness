@@ -4,7 +4,9 @@ import { z } from "zod";
 
 import { RunStatusSchema, type RunStatus } from "../domain/index.js";
 import { InfrastructureError } from "../process/infrastructure-error.js";
+import { withRepositoryLock } from "../repo/repository-lock.js";
 import { readJsonFile, writeJsonFileAtomic } from "./json-file.js";
+import { ensurePrivateMetadataDirectory } from "./metadata-root.js";
 
 const NonEmptyStringSchema = z.string().trim().min(1);
 
@@ -40,13 +42,15 @@ const TERMINAL_STATUSES = new Set<RunStatus>([
 
 export class IncompleteRunRegistry {
   readonly path: string;
+  readonly #projectRoot: string;
 
   constructor(projectRoot: string) {
+    this.#projectRoot = projectRoot;
     this.path = join(projectRoot, ".devagency", "incomplete-runs.json");
   }
 
   async list(): Promise<IncompleteRunEntry[]> {
-    const registry = await readJsonFile(this.path, IncompleteRunRegistrySchema);
+    const registry = await readJsonFile(this.#projectRoot, this.path, IncompleteRunRegistrySchema);
     return registry?.runs ?? [];
   }
 
@@ -61,9 +65,11 @@ export class IncompleteRunRegistry {
         { cause },
       );
     }
-    const runs = (await this.list()).filter(({ runId }) => runId !== parsed.runId);
-    runs.push(parsed);
-    await writeJsonFileAtomic(this.path, { runs });
+    await this.#mutate(async () => {
+      const runs = (await this.list()).filter(({ runId }) => runId !== parsed.runId);
+      runs.push(parsed);
+      await writeJsonFileAtomic(this.#projectRoot, this.path, { runs });
+    });
   }
 
   async updateStatus(
@@ -72,34 +78,41 @@ export class IncompleteRunRegistry {
     updatedAt: string,
   ): Promise<void> {
     const parsedStatus = RunStatusSchema.parse(status);
-    const runs = await this.list();
-    const existing = runs.find((entry) => entry.runId === runId);
-    if (!existing) return;
+    await this.#mutate(async () => {
+      const runs = await this.list();
+      const existing = runs.find((entry) => entry.runId === runId);
+      if (!existing) return;
 
-    if (TERMINAL_STATUSES.has(parsedStatus)) {
-      await writeJsonFileAtomic(this.path, {
-        runs: runs.filter((entry) => entry.runId !== runId),
-      });
-      return;
-    }
+      if (TERMINAL_STATUSES.has(parsedStatus)) {
+        await writeJsonFileAtomic(this.#projectRoot, this.path, {
+          runs: runs.filter((entry) => entry.runId !== runId),
+        });
+        return;
+      }
 
-    let updated: IncompleteRunEntry;
-    try {
-      updated = IncompleteRunEntrySchema.parse({
-        ...existing,
-        status: IncompleteRunStatusSchema.parse(parsedStatus),
-        updatedAt: z.iso.datetime().parse(updatedAt),
+      let updated: IncompleteRunEntry;
+      try {
+        updated = IncompleteRunEntrySchema.parse({
+          ...existing,
+          status: IncompleteRunStatusSchema.parse(parsedStatus),
+          updatedAt: z.iso.datetime().parse(updatedAt),
+        });
+      } catch (cause) {
+        throw new InfrastructureError(
+          "METADATA_INVALID",
+          "Invalid incomplete run discovery metadata",
+          { cause },
+        );
+      }
+      await writeJsonFileAtomic(this.#projectRoot, this.path, {
+        runs: [...runs.filter(({ runId: id }) => id !== runId), updated],
       });
-    } catch (cause) {
-      throw new InfrastructureError(
-        "METADATA_INVALID",
-        "Invalid incomplete run discovery metadata",
-        { cause },
-      );
-    }
-    await writeJsonFileAtomic(this.path, {
-      runs: [...runs.filter(({ runId: id }) => id !== runId), updated],
     });
+  }
+
+  async #mutate(operation: () => Promise<void>): Promise<void> {
+    await ensurePrivateMetadataDirectory(this.#projectRoot);
+    await withRepositoryLock(this.#projectRoot, operation);
   }
 }
 

@@ -171,7 +171,33 @@ describe("rich terminal rendering", () => {
     });
 
     expect(output.value).toContain("Last task: ship terminal");
+    expect(output.value).toContain("Changed files: none");
+    expect(output.value).not.toContain("Changed files: src/cli/renderer.ts");
     expect(output.value).toContain("Context: 1 recent turns, 1 recent runs, yes older summary (2 compactions)");
+  });
+
+  it("reports current Git changes in plain /status while retaining last task metadata", () => {
+    const output = new BufferOutput();
+    const renderer = new PlainTerminalRenderer(output, output);
+    renderer.status({
+      inspection,
+      session: {
+        sessionId: "session-status",
+        recentTurns: [],
+        runSummaries: [{
+          runId: "run-1",
+          status: "completed",
+          objective: "old task",
+          summary: "done",
+          changedFiles: ["stale.ts"],
+        }],
+      },
+      changedFiles: ["current.ts"],
+    });
+
+    expect(output.value).toContain("Last task: old task");
+    expect(output.value).toContain("Changed files: current.ts");
+    expect(output.value).not.toContain("stale.ts");
   });
 
   it("clears prior run phase when a new session resets lifecycle", () => {

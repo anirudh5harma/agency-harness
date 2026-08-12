@@ -66,19 +66,21 @@ function compactSession(
 
 export class SessionStore {
   readonly path: string;
+  readonly #projectRoot: string;
 
   constructor(projectRoot: string) {
+    this.#projectRoot = projectRoot;
     this.path = join(projectRoot, ".devagency", "session.json");
   }
 
   async loadOrCreate(): Promise<SessionContext> {
-    const session = await readJsonFile(this.path, PersistedSessionSchema);
+    const session = await readJsonFile(this.#projectRoot, this.path, PersistedSessionSchema);
     return session ?? this.createNew();
   }
 
   async createNew(): Promise<SessionContext> {
     const session = SessionContextSchema.parse({ sessionId: randomUUID() });
-    await writeJsonFileAtomic(this.path, session);
+    await writeJsonFileAtomic(this.#projectRoot, this.path, session);
     return session;
   }
 
@@ -89,7 +91,7 @@ export class SessionStore {
       ...session,
       recentTurns: [...session.recentTurns, turn],
     }, MAX_SESSION_TURNS, MAX_SESSION_RUN_SUMMARIES, new Date().toISOString());
-    await writeJsonFileAtomic(this.path, updated);
+    await writeJsonFileAtomic(this.#projectRoot, this.path, updated);
     return updated;
   }
 
@@ -100,7 +102,7 @@ export class SessionStore {
       ...session,
       runSummaries: [...session.runSummaries, parsedSummary],
     }, MAX_SESSION_TURNS, MAX_SESSION_RUN_SUMMARIES, new Date().toISOString());
-    await writeJsonFileAtomic(this.path, updated);
+    await writeJsonFileAtomic(this.#projectRoot, this.path, updated);
     return updated;
   }
 
@@ -112,7 +114,7 @@ export class SessionStore {
       EXPLICIT_COMPACT_RUN_SUMMARIES,
       new Date().toISOString(),
     );
-    if (updated !== session) await writeJsonFileAtomic(this.path, updated);
+    if (updated !== session) await writeJsonFileAtomic(this.#projectRoot, this.path, updated);
     return {
       session: updated,
       beforeTurns: session.recentTurns.length,

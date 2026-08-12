@@ -4,4 +4,5 @@ export * from "./git-checkpoint.js";
 export * from "./agency-worktree.js";
 export * from "./local-exclude.js";
 export * from "./repository-inspector.js";
+export * from "./safe-repository-file.js";
 export * from "./repository-lock.js";

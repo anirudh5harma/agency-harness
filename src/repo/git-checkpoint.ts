@@ -18,6 +18,11 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { InfrastructureError, runCommand } from "../process/index.js";
 import {
+  ensurePrivateMetadataDirectory,
+  readPrivateMetadataFile,
+  writePrivateMetadataFileAtomic,
+} from "../persistence/metadata-root.js";
+import {
   AGENCY_LOCAL_EXCLUDE_RULE,
   AGENCY_WORKTREE_EXCLUDE_RULE,
   ensureLocalExcludeRules,
@@ -28,6 +33,70 @@ const MAX_CHECKPOINTS = 100;
 const MAX_PATHS = 2_000;
 const METADATA_VERSION = 1;
 const MAX_CHECKPOINT_PATH_BYTES = 16 * 1024 * 1024;
+const GIT_BUFFER_TIMEOUT_MS = 30_000;
+const GIT_BUFFER_MAX_BYTES = 16 * 1024 * 1024;
+
+/** @internal Exported for deterministic subprocess-boundary tests. */
+export async function runBoundedGitWithInput(
+  args: readonly string[],
+  input: Buffer,
+  options: {
+    cwd: string;
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+    maxOutputBytes?: number;
+    spawnProcess?: typeof spawn;
+  },
+): Promise<Buffer> {
+  const timeoutMs = options.timeoutMs ?? GIT_BUFFER_TIMEOUT_MS;
+  const maxOutputBytes = options.maxOutputBytes ?? GIT_BUFFER_MAX_BYTES;
+  return await new Promise<Buffer>((resolvePromise, reject) => {
+    const child = (options.spawnProcess ?? spawn)("git", [...args], {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new InfrastructureError("GIT_COMMAND_FAILED", `git ${args.join(" ")} exceeded ${timeoutMs} ms`));
+    }, timeoutMs);
+    timer.unref();
+    const finish = (error?: unknown, output?: Buffer): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error === undefined) resolvePromise(output ?? Buffer.alloc(0));
+      else reject(error);
+    };
+    const append = (chunks: Buffer[], stream: "stdout" | "stderr", chunk: Buffer): void => {
+      if (settled) return;
+      if (stream === "stdout") stdoutBytes += chunk.byteLength;
+      else stderrBytes += chunk.byteLength;
+      if ((stream === "stdout" ? stdoutBytes : stderrBytes) > maxOutputBytes) {
+        child.kill("SIGKILL");
+        finish(new InfrastructureError("GIT_COMMAND_FAILED", `git ${args.join(" ")} exceeded its ${stream} limit`));
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    };
+    child.stdout.on("data", (chunk: Buffer) => append(stdout, "stdout", chunk));
+    child.stderr.on("data", (chunk: Buffer) => append(stderr, "stderr", chunk));
+    child.once("error", (cause) => finish(new InfrastructureError("GIT_COMMAND_FAILED", `git ${args.join(" ")} could not start`, { cause })));
+    child.once("close", (code) => {
+      if (code === 0) finish(undefined, Buffer.concat(stdout, stdoutBytes));
+      else finish(new InfrastructureError("GIT_COMMAND_FAILED", Buffer.concat(stderr, stderrBytes).toString("utf8").trim() || `git ${args.join(" ")} failed`));
+    });
+    child.stdin.on("error", (cause: NodeJS.ErrnoException) => {
+      if (cause.code !== "EPIPE") finish(new InfrastructureError("GIT_COMMAND_FAILED", `Could not write to git ${args.join(" ")}`, { cause }));
+    });
+    child.stdin.end(input);
+  });
+}
 
 export interface CheckpointPathMetadata {
   checkpointIdentity: string | null;
@@ -296,7 +365,7 @@ export class GitCheckpointManager {
     if (checkpoint === undefined) throw this.#missing(checkpointId ?? "latest");
     const token = randomUUID();
     const materializationRoot = join(this.root, ".devagency", "undo-plans", token);
-    await mkdir(materializationRoot, { recursive: true, mode: 0o700 });
+    await ensurePrivateMetadataDirectory(this.root, materializationRoot);
     const result: UndoPlan = {
       checkpointId: checkpoint.id,
       restored: [], diverged: [], unchanged: [], deletionsRequired: [],
@@ -325,7 +394,7 @@ export class GitCheckpointManager {
           const content = await this.#gitBuffer(["cat-file", "blob", match[2]!]);
           const materializedPath = join(materializationRoot, String(index++));
           if (mode === "120000") await symlink(content.toString("utf8"), materializedPath);
-          else await writeFile(materializedPath, content, { mode: mode === "100755" ? 0o755 : 0o644 });
+          else await writeFile(materializedPath, content, { flag: "wx", mode: mode === "100755" ? 0o700 : 0o600 });
           result.entries.push({ path, expectedIdentity: current, checkpointIdentity: snapshot.checkpointIdentity, materializedPath, mode });
         }
       }
@@ -480,8 +549,8 @@ export class GitCheckpointManager {
 
   async #load(): Promise<CheckpointFile> {
     try {
-      const contents = await readFile(this.#metadataPath, "utf8");
-      if (Buffer.byteLength(contents) > 8 * 1024 * 1024) throw new Error("metadata exceeds 8 MiB");
+      const contents = await readPrivateMetadataFile(this.root, this.#metadataPath, 8 * 1024 * 1024);
+      if (contents === null) return { version: METADATA_VERSION, checkpoints: [], runBindings: {} };
       const parsed = JSON.parse(contents) as Partial<CheckpointFile>;
       if (parsed.version !== METADATA_VERSION || !Array.isArray(parsed.checkpoints) || parsed.checkpoints.length > MAX_CHECKPOINTS) {
         throw new Error("invalid shape");
@@ -522,10 +591,7 @@ export class GitCheckpointManager {
   }
 
   async #save(file: CheckpointFile): Promise<void> {
-    await mkdir(dirname(this.#metadataPath), { recursive: true });
-    const temporary = `${this.#metadataPath}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(file, null, 2)}\n`, "utf8");
-    await rename(temporary, this.#metadataPath);
+    await writePrivateMetadataFileAtomic(this.root, this.#metadataPath, `${JSON.stringify(file, null, 2)}\n`);
   }
 
   #missing(id: string): InfrastructureError {
@@ -541,17 +607,9 @@ export class GitCheckpointManager {
 
   async #gitBuffer(args: string[], input?: Buffer, env?: NodeJS.ProcessEnv): Promise<Buffer> {
     if (input !== undefined) {
-      return new Promise<Buffer>((resolvePromise, reject) => {
-        const child = spawn("git", args, { cwd: this.root, env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
-        const stdout: Buffer[] = [];
-        const stderr: Buffer[] = [];
-        child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-        child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-        child.on("error", reject);
-        child.on("close", (code) => code === 0
-          ? resolvePromise(Buffer.concat(stdout))
-          : reject(new InfrastructureError("GIT_COMMAND_FAILED", Buffer.concat(stderr).toString("utf8").trim() || `git ${args.join(" ")} failed`)));
-        child.stdin.end(input);
+      return runBoundedGitWithInput(args, input, {
+        cwd: this.root,
+        env: { ...process.env, ...env },
       });
     }
     return new Promise<Buffer>((resolvePromise, reject) => {
@@ -573,9 +631,10 @@ export class GitCheckpointManager {
   }
 
   async #ensureControlDirectory(): Promise<void> {
-    const directory = dirname(this.#metadataPath);
-    await mkdir(directory, { recursive: true });
-    const stats = await lstat(directory);
-    if (!stats.isDirectory() || stats.isSymbolicLink()) throw unsafePath("Agency metadata directory must be a real contained directory");
+    try {
+      await ensurePrivateMetadataDirectory(this.root, dirname(this.#metadataPath));
+    } catch (cause) {
+      throw new InfrastructureError("GIT_UNSAFE_PATH", "Agency metadata directory must be a private real contained directory", { cause });
+    }
   }
 }

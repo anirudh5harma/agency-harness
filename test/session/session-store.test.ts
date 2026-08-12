@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -44,6 +44,44 @@ describe("SessionStore", () => {
     expect(await readdir(join(projectRoot, ".devagency"))).toEqual([
       "session.json",
     ]);
+    expect((await stat(join(projectRoot, ".devagency"))).mode & 0o777).toBe(0o700);
+    expect((await stat(join(projectRoot, ".devagency", "session.json"))).mode & 0o777).toBe(0o600);
+  });
+
+  it("rejects a linked metadata root and hardens legacy permissions", async () => {
+    const linkedProject = await temporaryProject();
+    const outside = await temporaryProject();
+    await symlink(outside, join(linkedProject, ".devagency"));
+    await expect(new SessionStore(linkedProject).loadOrCreate()).rejects.toMatchObject({
+      code: "METADATA_READ_FAILED",
+    });
+
+    const legacyProject = await temporaryProject();
+    const metadata = join(legacyProject, ".devagency");
+    await mkdir(metadata, { mode: 0o755 });
+    await writeFile(join(metadata, "session.json"), JSON.stringify({
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      recentTurns: [], runSummaries: [], olderSummary: "", compactionCount: 0, lastCompactedAt: null,
+    }), { mode: 0o644 });
+    await chmod(metadata, 0o755);
+    await chmod(join(metadata, "session.json"), 0o644);
+    await new SessionStore(legacyProject).loadOrCreate();
+    expect((await stat(metadata)).mode & 0o777).toBe(0o700);
+    expect((await stat(join(metadata, "session.json"))).mode & 0o777).toBe(0o600);
+  });
+
+  it("keeps metadata scoped to an explicit project root beneath a .devagency-named parent", async () => {
+    const container = await temporaryProject();
+    const projectRoot = join(container, ".devagency", "nested-project");
+    await mkdir(projectRoot, { recursive: true });
+    const store = new SessionStore(projectRoot);
+
+    const session = await store.loadOrCreate();
+
+    expect(session.sessionId).toBeTruthy();
+    expect((await stat(join(projectRoot, ".devagency"))).mode & 0o777).toBe(0o700);
+    await expect(readFile(join(container, ".devagency", "session.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("retains only the most recent schema-bounded turns and run summaries", async () => {

@@ -1,14 +1,22 @@
 import { constants } from "node:fs";
-import { link, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { link, lstat, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { InfrastructureError } from "../process/index.js";
+import { ensurePrivateMetadataDirectory, readPrivateMetadataFile } from "../persistence/metadata-root.js";
 
 interface Lease { pid: number; token: string; createdAt: number; processStartId: string }
 const PROCESS_START_ID = randomUUID();
 const PROCESS_STARTED_AT = Date.now() - Math.round(process.uptime() * 1_000);
 const MALFORMED_LEASE_GRACE_MS = 30_000;
+const MAX_LEASE_BYTES = 4 * 1024;
+
+async function readLeaseFile(root: string, path: string): Promise<string> {
+  const contents = await readPrivateMetadataFile(root, path, MAX_LEASE_BYTES);
+  if (contents === null) throw Object.assign(new Error("Repository lease disappeared"), { code: "ENOENT" });
+  return contents;
+}
 
 function live(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
@@ -17,9 +25,11 @@ function live(pid: number): boolean {
 
 export async function withRepositoryLock<T>(root: string, operation: () => Promise<T>): Promise<T> {
   const control = join(root, ".devagency");
-  await mkdir(control, { recursive: true });
-  const stats = await lstat(control);
-  if (!stats.isDirectory() || stats.isSymbolicLink()) throw new InfrastructureError("GIT_UNSAFE_PATH", "Agency metadata directory must be a real directory");
+  try {
+    await ensurePrivateMetadataDirectory(root, control);
+  } catch (cause) {
+    throw new InfrastructureError("GIT_UNSAFE_PATH", "Agency metadata directory must be a private real directory", { cause });
+  }
   const lock = join(control, "repository.lock");
   const token = randomUUID();
   const lease: Lease = { pid: process.pid, token, createdAt: Date.now(), processStartId: PROCESS_START_ID };
@@ -32,13 +42,13 @@ export async function withRepositoryLock<T>(root: string, operation: () => Promi
     } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code !== "EEXIST" || attempt >= 250) throw new InfrastructureError("GIT_CHECKPOINT_INVALID", "Could not acquire repository metadata lock", { cause });
       try {
-        const observedBytes = await readFile(lock, "utf8");
+        const observedBytes = await readLeaseFile(root, lock);
         const observed = JSON.parse(observedBytes) as Lease;
         const reusedCurrentPid = observed.pid === process.pid && observed.processStartId !== PROCESS_START_ID && observed.createdAt < PROCESS_STARTED_AT;
         if (Number.isInteger(observed.pid) && (!live(observed.pid) || reusedCurrentPid)) {
           const quarantine = `${lock}.stale-${randomUUID()}`;
           await rename(lock, quarantine);
-          const movedBytes = await readFile(quarantine, "utf8");
+          const movedBytes = await readLeaseFile(root, quarantine);
           const moved = JSON.parse(movedBytes) as Lease;
           if (movedBytes === observedBytes && moved.token === observed.token && (!live(moved.pid) || reusedCurrentPid)) await rm(quarantine, { force: true });
           else await link(quarantine, lock).then(() => rm(quarantine, { force: true })).catch(() => {});
@@ -65,7 +75,7 @@ export async function withRepositoryLock<T>(root: string, operation: () => Promi
     const quarantine = `${lock}.release-${randomUUID()}`;
     try {
       await rename(lock, quarantine);
-      const moved = JSON.parse(await readFile(quarantine, "utf8")) as Lease;
+      const moved = JSON.parse(await readLeaseFile(root, quarantine)) as Lease;
       if (moved.token === token) await rm(quarantine, { force: true });
       else await link(quarantine, lock).then(() => rm(quarantine, { force: true })).catch(() => {});
     } catch { /* Never unlink a lease whose token cannot be proven. */ }

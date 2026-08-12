@@ -119,6 +119,35 @@ describe("IncompleteRunRegistry", () => {
     ]);
   });
 
+  it("serializes concurrent mutations without losing runs", async () => {
+    const projectRoot = await temporaryProject();
+    const registry = new IncompleteRunRegistry(projectRoot);
+    const entries = Array.from({ length: 12 }, (_, index) => ({
+      ...entry,
+      runId: `run-${index}`,
+      threadId: `thread-${index}`,
+      sessionId: `session-${index}`,
+    }));
+
+    await Promise.all(entries.map((candidate) => registry.upsert(candidate)));
+
+    expect((await registry.list()).map(({ runId }) => runId).sort()).toEqual(
+      entries.map(({ runId }) => runId).sort(),
+    );
+
+    await Promise.all([
+      registry.updateStatus("run-0", "completed", "2026-08-10T10:02:00.000Z"),
+      registry.updateStatus("run-1", "verifying", "2026-08-10T10:02:00.000Z"),
+      registry.upsert({ ...entry, runId: "run-new" }),
+    ]);
+
+    const finalRuns = await registry.list();
+    expect(finalRuns.some(({ runId }) => runId === "run-0")).toBe(false);
+    expect(finalRuns.find(({ runId }) => runId === "run-1")?.status).toBe("verifying");
+    expect(finalRuns.some(({ runId }) => runId === "run-new")).toBe(true);
+    expect(finalRuns).toHaveLength(12);
+  });
+
   it("preserves typed validation errors for incomplete updates", async () => {
     const projectRoot = await temporaryProject();
     const registry = new IncompleteRunRegistry(projectRoot);

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { open, rename, rm } from "node:fs/promises";
+import { basename, join, resolve, sep } from "node:path";
 import {
   projectKnowledgeKey,
   ProjectKnowledgeEntrySchema,
@@ -10,7 +10,13 @@ import {
   type ProjectKnowledgeEntry,
 } from "../domain/index.js";
 import { InfrastructureError } from "../process/index.js";
-import { isMissingFile } from "./json-file.js";
+import { withRepositoryLock } from "../repo/repository-lock.js";
+import {
+  ensurePrivateMetadataDirectory,
+  PRIVATE_METADATA_FILE_MODE,
+  readPrivateMetadataFile,
+  validatePrivateMetadataFile,
+} from "./metadata-root.js";
 
 const MAX_FILE_BYTES = 64 * 1024;
 const MAX_ENTRIES = 100;
@@ -46,28 +52,27 @@ function parseFile(category: typeof categories[number], path: string, contents: 
   }
 }
 
-async function readBoundedFile(path: string): Promise<string | null> {
-  let handle;
+async function readBoundedFile(projectRoot: string, path: string): Promise<string | null> {
   try {
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    return await readPrivateMetadataFile(projectRoot, path, MAX_FILE_BYTES);
   } catch (cause) {
-    if (isMissingFile(cause)) return null;
-    if (cause instanceof Error && "code" in cause && (cause as NodeJS.ErrnoException).code === "ELOOP") {
-      throw new InfrastructureError("METADATA_INVALID", `Project knowledge file must not be a symbolic link: ${path}`, { cause });
-    }
-    throw new InfrastructureError("METADATA_READ_FAILED", `Could not read project knowledge at ${path}`, { cause });
+    throw new InfrastructureError("METADATA_INVALID", `Invalid project knowledge path at ${path}`, { cause });
   }
+}
+
+async function writePrivateTemporary(projectRoot: string, path: string, contents: string): Promise<void> {
+  const handle = await open(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    PRIVATE_METADATA_FILE_MODE,
+  );
   try {
-    if ((await handle.stat()).size > MAX_FILE_BYTES) {
-      throw new InfrastructureError("METADATA_INVALID", `Invalid project knowledge at ${path}`);
-    }
-    return await handle.readFile("utf8");
-  } catch (cause) {
-    if (cause instanceof InfrastructureError) throw cause;
-    throw new InfrastructureError("METADATA_READ_FAILED", `Could not read project knowledge at ${path}`, { cause });
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
   } finally {
     await handle.close();
   }
+  await validatePrivateMetadataFile(projectRoot, path);
 }
 
 export interface ProjectKnowledgeStoreBoundary {
@@ -92,28 +97,20 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
     if (!this.directory.startsWith(`${this.#root}${sep}`)) throw new InfrastructureError("METADATA_INVALID", "Knowledge path is outside the repository");
   }
 
-  async #assertContained(): Promise<void> {
-    for (let current = this.directory; current.startsWith(`${this.#root}${sep}`); current = dirname(current)) {
-      try {
-        if ((await lstat(current)).isSymbolicLink()) {
-          const target = await realpath(current);
-          if (target !== this.#root && !target.startsWith(`${this.#root}${sep}`)) throw new InfrastructureError("METADATA_INVALID", "Knowledge path escapes the repository");
-        }
-      } catch (error) {
-        if (!isMissingFile(error)) throw error;
-      }
+  async #ensureDirectory(): Promise<void> {
+    try {
+      await ensurePrivateMetadataDirectory(this.#root, this.directory);
+    } catch (cause) {
+      throw new InfrastructureError("METADATA_INVALID", "Knowledge path must contain only private real directories", { cause });
     }
   }
 
   async load(): Promise<ProjectKnowledge> {
-    await this.#assertContained();
+    await this.#ensureDirectory();
     const entries: ProjectKnowledgeEntry[] = [];
     for (const category of categories) {
       const path = join(this.directory, filename(category));
-      try {
-        if ((await lstat(path)).isSymbolicLink()) throw new InfrastructureError("METADATA_INVALID", `Project knowledge file must not be a symbolic link: ${path}`);
-      } catch (error) { if (!isMissingFile(error)) throw error; }
-      const contents = await readBoundedFile(path);
+      const contents = await readBoundedFile(this.#root, path);
       if (contents === null) continue;
       entries.push(...parseFile(category, path, contents));
     }
@@ -122,7 +119,8 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
   }
 
   async append(proposals: readonly ProjectKnowledgeEntry[]): Promise<ProjectKnowledge> {
-    const operation = this.#appendQueue.then(() => this.#append(proposals));
+    const operation = this.#appendQueue.then(async () =>
+      await withRepositoryLock(this.#root, async () => await this.#append(proposals)));
     this.#appendQueue = operation.then(() => undefined, () => undefined);
     return operation;
   }
@@ -133,7 +131,7 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
     const merged = [...new Map([...current.entries, ...parsed].map((entry) => [projectKnowledgeKey(entry), entry])).values()];
     if (categories.some((category) => merged.filter((entry) => entry.category === category).length > MAX_ENTRIES)) throw new InfrastructureError("METADATA_WRITE_FAILED", "Project knowledge exceeds bounded entry count");
     if (merged.length === current.entries.length) return current;
-    await this.#assertContained();
+    await this.#ensureDirectory();
     const temporaryPaths = new Set<string>();
     const replacements: Array<{
       path: string;
@@ -142,28 +140,24 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
     }> = [];
     const replaced: typeof replacements = [];
     try {
-      await mkdir(this.directory, { recursive: true });
       for (const category of categories) {
         const path = join(this.directory, filename(category));
-        try {
-          if ((await lstat(path)).isSymbolicLink()) throw new InfrastructureError("METADATA_INVALID", `Project knowledge file must not be a symbolic link: ${path}`);
-        } catch (error) { if (!isMissingFile(error)) throw error; }
-        const original = await readBoundedFile(path);
+        const original = await readBoundedFile(this.#root, path);
         const contents = renderFile(category, merged.filter((entry) => entry.category === category));
         if (original === contents) continue;
         const temporary = join(this.directory, `.${basename(path)}.${randomUUID()}.tmp`);
         temporaryPaths.add(temporary);
-        await writeFile(temporary, contents, { flag: "wx" });
-        const written = await readFile(temporary, "utf8");
+        await writePrivateTemporary(this.#root, temporary, contents);
+        const written = await readBoundedFile(this.#root, temporary);
+        if (written === null) throw new Error(`Temporary project knowledge disappeared at ${temporary}`);
         parseFile(category, temporary, written);
         if (written !== contents) throw new Error(`Could not validate temporary project knowledge at ${temporary}`);
         replacements.push({ path, temporary, original });
       }
       for (const replacement of replacements) {
-        try {
-          if ((await lstat(replacement.path)).isSymbolicLink()) throw new InfrastructureError("METADATA_INVALID", `Project knowledge file must not be a symbolic link: ${replacement.path}`);
-        } catch (error) { if (!isMissingFile(error)) throw error; }
+        await validatePrivateMetadataFile(this.#root, replacement.path);
         await this.#rename(replacement.temporary, replacement.path);
+        await validatePrivateMetadataFile(this.#root, replacement.path);
         temporaryPaths.delete(replacement.temporary);
         replaced.push(replacement);
       }
@@ -177,7 +171,7 @@ export class ProjectKnowledgeStore implements ProjectKnowledgeStoreBoundary {
           }
           const rollback = join(this.directory, `.${basename(replacement.path)}.${randomUUID()}.tmp`);
           temporaryPaths.add(rollback);
-          await writeFile(rollback, replacement.original, { flag: "wx" });
+          await writePrivateTemporary(this.#root, rollback, replacement.original);
           await this.#rename(rollback, replacement.path);
           temporaryPaths.delete(rollback);
         } catch (error) {

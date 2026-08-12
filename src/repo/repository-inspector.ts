@@ -3,6 +3,7 @@ import { basename, join, relative, resolve, sep } from "node:path";
 
 import type { ProjectMetadata, RepoContext } from "../domain/index.js";
 import { InfrastructureError, runCommand } from "../process/index.js";
+import { safeRepositoryFileExists } from "./safe-repository-file.js";
 
 const INSTRUCTION_FILE_NAMES = ["AGENTS.md", "CLAUDE.md", "CODEX.md"] as const;
 
@@ -142,7 +143,7 @@ async function findInstructionFiles(
     join(rootPath, ".github", "copilot-instructions.md"),
   ];
   const present = await Promise.all(
-    candidates.map(async (path) => ((await exists(path)) ? path : null)),
+    candidates.map(async (path) => ((await safeRepositoryFileExists(rootPath, path)) ? path : null)),
   );
   return present.filter((path): path is string => path !== null);
 }

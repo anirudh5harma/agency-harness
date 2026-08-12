@@ -242,6 +242,88 @@ function createBoundary(options: {
 }
 
 describe("PiCodingRuntime", () => {
+  it("bounds a provider prompt that never settles", async () => {
+    const boundary = createBoundary({
+      executorPrompt: async () => await new Promise<void>(() => {}),
+    });
+    const runtime = await PiCodingRuntime.create({
+      sdk: boundary.sdk,
+      promptTimeoutMs: 10,
+      abortTimeoutMs: 10,
+    });
+
+    await expect(
+      runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-timeout" }),
+    ).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "PI_REQUEST_TIMED_OUT",
+      message: "Pi execution request exceeded its deadline",
+    });
+  });
+
+  it("preserves a typed deadline failure for a planner that never settles", async () => {
+    const boundary = createBoundary({
+      plannerPrompt: async () => await new Promise<void>(() => {}),
+    });
+    const runtime = await PiCodingRuntime.create({
+      sdk: boundary.sdk,
+      promptTimeoutMs: 10,
+      abortTimeoutMs: 10,
+    });
+
+    await expect(runtime.createPlan({ intent: "Plan", repo })).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "PI_REQUEST_TIMED_OUT",
+      message: "Pi planning request exceeded its deadline",
+    });
+  });
+
+  it("bounds public abort when an SDK session never acknowledges cancellation", async () => {
+    const boundary = createBoundary({});
+    const runtime = await PiCodingRuntime.create({
+      sdk: boundary.sdk,
+      abortTimeoutMs: 10,
+    });
+    await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-abort-timeout" });
+    boundary.sessions[0]!.abort.mockImplementation(async () => await new Promise<void>(() => {}));
+
+    await expect(runtime.abort()).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "PI_SESSION_ABORT_FAILED",
+      message: "Pi session abort exceeded its deadline",
+    });
+    expect(boundary.sessions[0]?.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("preserves AbortSignal cancellation when both prompt and SDK abort never settle", async () => {
+    const controller = new AbortController();
+    const boundary = createBoundary({
+      executorPrompt: async () => {
+        controller.abort();
+        await new Promise<void>(() => {});
+      },
+      createSession: async (_options, createDefault) => {
+        const created = await createDefault();
+        created.session.abort.mockImplementation(async () => await new Promise<void>(() => {}));
+        return created;
+      },
+    });
+    const runtime = await PiCodingRuntime.create({
+      sdk: boundary.sdk,
+      promptTimeoutMs: 1_000,
+      abortTimeoutMs: 10,
+    });
+
+    await expect(runtime.execute({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-cancel-timeout",
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(boundary.sessions[0]?.dispose).toHaveBeenCalledOnce();
+  });
+
   it("captures validated knowledge proposals without writing and labels bounded prompt context", async () => {
     const boundary = createBoundary({
       executorPrompt: async (_session, prompt) => {
@@ -388,6 +470,7 @@ describe("PiCodingRuntime", () => {
   });
 
   it("scopes consequential shell approval to the exact command for one use", async () => {
+    const testRepo = { ...repo, rootPath: process.cwd() };
     const command = "rm -rf build";
     const action = bashApprovalAction(["rm", "-rf", "build"]);
     let prompts = 0;
@@ -433,12 +516,12 @@ describe("PiCodingRuntime", () => {
       },
     });
     const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
-    const paused = await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-1" });
+    const paused = await runtime.execute({ intent: "Build", repo: testRepo, plan, sessionId: "agency-1" });
     const request = (paused as { decisionRequest: import("../../src/domain/index.js").HumanDecisionRequest }).decisionRequest;
 
     await runtime.execute({
       intent: "Build",
-      repo,
+      repo: testRepo,
       plan,
       sessionId: "agency-1",
       humanDecision: {
@@ -453,7 +536,7 @@ describe("PiCodingRuntime", () => {
 
     await runtime.execute({
       intent: "Build",
-      repo,
+      repo: testRepo,
       plan,
       sessionId: "agency-1",
       humanDecision: {
@@ -760,9 +843,10 @@ describe("PiCodingRuntime", () => {
   });
 
   it("blocks repository-publishing git commands at the bash tool boundary", async () => {
+    const testRepo = { ...repo, rootPath: process.cwd() };
     const boundary = createBoundary({});
     const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
-    await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-1" });
+    await runtime.execute({ intent: "Build", repo: testRepo, plan, sessionId: "agency-1" });
     const bash = boundary.sessionOptions[0]?.customTools?.find((tool) => tool.name === "bash");
     expect(bash).toBeDefined();
 
@@ -794,7 +878,7 @@ describe("PiCodingRuntime", () => {
     }
 
     await expect(invoke("npm run test")).resolves.toBeDefined();
-    await expect(invoke("git diff -- src/coding/runtime.ts")).resolves.toBeDefined();
+    await expect(invoke("git diff -- src/coding/tool-policy.ts")).resolves.toBeDefined();
 
     for (const destructive of ["rm -rf build", "rm -fr build", "rm --recursive build"]) {
       await expect(invoke(destructive), destructive).rejects.toThrow("one-shot approval");

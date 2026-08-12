@@ -34,13 +34,25 @@ export async function runAgency(
   dependencies: AgencyApplicationDependencies,
 ): Promise<void> {
   let application: AgencyApplication | undefined;
+  let primaryError: unknown;
+  let cleanupError: unknown;
   try {
     application = await AgencyApplication.create(dependencies);
     await application.run();
-  } finally {
+  } catch (error) {
+    primaryError = error;
+  }
+  try {
     if (application === undefined) dependencies.io.close();
     else await application.dispose();
+  } catch (error) {
+    cleanupError = error;
   }
+  if (primaryError !== undefined && cleanupError !== undefined) {
+    throw new AggregateError([primaryError, cleanupError], "Agency run and cleanup failed");
+  }
+  if (primaryError !== undefined) throw primaryError;
+  if (cleanupError !== undefined) throw cleanupError;
 }
 
 export interface CliArguments {

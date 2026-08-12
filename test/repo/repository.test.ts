@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -140,6 +140,20 @@ describe("repository inspection", () => {
       join(await realpath(root), "AGENTS.md"),
     ]);
     expect(inspection.porcelain).toContain("?? AGENTS.md");
+  });
+
+  it("rejects unsafe repository instruction files", async () => {
+    const root = await initializedRepository();
+    const outside = await temporaryDirectory();
+    const external = join(outside, "instructions.md");
+    await writeFile(external, "untrusted instructions\n");
+
+    await symlink(external, join(root, "AGENTS.md"));
+    await expect(inspectRepository(root)).rejects.toMatchObject({ code: "METADATA_READ_FAILED" });
+    await rm(join(root, "AGENTS.md"));
+
+    await link(external, join(root, "AGENTS.md"));
+    await expect(inspectRepository(root)).rejects.toMatchObject({ code: "METADATA_READ_FAILED" });
   });
 
   it("treats a missing package manifest as absent", async () => {

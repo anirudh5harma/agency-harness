@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { z } from "zod";
@@ -13,7 +13,10 @@ export type MissionKind = z.infer<typeof MissionKindSchema>;
 const RunIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u);
 const CountSchema = z.number().int().nonnegative().max(1_000_000);
 const DurationSchema = z.number().finite().nonnegative().max(31_536_000_000);
-const MAX_DIRECTORY_ENTRIES = 1_000;
+// Valid Agency-owned records are retained by recency. Unknown and unsafe entries
+// are never removed, and reads cap filesystem work even if those entries accumulate.
+const MAX_RETAINED_EVALUATIONS = 1_000;
+const MAX_JSON_DIRECTORY_ENTRIES = 10_000;
 const MAX_EVALUATION_BYTES = 64 * 1024;
 const MAX_CORRUPT_ALLOWANCE = 100;
 const FILE_CONCURRENCY = 8;
@@ -100,6 +103,7 @@ export class EvaluationStore implements EvaluationRepository {
         throw new InfrastructureError("METADATA_WRITE_FAILED", "Evaluation target changed during write");
       }
       await rename(temporary, target);
+      await this.#pruneOwnedEvaluations(directory, parsed.runId);
     } catch (cause) {
       if (cause instanceof InfrastructureError) throw cause;
       throw new InfrastructureError("METADATA_WRITE_FAILED", `Could not write evaluation ${parsed.runId}`, { cause });
@@ -121,10 +125,13 @@ export class EvaluationStore implements EvaluationRepository {
       throw error;
     }
     const entries = await readdir(directory, { withFileTypes: true });
-    if (entries.length > MAX_DIRECTORY_ENTRIES) {
-      throw new InfrastructureError("METADATA_READ_FAILED", `Evaluation directory exceeds ${MAX_DIRECTORY_ENTRIES} entries`);
-    }
     const jsonEntries = entries.filter(({ name }) => name.endsWith(".json"));
+    if (jsonEntries.length > MAX_JSON_DIRECTORY_ENTRIES) {
+      throw new InfrastructureError(
+        "METADATA_READ_FAILED",
+        `Evaluation directory exceeds ${MAX_JSON_DIRECTORY_ENTRIES} JSON entries`,
+      );
+    }
     let corruptCount = jsonEntries.filter((entry) => !entry.isFile()).length;
     const regular = jsonEntries.filter((entry) => entry.isFile());
     const dated: Array<{ name: string; modifiedAt: number }> = [];
@@ -164,6 +171,67 @@ export class EvaluationStore implements EvaluationRepository {
     return { evaluations, corruptCount };
   }
 
+  async #pruneOwnedEvaluations(directory: string, currentRunId: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    const possibleOwned = entries.filter((entry) =>
+      entry.isFile() && entry.name.endsWith(".json") &&
+      RunIdSchema.safeParse(entry.name.slice(0, -".json".length)).success);
+    if (possibleOwned.length <= MAX_RETAINED_EVALUATIONS) return;
+    const candidates: Array<{
+      path: string;
+      runId: string;
+      modifiedAt: number;
+      dev: bigint;
+      ino: bigint;
+    }> = [];
+    for (let offset = 0; offset < possibleOwned.length; offset += FILE_CONCURRENCY) {
+      const batch = possibleOwned.slice(offset, offset + FILE_CONCURRENCY);
+      const validated = await Promise.all(batch.map(async (entry) => {
+        const runId = entry.name.slice(0, -".json".length);
+        const path = join(directory, entry.name);
+        try {
+          const record = await this.#readEvaluationRecord(path);
+          if (record.evaluation.runId !== runId) return null;
+          return { path, runId, ...record };
+        } catch {
+          // Corrupt or concurrently changed files are not known to be Agency-owned.
+          return null;
+        }
+      }));
+      for (const record of validated) {
+        if (record === null) continue;
+        const { path, runId, modifiedAt, dev, ino } = record;
+        candidates.push({ path, runId, modifiedAt, dev, ino });
+      }
+    }
+    candidates.sort((left, right) => {
+      if (left.runId === currentRunId && right.runId !== currentRunId) return 1;
+      if (right.runId === currentRunId && left.runId !== currentRunId) return -1;
+      return left.modifiedAt - right.modifiedAt || left.path.localeCompare(right.path);
+    });
+    const excess = candidates.length - MAX_RETAINED_EVALUATIONS;
+    for (const candidate of candidates.slice(0, Math.max(0, excess))) {
+      const quarantine = join(directory, `.prune-${randomUUID()}.tmp`);
+      try {
+        await rename(candidate.path, quarantine);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      const moved = await lstat(quarantine, { bigint: true });
+      if (!moved.isFile() || moved.isSymbolicLink() || moved.nlink !== 1n ||
+        moved.dev !== candidate.dev || moved.ino !== candidate.ino) {
+        // Restore without overwriting a concurrently published path. If that path
+        // now exists, preserve the quarantined entry rather than deleting it.
+        await link(quarantine, candidate.path)
+          .then(async () => unlink(quarantine))
+          .catch(() => undefined);
+        continue;
+      }
+      await unlink(quarantine);
+    }
+  }
+
   async #validatedDirectory(create = true): Promise<string> {
     const canonicalRoot = await realpath(this.#projectRoot);
     const rootInfo = await lstat(canonicalRoot);
@@ -197,15 +265,34 @@ export class EvaluationStore implements EvaluationRepository {
   }
 
   async #readEvaluation(path: string): Promise<RunEvaluation> {
+    return (await this.#readEvaluationRecord(path)).evaluation;
+  }
+
+  async #readEvaluationRecord(path: string): Promise<{
+    evaluation: RunEvaluation;
+    modifiedAt: number;
+    dev: bigint;
+    ino: bigint;
+  }> {
     let handle;
     try {
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const info = await handle.stat();
-      if (!info.isFile() || info.nlink !== 1 || info.size > MAX_EVALUATION_BYTES) {
+      const before = await handle.stat({ bigint: true });
+      if (!before.isFile() || before.nlink !== 1n || before.size > BigInt(MAX_EVALUATION_BYTES)) {
         throw new InfrastructureError("METADATA_INVALID", "Evaluation file is not a bounded regular file");
       }
       const content = await handle.readFile("utf8");
-      return RunEvaluationSchema.parse(JSON.parse(content));
+      const after = await handle.stat({ bigint: true });
+      if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
+        before.mtimeNs !== after.mtimeNs) {
+        throw new InfrastructureError("METADATA_READ_FAILED", "Evaluation file changed while being read");
+      }
+      return {
+        evaluation: RunEvaluationSchema.parse(JSON.parse(content)),
+        modifiedAt: Number(before.mtimeMs),
+        dev: before.dev,
+        ino: before.ino,
+      };
     } catch (cause) {
       if (cause instanceof InfrastructureError) throw cause;
       throw new InfrastructureError("METADATA_INVALID", `Invalid evaluation metadata at ${path}`, { cause });

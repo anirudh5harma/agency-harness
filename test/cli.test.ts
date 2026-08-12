@@ -202,6 +202,69 @@ describe("Agency terminal application", () => {
     expect(disposeRenderer).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves the startup failure and closes every resource when runtime disposal rejects", async () => {
+    const cwd = await temporaryGitProject();
+    const io = new ScriptedIO([]);
+    const closeCheckpoint = vi.fn();
+    const renderer = new PlainTerminalRenderer(new BufferOutput(), new BufferOutput());
+    const disposeRenderer = vi.spyOn(renderer, "dispose");
+    const runtime = new FakeCodingRuntime();
+    runtime.dispose = vi.fn(async () => { throw new Error("runtime cleanup failed"); });
+
+    const startup = runAgency({
+      cwd,
+      io,
+      output: new BufferOutput(),
+      errorOutput: new BufferOutput(),
+      rendererFactory: () => renderer,
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread: async () => {},
+        close: closeCheckpoint,
+      }),
+      runtimeFactory: async () => runtime,
+      graphFactory: () => { throw new Error("graph initialization failed"); },
+    });
+
+    await expect(startup).rejects.toThrow("graph initialization failed");
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(closeCheckpoint).toHaveBeenCalledTimes(1);
+    expect(disposeRenderer).toHaveBeenCalledTimes(1);
+    expect(io.closeCalls).toBe(1);
+  });
+
+  it("closes every application resource when runtime disposal rejects", async () => {
+    const cwd = await temporaryGitProject();
+    const io = new ScriptedIO(["/exit"]);
+    const closeCheckpoint = vi.fn();
+    const renderer = new PlainTerminalRenderer(new BufferOutput(), new BufferOutput());
+    const disposeRenderer = vi.spyOn(renderer, "dispose");
+    const runtime = new FakeCodingRuntime();
+    runtime.dispose = vi.fn(async () => { throw new Error("runtime cleanup failed"); });
+
+    await expect(runAgency({
+      cwd,
+      io,
+      output: new BufferOutput(),
+      errorOutput: new BufferOutput(),
+      rendererFactory: () => renderer,
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread: async () => {},
+        close: closeCheckpoint,
+      }),
+      runtimeFactory: async () => runtime,
+      graphFactory: () => ({ invoke: vi.fn(), getState: vi.fn(), resume: vi.fn() }),
+      registryFactory: () => ({ list: async () => [], upsert: async () => {}, updateStatus: async () => {} }),
+    })).rejects.toThrow("runtime cleanup failed");
+
+    expect(io.closeCalls).toBe(1);
+    expect(closeCheckpoint).toHaveBeenCalledTimes(1);
+    expect(disposeRenderer).toHaveBeenCalledTimes(1);
+  });
+
   it("uses SIGINT to close an idle REPL", async () => {
     let interrupt: (() => void) | undefined;
     let finishRead: (() => void) | undefined;
@@ -555,6 +618,7 @@ describe("Agency terminal application", () => {
       expect.any(Object),
     );
     expect(output.value).toContain("[a] Approve");
+    expect(output.value).toContain("Exact action: npx prisma migrate deploy");
     expect(output.value).toContain("Done: migration guidance applied");
   });
 
