@@ -132,7 +132,13 @@ describe("runCommand", () => {
       cwd: process.cwd(),
     });
 
-    expect(success).toMatchObject({ exitCode: 0, stdout: "ok", timedOut: false });
+    expect(success).toMatchObject({
+      exitCode: 0,
+      stdout: "ok",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      timedOut: false,
+    });
     expect(success.durationMs).toBeGreaterThanOrEqual(0);
     expect(failure).toMatchObject({ exitCode: 7, stderr: "bad", timedOut: false });
   });
@@ -213,6 +219,29 @@ describe("runCommand", () => {
     expect(result.stdout).toContain("BEGIN-");
     expect(result.stdout).toContain("-TAIL");
     expect(result.stdout).toContain("output truncated");
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result.stderrTruncated).toBe(false);
+  });
+
+  it("reports truncated NUL-delimited output without exposing a complete-looking listing", async () => {
+    const longPath = `${"directory/".repeat(20)}file.ts\0`;
+    const result = await runCommand({
+      command: process.execPath,
+      args: ["-e", `process.stdout.write(${JSON.stringify(longPath)}.repeat(10_000))`],
+      cwd: process.cwd(),
+      maxOutputBytes: 8 * 1024 * 1024,
+    });
+
+    expect(result.stdoutTruncated).toBe(false);
+
+    const truncated = await runCommand({
+      command: process.execPath,
+      args: ["-e", `process.stdout.write(${JSON.stringify(longPath)}.repeat(50_000))`],
+      cwd: process.cwd(),
+      maxOutputBytes: 8 * 1024 * 1024,
+    });
+    expect(truncated.stdoutTruncated).toBe(true);
+    expect(truncated.stdout).toContain("output truncated");
   });
 
   it("preserves the exact head and tail across many small chunks", async () => {

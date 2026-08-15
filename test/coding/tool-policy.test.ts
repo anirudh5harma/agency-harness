@@ -15,6 +15,7 @@ import {
   createProtectedBashTool,
   createRoleFileTools,
   defaultToolFactoryBoundary,
+  parseGitVisibleSearchFileList,
 } from "../../src/coding/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -130,6 +131,28 @@ describe("Agency tool policy", () => {
       .rejects.toMatchObject({ name: "AbortError" });
   });
 
+  it("rejects truncated Git search listings before parsing NUL paths", () => {
+    expect(() => parseGitVisibleSearchFileList({
+      stdout: "src/first.ts\0\n… output truncated …\0src/last.ts\0",
+      stdoutTruncated: true,
+    })).toThrow("search listing byte limit");
+  });
+
+  it("caps aggregate grep bytes and omits matches after the cap", async () => {
+    const { root } = await fixture();
+    const chunk = Buffer.alloc(1024 * 1024, 97);
+    for (let index = 0; index < 32; index += 1) {
+      await writeFile(join(root, `cap-${String(index).padStart(2, "0")}.txt`), chunk);
+    }
+    await writeFile(join(root, "z-after-cap.txt"), "needle-after-cap\n");
+    const grep = createRoleFileTools({ root, role: "planner" }).find(({ name }) => name === "grep")!;
+
+    const result = await invoke(grep, { path: ".", pattern: "needle-after-cap", literal: true });
+
+    expect(result.content).toEqual([{ type: "text", text: "No matches found" }]);
+    expect(result.details).toEqual({ searchByteLimitReached: 32 * 1024 * 1024 });
+  });
+
   it("honors Git ignore rules during search", async () => {
     const { root } = await fixture();
     await writeFile(join(root, ".gitignore"), "custom-generated/\n");
@@ -216,14 +239,16 @@ describe("Agency tool policy", () => {
     const edit = tools.find(({ name }) => name === "edit")!;
     const write = tools.find(({ name }) => name === "write")!;
     const blocked = [
-      invoke(write, { path: "package-lock.json", content: "{\"lockfileVersion\":3}\n" }),
-      invoke(edit, { path: "package-lock.json", edits: [{ oldText: "{}", newText: "{\"lockfileVersion\":3}" }] }),
-      invoke(write, { path: "prisma/migrations/001.sql", content: "drop table users;\n" }),
-      invoke(edit, { path: "prisma/migrations/001.sql", edits: [{ oldText: "select 1", newText: "drop table users" }] }),
-      invoke(write, { path: "package.json", content: JSON.stringify({ name: "safe", dependencies: { zod: "2.0.0" } }) }),
-      invoke(edit, { path: "package.json", edits: [{ oldText: '"zod": "1.0.0"', newText: '"zod": "2.0.0"' }] }),
+      () => invoke(write, { path: "package-lock.json", content: "{\"lockfileVersion\":3}\n" }),
+      () => invoke(edit, { path: "package-lock.json", edits: [{ oldText: "{}", newText: "{\"lockfileVersion\":3}" }] }),
+      () => invoke(write, { path: "prisma/migrations/001.sql", content: "drop table users;\n" }),
+      () => invoke(edit, { path: "prisma/migrations/001.sql", edits: [{ oldText: "select 1", newText: "drop table users" }] }),
+      () => invoke(write, { path: "package.json", content: JSON.stringify({ name: "safe", dependencies: { zod: "2.0.0" } }) }),
+      () => invoke(edit, { path: "package.json", edits: [{ oldText: '"zod": "1.0.0"', newText: '"zod": "2.0.0"' }] }),
     ];
-    for (const result of blocked) await expect(result).rejects.toThrow("Agency policy blocks this operation");
+    for (const operation of blocked) {
+      await expect(operation()).rejects.toThrow("Agency policy blocks this operation");
+    }
     expect(consumeApproval).not.toHaveBeenCalled();
   });
 

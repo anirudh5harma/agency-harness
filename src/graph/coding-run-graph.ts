@@ -110,6 +110,8 @@ const BoundedVerificationSchema = z.strictObject({
         signal: z.string().trim().min(1).max(100).nullable(),
         stdout: TextSchema,
         stderr: TextSchema,
+        stdoutTruncated: z.boolean().optional(),
+        stderrTruncated: z.boolean().optional(),
         durationMs: z.number().finite().nonnegative(),
         timedOut: z.boolean(),
       }),

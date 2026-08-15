@@ -138,6 +138,7 @@ export interface AgencyApplicationDependencies {
     requestDiscard(signal: AbortSignal): Promise<boolean>;
   };
   createId?: () => string;
+  onPromptReady?: () => void;
 }
 
 export class AgencyApplication implements ReplHandler {
@@ -154,6 +155,7 @@ export class AgencyApplication implements ReplHandler {
   readonly #createId: () => string;
   readonly #gitCheckpoints: GitCheckpointManager;
   readonly #evaluationStore: EvaluationRepository;
+  readonly #onPromptReady: () => void;
   readonly #detachMutationTracking: () => void;
   #activeMutationRunId: string | null = null;
   #mutationWrites: Promise<void> = Promise.resolve();
@@ -186,6 +188,7 @@ export class AgencyApplication implements ReplHandler {
     this.#inspectRecovery =
       input.dependencies.inspectRecovery ?? inspectIncompleteRunRecovery;
     this.#createId = input.dependencies.createId ?? randomUUID;
+    this.#onPromptReady = input.dependencies.onPromptReady ?? (() => {});
     this.#gitCheckpoints = new GitCheckpointManager(input.inspection.rootPath);
     this.#evaluationStore = input.evaluationStore;
     this.#detachMutationTracking = input.eventBus.subscribe("file_changed", ({ path }) => {
@@ -308,7 +311,7 @@ export class AgencyApplication implements ReplHandler {
   async run(): Promise<void> {
     this.#renderer.header(this.#inspection, this.#session);
     await this.#offerRecovery();
-    await new AgencyRepl(this.#io, this).run();
+    await new AgencyRepl(this.#io, this, "agency> ", this.#onPromptReady).run();
   }
 
   async handle(line: string, signal: AbortSignal): Promise<"continue" | "exit"> {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { resolve } from "node:path";
-import { realpathSync } from "node:fs";
+import { realpathSync, writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { AgencyApplication, type AgencyApplicationDependencies } from "./application.js";
@@ -160,6 +160,9 @@ export async function main(args: readonly string[] = process.argv.slice(2)): Pro
     io,
     output: process.stdout,
     errorOutput: process.stderr,
+    ...(process.env.AGENCY_ACCEPTANCE_PROMPT_READY_FD === "3"
+      ? { onPromptReady: () => writeSync(3, "agency-prompt-ready\n") }
+      : {}),
     ...(worktree === undefined ? {} : { worktree }),
   });
   if (context !== undefined && discard !== undefined) {

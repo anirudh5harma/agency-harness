@@ -4,11 +4,31 @@ import { describe, expect, it } from "vitest";
 // @ts-expect-error importing its exported diagnostic seam is safe for this focused test.
 import {
   boundedAgencyDiagnostic,
+  createPromptReadyInputDriver,
   postRunDiagnostic,
   validateAgencyTranscript,
 } from "../../scripts/acceptance/real-pi-divide.mjs";
 
 describe("real-Pi acceptance diagnostics", () => {
+  it("sends input only for the out-of-band prompt-ready signal", () => {
+    const writes: string[] = [];
+    let ended = "";
+    const driver = createPromptReadyInputDriver(["first", "second"], {
+      write: (value: string) => writes.push(value),
+      end: (value: string) => { ended = value; },
+    });
+
+    const streamedAssistantText = "I can print literal agency> text without requesting input.";
+    expect(streamedAssistantText).toContain("agency> ");
+    expect(writes).toEqual([]);
+    driver.accept("agency-prompt-");
+    expect(writes).toEqual([]);
+    driver.accept("ready\nagency-prompt-ready\n");
+
+    expect(writes).toEqual(["first\n"]);
+    expect(ended).toBe("second\n");
+  });
+
   it("reports all transcript failures in one bounded and sanitized diagnostic", () => {
     const result = {
       stdout: `${"old output\n".repeat(1_000)}Done: first\nStatus: failed\n`,

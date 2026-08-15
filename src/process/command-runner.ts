@@ -73,6 +73,10 @@ class BoundedOutput {
     }
   }
 
+  get truncated(): boolean {
+    return this.#totalBytes > this.limit;
+  }
+
   toString(): string {
     const head = Buffer.concat(this.#head, this.#headBytes);
     if (this.#totalBytes <= this.#headLimit) return head.toString("utf8");
@@ -375,6 +379,8 @@ export async function runCommandWithDependencies(
         signal,
         stdout: stdout.toString(),
         stderr: stderr.toString(),
+        stdoutTruncated: stdout.truncated,
+        stderrTruncated: stderr.truncated,
         durationMs: performance.now() - startedAt,
         timedOut,
       });

@@ -60,6 +60,7 @@ const MAX_INTERNAL_READ_BYTES = 16 * 1024 * 1024;
 const MAX_SEARCH_DEPTH = 32;
 const MAX_SEARCH_FILES = 20_000;
 const MAX_SEARCH_ENTRIES = 40_000;
+const MAX_SEARCH_LIST_BYTES = 8 * 1024 * 1024;
 const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_TOTAL_BYTES = 32 * 1024 * 1024;
 const activeMutationSignal = new AsyncLocalStorage<AbortSignal | undefined>();
@@ -311,6 +312,17 @@ function assertSearchDoesNotTargetPrivate(params: unknown, includePattern: boole
 
 interface SearchFile { path: string; size: number }
 
+/** @internal Exported for deterministic policy-boundary tests. */
+export function parseGitVisibleSearchFileList(listed: {
+  stdout: string;
+  stdoutTruncated?: boolean | undefined;
+}): string[] {
+  if (listed.stdoutTruncated === true) {
+    throw policyError(`search listing byte limit is ${MAX_SEARCH_LIST_BYTES}`);
+  }
+  return listed.stdout.split("\0").filter(Boolean).sort();
+}
+
 async function safeSearchFiles(
   root: string,
   input: string,
@@ -328,12 +340,12 @@ async function safeSearchFiles(
     args: ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", relativeSearchRoot === "" ? "." : relativeSearchRoot],
     cwd: canonicalRoot,
     timeoutMs: 10_000,
-    maxOutputBytes: 8 * 1024 * 1024,
+    maxOutputBytes: MAX_SEARCH_LIST_BYTES,
     ...(signal === undefined ? {} : { signal }),
   });
   if (listed.exitCode !== 0) throw policyError("could not enumerate Git-visible search files");
   const files: SearchFile[] = [];
-  const candidates = listed.stdout.split("\0").filter(Boolean).sort();
+  const candidates = parseGitVisibleSearchFileList(listed);
   if (candidates.length > MAX_SEARCH_ENTRIES) throw policyError(`search entry limit is ${MAX_SEARCH_ENTRIES}`);
   for (const candidate of candidates) {
     assertNotAborted(signal, "Search aborted");

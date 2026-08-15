@@ -186,6 +186,8 @@ export const CommandResultSchema = z.strictObject({
   signal: NonEmptyStringSchema.nullable().default(null),
   stdout: z.string(),
   stderr: z.string(),
+  stdoutTruncated: z.boolean().optional(),
+  stderrTruncated: z.boolean().optional(),
   durationMs: z.number().finite().nonnegative(),
   timedOut: z.boolean().default(false),
 });

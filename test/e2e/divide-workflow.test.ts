@@ -5,13 +5,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { runAgency, type TerminalIO, type TextOutput } from "../../src/cli/index.js";
 import { FakeCodingRuntime } from "../../src/coding/index.js";
 import type { Plan } from "../../src/domain/index.js";
 import { EventBus } from "../../src/events/index.js";
+import { createCheckpointPersistence } from "../../src/persistence/index.js";
 
 const execFileAsync = promisify(execFile);
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -251,14 +251,13 @@ describe("divide fixture end to end", () => {
       expect(trajectory).toContain('"event":"verification_passed"');
       expect(trajectory).toContain('"event":"run_completed"');
     }
-    const database = new DatabaseSync(join(cwd, ".devagency", "state.db"), { readOnly: true });
+    const checkpoint = await createCheckpointPersistence(cwd);
     try {
-      const checkpointCount = database.prepare("SELECT count(*) AS count FROM checkpoints").get() as {
-        count: number;
-      };
-      expect(checkpointCount.count).toBe(0);
+      const tuples = [];
+      for await (const tuple of checkpoint.checkpointer.list({ configurable: {} })) tuples.push(tuple);
+      expect(tuples).toEqual([]);
     } finally {
-      database.close();
+      checkpoint.close();
     }
   }, 30_000);
 });
