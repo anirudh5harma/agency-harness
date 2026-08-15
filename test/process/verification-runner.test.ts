@@ -88,6 +88,44 @@ describe("VerificationRunner", () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
+  it("redacts command output before returning a failed verification result", async () => {
+    const execute = vi.fn(async (command: VerificationCommand) => ({
+      ...result(command, 1),
+      stdout: "Bearer bearer-secret-value token=plain-token-value",
+      stderr: "AKIAIOSFODNN7EXAMPLE ghp_abcdefghijklmnopqrstuvwxyz123456",
+    }));
+    const runner = new VerificationRunner({ execute });
+
+    const verification = await runner.run(commands.slice(0, 1), process.cwd());
+
+    expect(JSON.stringify(verification)).not.toMatch(
+      /bearer-secret-value|plain-token-value|AKIAIOSFODNN7EXAMPLE|ghp_abcdefghijklmnopqrstuvwxyz123456/u,
+    );
+    expect(JSON.stringify(verification)).toContain("[REDACTED]");
+  });
+
+  it("runs verification with a minimal environment that excludes credentials", async () => {
+    const execute = vi.fn(async (command: VerificationCommand) => result(command, 0));
+    const runner = new VerificationRunner({
+      execute,
+      environment: {
+        PATH: "/safe/bin",
+        HOME: "/safe/home",
+        OPENAI_API_KEY: "sk-providerSecret123",
+        AWS_SECRET_ACCESS_KEY: "aws-secret-value",
+        GITHUB_TOKEN: "ghp_abcdefghijklmnopqrstuvwxyz123456",
+      },
+    });
+
+    await runner.run(commands.slice(0, 1), process.cwd());
+
+    const options = execute.mock.calls[0]?.[1];
+    expect(options?.env).toEqual({ PATH: "/safe/bin", HOME: "/safe/home" });
+    expect(options?.env).not.toHaveProperty("OPENAI_API_KEY");
+    expect(options?.env).not.toHaveProperty("AWS_SECRET_ACCESS_KEY");
+    expect(options?.env).not.toHaveProperty("GITHUB_TOKEN");
+  });
+
   it("propagates command spawn failures instead of reporting verification failure", async () => {
     const runner = new VerificationRunner();
 

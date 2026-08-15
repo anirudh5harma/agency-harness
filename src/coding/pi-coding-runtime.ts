@@ -548,7 +548,7 @@ function executorPrompt(input: ExecuteInput): string {
 
 function failureSummary(failure: FailureContext, changedFiles: string[]): string {
   return concise(
-    JSON.stringify({
+    redactSecrets(JSON.stringify({
       stage: failure.stage,
       message: failure.message,
       cause: failure.cause,
@@ -566,7 +566,7 @@ function failureSummary(failure: FailureContext, changedFiles: string[]): string
               stdout: concise(failure.command.stdout, 500),
               stderr: concise(failure.command.stderr, 500),
             },
-    }),
+    })),
     MAX_FAILURE_CHARS,
   );
 }

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { CommandResult, VerificationResult } from "../domain/index.js";
+import { redactSecrets, type CommandResult, type VerificationResult } from "../domain/index.js";
 import type { EventBus } from "../events/index.js";
 import { runCommand, type RunCommandOptions } from "./command-runner.js";
 import { InfrastructureError } from "./infrastructure-error.js";
@@ -28,11 +28,40 @@ export interface VerificationRunnerOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
   signal?: AbortSignal;
+  /** Source environment is always reduced to verification-safe compatibility keys. */
+  environment?: NodeJS.ProcessEnv;
 }
 
 interface PackageManifest {
   packageManager?: unknown;
   scripts?: unknown;
+}
+
+const VERIFICATION_ENVIRONMENT_KEYS = [
+  "PATH", "Path", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP",
+  "SystemRoot", "ComSpec", "PATHEXT", "WINDIR",
+  "LANG", "LC_ALL", "LC_CTYPE", "TZ", "NODE_ENV", "CI", "TERM", "FORCE_COLOR", "NO_COLOR",
+  "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+  "COREPACK_HOME", "PNPM_HOME", "BUN_INSTALL", "VOLTA_HOME",
+] as const;
+
+function verificationEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const key of VERIFICATION_ENVIRONMENT_KEYS) {
+    const value = source[key];
+    if (value !== undefined) environment[key] = value;
+  }
+  return environment;
+}
+
+function sanitizedCommandResult(result: CommandResult): CommandResult {
+  return {
+    ...result,
+    command: redactSecrets(result.command),
+    args: result.args.map(redactSecrets),
+    stdout: redactSecrets(result.stdout),
+    stderr: redactSecrets(result.stderr),
+  };
 }
 
 function packageRunner(packageManager: unknown): string {
@@ -89,6 +118,7 @@ export class VerificationRunner {
           args: command.args,
         }));
     this.#options = {
+      env: verificationEnvironment(options.environment ?? process.env),
       ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
       ...(options.maxOutputBytes === undefined
         ? {}
@@ -109,7 +139,9 @@ export class VerificationRunner {
     for (const command of commands) {
       const displayCommand = [command.command, ...command.args].join(" ");
       this.#eventBus?.emit({ type: "command_started", command: displayCommand });
-      const result = await this.#execute(command, { ...this.#options, cwd });
+      const result = sanitizedCommandResult(
+        await this.#execute(command, { ...this.#options, cwd }),
+      );
       results.push(result);
       this.#eventBus?.emit({
         type: "command_finished",

@@ -280,8 +280,12 @@ describe("coding run graph", () => {
       action: "npx prisma migrate deploy",
       options: [
         { id: "approve", label: "Approve", description: "Run this exact action once." },
-        { id: "reject", label: "Reject", description: "Cancel the migration." },
-        { id: "edit", label: "Edit", description: "Provide a different instruction." },
+        { id: "reject", label: "Reject", description: "Cancel this action." },
+        {
+          id: "edit",
+          label: "Edit",
+          description: "Provide different guidance; do not run the original action.",
+        },
       ],
       allowCustom: true,
     };
@@ -715,6 +719,149 @@ describe("coding run graph", () => {
     expect(state.attempt).toBe(1);
     expect(runtime.calls.repair).toHaveLength(1);
     expect(runtime.calls.repair[0]?.failure.recoverable).toBe(true);
+  });
+
+  it("remeasures and owns only newly visible paths created by verification", async () => {
+    const { root, runtime, deps } = await setup([]);
+    const bus = new EventBus();
+    const ownedPaths: string[] = [];
+    bus.subscribe("file_changed", ({ path }) => ownedPaths.push(path));
+    deps.eventBus = bus;
+    deps.runVerification = vi.fn(async () => {
+      await writeFile(join(root, "verification-output.txt"), "generated\n");
+      return verification("passed");
+    });
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("completed");
+    expect(state.changedFiles).toEqual(["verification-output.txt"]);
+    expect(ownedPaths).toEqual(["verification-output.txt"]);
+  });
+
+  it("remeasures a failed verification before routing its new path to repair", async () => {
+    const { root, runtime, deps } = await setup([]);
+    let verificationAttempt = 0;
+    deps.runVerification = vi.fn(async () => {
+      verificationAttempt += 1;
+      if (verificationAttempt === 1) {
+        await writeFile(join(root, "failed-verification.txt"), "failure artifact\n");
+        return verification("failed");
+      }
+      return verification("passed");
+    });
+    runtime.enqueueExecuteResult({ message: "broken", changedFiles: [], sessionId: "pi-1" });
+    runtime.enqueueRepairResult({ message: "fixed", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(runtime.calls.repair[0]?.changedFiles).toEqual(["failed-verification.txt"]);
+    expect(state.changedFiles).toEqual(["failed-verification.txt"]);
+    expect(state.status).toBe("completed");
+  });
+
+  it("does not claim verifier ownership of a path already dirty before verification", async () => {
+    const { root, runtime, deps } = await setup([]);
+    const bus = new EventBus();
+    const ownedPaths: string[] = [];
+    bus.subscribe("file_changed", ({ path }) => ownedPaths.push(path));
+    deps.eventBus = bus;
+    runtime.enqueueExecuteResult({ message: "dirty", changedFiles: [], sessionId: "pi-1" });
+    runtime.execute = async (executeInput) => {
+      const result = await FakeCodingRuntime.prototype.execute.call(runtime, executeInput);
+      await writeFile(join(root, "fixture.txt"), "executor value\n");
+      return result;
+    };
+    deps.runVerification = vi.fn(async () => {
+      await writeFile(join(root, "fixture.txt"), "verifier value\n");
+      return verification("passed");
+    });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.changedFiles).toEqual(["fixture.txt"]);
+    expect(ownedPaths).toEqual([]);
+  });
+
+  it("sanitizes failed verification output before state and repair input", async () => {
+    const { root, runtime, deps } = await setup([]);
+    const rawSecrets = [
+      "Bearer bearer-secret-value",
+      "sk-providerSecret123",
+      "token=plain-token-value",
+      "password=hunter2",
+      "AKIAIOSFODNN7EXAMPLE",
+      "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    ];
+    deps.runVerification = vi.fn(async () => ({
+      ...verification("failed"),
+      commands: [{
+        ...verification("failed").commands[0]!,
+        stdout: rawSecrets.join("\n"),
+        stderr: rawSecrets.join("\n"),
+      }],
+    }));
+    runtime.enqueueExecuteResult({ message: "broken", changedFiles: [], sessionId: "pi-1" });
+    runtime.enqueueRepairResult({ message: "fixed", changedFiles: [], sessionId: "pi-1" });
+    const persistence = await createSqliteCheckpointPersistence(root);
+
+    const state = await createCodingRunGraph(deps, {
+      checkpointer: persistence.checkpointer,
+    }).invoke(input(root));
+
+    const persistedBoundary = JSON.stringify({ verification: state.verification, repair: runtime.calls.repair[0] });
+    for (const secret of rawSecrets) expect(persistedBoundary).not.toContain(secret);
+    expect(persistedBoundary).toContain("[REDACTED]");
+    persistence.close();
+    const checkpointBytes = await readFile(persistence.path);
+    for (const secret of rawSecrets) {
+      expect(checkpointBytes.includes(Buffer.from(secret))).toBe(false);
+    }
+  });
+
+  it("sanitizes verifier infrastructure errors before checkpoint state", async () => {
+    const { root, runtime, deps } = await setup([]);
+    deps.runVerification = vi.fn(async () => {
+      throw new Error("verifier crashed with Bearer bearer-secret-value");
+    });
+    runtime.enqueueExecuteResult({ message: "ready", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.failure?.message).toContain("Bearer [REDACTED]");
+    expect(JSON.stringify(state)).not.toContain("bearer-secret-value");
+  });
+
+  it("fails a mission when verification creates a fourth changed path", async () => {
+    const { root, runtime, deps } = await setup([]);
+    runtime.enqueueExecuteResult({ message: "three files", changedFiles: [], sessionId: "pi-1" });
+    runtime.execute = async (executeInput) => {
+      const result = await FakeCodingRuntime.prototype.execute.call(runtime, executeInput);
+      await Promise.all(["one.txt", "two.txt", "three.txt"].map(async (path) =>
+        await writeFile(join(root, path), `${path}\n`)));
+      return result;
+    };
+    deps.runVerification = vi.fn(async () => {
+      await writeFile(join(root, "four.txt"), "four\n");
+      return verification("passed");
+    });
+    const writeEvaluation = vi.fn(async () => {});
+    deps.evaluationStore = { write: writeEvaluation };
+
+    const state = await createCodingRunGraph(deps).invoke({ ...input(root), missionKind: "tests" });
+
+    expect(state).toMatchObject({
+      status: "failed",
+      changedFiles: ["four.txt", "one.txt", "three.txt", "two.txt"],
+      failure: { stage: "verifying", recoverable: false },
+    });
+    expect(state.failure?.message).toContain("more than 3 files");
+    expect(runtime.calls.repair).toHaveLength(0);
+    expect(writeEvaluation).toHaveBeenCalledWith(expect.objectContaining({
+      success: false,
+      changedFileCount: 4,
+    }));
   });
 
   it("detects verification before model edits and reuses the immutable commands for every pass", async () => {

@@ -25,6 +25,7 @@ import {
   ProjectKnowledgeEntrySchema,
   ProjectKnowledgeSchema,
   RepoContextSchema,
+  redactSecrets,
   SessionContextSchema,
   type AgencyPhase,
   type FailureContext,
@@ -284,11 +285,11 @@ function infrastructureFailure(
   error: unknown,
 ): FailureContext {
   const cause = error instanceof Error && error.cause !== undefined
-    ? concise(String(error.cause), 2_000)
+    ? concise(redactSecrets(String(error.cause)), 2_000)
     : undefined;
   return {
     stage,
-    message: errorMessage(error),
+    message: redactSecrets(errorMessage(error)),
     ...(cause === undefined ? {} : { cause }),
     recoverable: false,
   };
@@ -297,11 +298,13 @@ function infrastructureFailure(
 function boundedVerification(result: VerificationResult): VerificationResult {
   return BoundedVerificationSchema.parse({
     ...result,
-    summary: concise(result.summary),
+    summary: concise(redactSecrets(result.summary)),
     commands: result.commands.slice(0, MAX_COMMANDS).map((command) => ({
       ...command,
-      stdout: concise(command.stdout),
-      stderr: concise(command.stderr),
+      command: redactSecrets(command.command),
+      args: command.args.map(redactSecrets),
+      stdout: concise(redactSecrets(command.stdout)),
+      stderr: concise(redactSecrets(command.stderr)),
     })),
   });
 }
@@ -503,6 +506,23 @@ export function createCodingRunGraph(
       .map(({ path }) => path)
       .filter((path) => !isInternalMetadataPath(path))
       .slice(0, MAX_CHANGED_FILES);
+  }
+
+  async function changedFilesAfterVerification(
+    baseline: GitBaseline,
+    beforeVerification: readonly string[],
+  ): Promise<string[]> {
+    const changedFiles = await actualChangedFiles(baseline);
+    const alreadyChanged = new Set(beforeVerification);
+    // Cooperative-process attribution: only paths that became Git-visible while
+    // Agency's verifier was running are eligible for undo ownership. Paths dirty
+    // beforehand stay unowned because concurrent user edits cannot be separated.
+    for (const path of changedFiles) {
+      if (!alreadyChanged.has(path)) {
+        dependencies.eventBus?.emit({ type: "file_changed", path });
+      }
+    }
+    return changedFiles;
   }
 
   function mergeKnowledge(
@@ -819,7 +839,9 @@ export function createCodingRunGraph(
     if (state.status === "failed") return {};
     const boundary = await enterPhase(state, "verifying", "verification");
     if (boundary.result.status === "failed") return boundary.result;
+    let beforeVerification: string[] | null = null;
     try {
+      if (state.baseline === null) throw new Error("Verification baseline is missing");
       const commands = state.verificationCommands.map((command) => ({
         ...command,
         args: [...command.args],
@@ -849,12 +871,17 @@ export function createCodingRunGraph(
           },
         };
       }
+      beforeVerification = await actualChangedFiles(state.baseline);
       const verification = boundedVerification(
         await runVerification(
           commands,
           state.repoPath,
           runtime.signal ?? new AbortController().signal,
         ),
+      );
+      const changedFiles = await changedFilesAfterVerification(
+        state.baseline,
+        beforeVerification,
       );
       const verificationMetrics = {
         verificationCommandCount: state.verificationCommandCount + verification.commands.length,
@@ -863,6 +890,21 @@ export function createCodingRunGraph(
           ...verification.commands.map(({ durationMs }) => durationMs),
         ].slice(0, MAX_COMMANDS * 21),
       };
+      if (state.missionKind !== null && changedFiles.length > 3) {
+        const message = "Mission changed more than 3 files; refusing successful completion";
+        await recordTrajectory(state, "verification_failed");
+        await recordTrajectory(state, "verification_completed", {
+          startedAt: boundary.startedAt,
+        });
+        return {
+          ...boundary.result,
+          ...verificationMetrics,
+          changedFiles,
+          verification,
+          status: "failed",
+          failure: { stage: "verifying", message, recoverable: false },
+        };
+      }
       if (verification.status !== "passed") {
         await recordTrajectory(state, "verification_failed");
         await recordTrajectory(state, "verification_completed", {
@@ -871,6 +913,7 @@ export function createCodingRunGraph(
         return {
           ...boundary.result,
           ...verificationMetrics,
+          changedFiles,
           verification,
           failure: {
             stage: "verifying",
@@ -886,9 +929,35 @@ export function createCodingRunGraph(
       await recordTrajectory(state, "verification_completed", {
         startedAt: boundary.startedAt,
       });
-      return { ...boundary.result, ...verificationMetrics, verification, failure: null };
+      return {
+        ...boundary.result,
+        ...verificationMetrics,
+        changedFiles,
+        verification,
+        failure: null,
+      };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "verification_failed", boundary.startedAt, error);
+      if (beforeVerification !== null && state.baseline !== null) {
+        try {
+          const changedFiles = await changedFilesAfterVerification(
+            state.baseline,
+            beforeVerification,
+          );
+          return {
+            ...boundary.result,
+            changedFiles,
+            status: "failed",
+            failure: infrastructureFailure("verifying", reportedError),
+          };
+        } catch (measurementError) {
+          return {
+            ...boundary.result,
+            status: "failed",
+            failure: infrastructureFailure("verifying", measurementError),
+          };
+        }
+      }
       return { ...boundary.result, status: "failed", failure: infrastructureFailure("verifying", reportedError) };
     }
   };

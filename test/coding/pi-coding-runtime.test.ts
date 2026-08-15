@@ -767,6 +767,48 @@ describe("PiCodingRuntime", () => {
     expect(boundary.sessions[0]?.prompts[1]?.length).toBeLessThan(10_000);
   });
 
+  it("defensively redacts verification secrets from repair prompts", async () => {
+    const boundary = createBoundary({});
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-secrets" });
+    const secrets = [
+      "Bearer bearer-secret-value",
+      "sk-providerSecret123",
+      "token=plain-token-value",
+      "password=hunter2",
+      "AKIAIOSFODNN7EXAMPLE",
+      "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    ];
+
+    await runtime.repair({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-secrets",
+      attempt: 1,
+      changedFiles: [],
+      failure: {
+        stage: "verifying",
+        message: `failed ${secrets.join(" ")}`,
+        recoverable: true,
+        command: {
+          command: "npm",
+          args: ["test"],
+          exitCode: 1,
+          signal: null,
+          stdout: secrets.join("\n"),
+          stderr: secrets.join("\n"),
+          durationMs: 1,
+          timedOut: false,
+        },
+      },
+    });
+
+    const prompt = boundary.sessions[0]?.prompts[1] ?? "";
+    for (const secret of secrets) expect(prompt).not.toContain(secret);
+    expect(prompt).toContain("[REDACTED]");
+  });
+
   it("streams assistant text while returning the final message without duplicating it", async () => {
     const boundary = createBoundary({
       executorPrompt: async (session) => {

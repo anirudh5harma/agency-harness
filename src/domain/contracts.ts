@@ -5,6 +5,13 @@ export function redactSecrets(value: string): string {
   return value
     .replace(/\bBearer\s+[^\s,;]+/giu, "Bearer [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gu, "[REDACTED]")
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu, "[REDACTED]")
+    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/gu, "[REDACTED]")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu, "[REDACTED]")
+    .replace(
+      /(\baws[_ -]?(?:access[_ -]?key[_ -]?id|secret[_ -]?access[_ -]?key|session[_ -]?token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
+      "$1[REDACTED]",
+    )
     .replace(
       /(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
       "$1[REDACTED]",
