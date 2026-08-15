@@ -1,6 +1,6 @@
 import type { SessionContext, VerificationResult } from "../domain/index.js";
 import type { SessionCompactionResult } from "../session/index.js";
-import { detectNodeVerificationCommands, runCommand, VerificationRunner } from "../process/index.js";
+import { detectNodeVerificationConfiguration, runCommand, VerificationRunner } from "../process/index.js";
 import { inspectRepository, type RepositoryInspection } from "../repo/index.js";
 import {
   GitCheckpointManager,
@@ -111,8 +111,11 @@ export async function verifyProject(
   cwd: string,
   signal: AbortSignal,
 ): Promise<VerificationResult> {
-  const commands = await detectNodeVerificationCommands(cwd);
-  return new VerificationRunner({ signal }).run(commands, cwd);
+  const configuration = await detectNodeVerificationConfiguration(cwd);
+  return new VerificationRunner({
+    signal,
+    requiredEnvironmentKeys: configuration.requiredEnvironmentKeys,
+  }).run(configuration.commands, cwd);
 }
 
 export class SlashCommandRouter {

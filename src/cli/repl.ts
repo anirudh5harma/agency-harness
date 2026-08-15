@@ -163,13 +163,20 @@ export class AgencyRepl {
   readonly #io: TerminalIO;
   readonly #handler: ReplHandler;
   readonly #prompt: string;
+  readonly #onPromptReady: () => void;
   #active: AbortController | null = null;
   #exitRequested = false;
 
-  constructor(io: TerminalIO, handler: ReplHandler, prompt = "agency> ") {
+  constructor(
+    io: TerminalIO,
+    handler: ReplHandler,
+    prompt = "agency> ",
+    onPromptReady: () => void = () => {},
+  ) {
     this.#io = io;
     this.#handler = handler;
     this.#prompt = prompt;
+    this.#onPromptReady = onPromptReady;
   }
 
   async run(): Promise<void> {
@@ -207,6 +214,7 @@ export class AgencyRepl {
     const lines: string[] = [];
     let prompt = this.#prompt;
     while (true) {
+      this.#onPromptReady();
       const value = await this.#io.readLine(prompt);
       if (value === null) return null;
       if (!value.endsWith("\\")) {

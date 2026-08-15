@@ -25,6 +25,8 @@ import {
   ProjectKnowledgeEntrySchema,
   ProjectKnowledgeSchema,
   RepoContextSchema,
+  recoverHumanDecisionRequest,
+  redactSecrets,
   SessionContextSchema,
   type AgencyPhase,
   type FailureContext,
@@ -50,7 +52,7 @@ import type {
 import { ProjectKnowledgeStore, type ProjectKnowledgeStoreBoundary } from "../persistence/index.js";
 import {
   VerificationRunner,
-  detectNodeVerificationCommands,
+  detectNodeVerificationConfiguration,
   InfrastructureError,
   type VerificationCommand,
 } from "../process/index.js";
@@ -109,6 +111,8 @@ const BoundedVerificationSchema = z.strictObject({
         signal: z.string().trim().min(1).max(100).nullable(),
         stdout: TextSchema,
         stderr: TextSchema,
+        stdoutTruncated: z.boolean().optional(),
+        stderrTruncated: z.boolean().optional(),
         durationMs: z.number().finite().nonnegative(),
         timedOut: z.boolean(),
       }),
@@ -140,6 +144,9 @@ const VerificationScriptsSchema = z.record(
   z.string().trim().min(1).max(1_000),
   z.string().max(MAX_TEXT),
 );
+const VerificationEnvironmentKeysSchema = z.array(
+  z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u),
+).max(64);
 
 export const CodingRunStateSchema = new StateSchema({
   runId: IdentifierSchema,
@@ -171,6 +178,7 @@ export const CodingRunStateSchema = new StateSchema({
     .max(MAX_COMMANDS)
     .default([]),
   verificationScripts: VerificationScriptsSchema.default({}),
+  requiredVerificationEnvironmentKeys: VerificationEnvironmentKeysSchema.default([]),
   attempt: z.number().int().nonnegative().max(20).default(0),
   missionKind: z.enum(["tests", "dead-code", "simplify", "performance"]).nullable().default(null),
   toolCalls: z.number().int().nonnegative().max(1_000_000).default(0),
@@ -222,10 +230,12 @@ export interface CodingRunGraphDependencies {
   captureGitBaseline?: (cwd: string) => Promise<GitBaseline>;
   getChangedFiles?: (baseline: GitBaseline) => Promise<GitFileChange[]>;
   detectVerificationCommands?: (cwd: string) => Promise<VerificationCommand[]>;
+  detectVerificationConfiguration?: typeof detectNodeVerificationConfiguration;
   runVerification?: (
     commands: readonly VerificationCommand[],
     cwd: string,
     signal: AbortSignal,
+    requiredEnvironmentKeys: readonly string[],
   ) => Promise<VerificationResult>;
   eventBus?: EventBus;
   trajectoryWriter?: TrajectoryWriter;
@@ -284,11 +294,11 @@ function infrastructureFailure(
   error: unknown,
 ): FailureContext {
   const cause = error instanceof Error && error.cause !== undefined
-    ? concise(String(error.cause), 2_000)
+    ? concise(redactSecrets(String(error.cause)), 2_000)
     : undefined;
   return {
     stage,
-    message: errorMessage(error),
+    message: redactSecrets(errorMessage(error)),
     ...(cause === undefined ? {} : { cause }),
     recoverable: false,
   };
@@ -297,11 +307,13 @@ function infrastructureFailure(
 function boundedVerification(result: VerificationResult): VerificationResult {
   return BoundedVerificationSchema.parse({
     ...result,
-    summary: concise(result.summary),
+    summary: concise(redactSecrets(result.summary)),
     commands: result.commands.slice(0, MAX_COMMANDS).map((command) => ({
       ...command,
-      stdout: concise(command.stdout),
-      stderr: concise(command.stderr),
+      command: redactSecrets(command.command),
+      args: command.args.map(redactSecrets),
+      stdout: concise(redactSecrets(command.stdout)),
+      stderr: concise(redactSecrets(command.stderr)),
     })),
   });
 }
@@ -403,18 +415,25 @@ export function createCodingRunGraph(
     dependencies.loadRepoInstructions ?? loadRepositoryInstructions;
   const captureBaseline = dependencies.captureGitBaseline ?? captureGitBaseline;
   const changedFilesSince = dependencies.getChangedFiles ?? getChangedFiles;
-  const detectCommands =
-    dependencies.detectVerificationCommands ?? detectNodeVerificationCommands;
+  const detectConfiguration = dependencies.detectVerificationConfiguration
+    ?? (dependencies.detectVerificationCommands === undefined
+      ? detectNodeVerificationConfiguration
+      : async (cwd: string) => ({
+          commands: await dependencies.detectVerificationCommands!(cwd),
+          requiredEnvironmentKeys: [],
+        }));
   const runVerification =
     dependencies.runVerification ??
-    ((commands, cwd, signal) =>
-      new VerificationRunner({
+    (async (commands, cwd, signal, requiredEnvironmentKeys) => {
+      return new VerificationRunner({
         ...(dependencies.eventBus === undefined ? {} : { eventBus: dependencies.eventBus }),
         signal,
+        requiredEnvironmentKeys,
       }).run(
         commands,
         cwd,
-      ));
+      );
+    });
   const now = dependencies.now ?? (() => new Date());
   const ensureMetadataIgnored =
     dependencies.ensureMetadataIgnored ?? ensureAgencyMetadataIgnored;
@@ -503,6 +522,13 @@ export function createCodingRunGraph(
       .map(({ path }) => path)
       .filter((path) => !isInternalMetadataPath(path))
       .slice(0, MAX_CHANGED_FILES);
+  }
+
+  async function changedFilesAfterVerification(baseline: GitBaseline): Promise<string[]> {
+    // Verification is an opaque project process. Its aggregate Git delta stays
+    // truthful, but concurrent user writes cannot be distinguished from verifier
+    // writes and therefore must never become Agency undo ownership.
+    return actualChangedFiles(baseline);
   }
 
   function mergeKnowledge(
@@ -608,10 +634,13 @@ export function createCodingRunGraph(
         inspection.instructionFiles,
       );
       const baseline = await captureBaseline(inspection.rootPath);
+      const detectedVerification = await detectConfiguration(inspection.rootPath);
       const verificationCommands = z
         .array(VerificationCommandSchema)
         .max(MAX_COMMANDS)
-        .parse(await detectCommands(inspection.rootPath));
+        .parse(detectedVerification.commands);
+      const requiredVerificationEnvironmentKeys = VerificationEnvironmentKeysSchema
+        .parse(detectedVerification.requiredEnvironmentKeys);
       const preparedVerificationScripts = await verificationScripts(
         inspection.rootPath,
         verificationCommands,
@@ -628,6 +657,7 @@ export function createCodingRunGraph(
           baseline,
           verificationCommands,
           verificationScripts: preparedVerificationScripts,
+          requiredVerificationEnvironmentKeys,
           verification: {
             status: "skipped",
             summary: message,
@@ -651,6 +681,7 @@ export function createCodingRunGraph(
         baseline,
         verificationCommands,
         verificationScripts: preparedVerificationScripts,
+        requiredVerificationEnvironmentKeys,
         createdAt,
         updatedAt: createdAt,
       };
@@ -819,7 +850,9 @@ export function createCodingRunGraph(
     if (state.status === "failed") return {};
     const boundary = await enterPhase(state, "verifying", "verification");
     if (boundary.result.status === "failed") return boundary.result;
+    let beforeVerification: string[] | null = null;
     try {
+      if (state.baseline === null) throw new Error("Verification baseline is missing");
       const commands = state.verificationCommands.map((command) => ({
         ...command,
         args: [...command.args],
@@ -849,13 +882,16 @@ export function createCodingRunGraph(
           },
         };
       }
+      beforeVerification = await actualChangedFiles(state.baseline);
       const verification = boundedVerification(
         await runVerification(
           commands,
           state.repoPath,
           runtime.signal ?? new AbortController().signal,
+          state.requiredVerificationEnvironmentKeys,
         ),
       );
+      const changedFiles = await changedFilesAfterVerification(state.baseline);
       const verificationMetrics = {
         verificationCommandCount: state.verificationCommandCount + verification.commands.length,
         verificationCommandDurationsMs: [
@@ -863,6 +899,21 @@ export function createCodingRunGraph(
           ...verification.commands.map(({ durationMs }) => durationMs),
         ].slice(0, MAX_COMMANDS * 21),
       };
+      if (state.missionKind !== null && changedFiles.length > 3) {
+        const message = "Mission changed more than 3 files; refusing successful completion";
+        await recordTrajectory(state, "verification_failed");
+        await recordTrajectory(state, "verification_completed", {
+          startedAt: boundary.startedAt,
+        });
+        return {
+          ...boundary.result,
+          ...verificationMetrics,
+          changedFiles,
+          verification,
+          status: "failed",
+          failure: { stage: "verifying", message, recoverable: false },
+        };
+      }
       if (verification.status !== "passed") {
         await recordTrajectory(state, "verification_failed");
         await recordTrajectory(state, "verification_completed", {
@@ -871,6 +922,7 @@ export function createCodingRunGraph(
         return {
           ...boundary.result,
           ...verificationMetrics,
+          changedFiles,
           verification,
           failure: {
             stage: "verifying",
@@ -886,9 +938,32 @@ export function createCodingRunGraph(
       await recordTrajectory(state, "verification_completed", {
         startedAt: boundary.startedAt,
       });
-      return { ...boundary.result, ...verificationMetrics, verification, failure: null };
+      return {
+        ...boundary.result,
+        ...verificationMetrics,
+        changedFiles,
+        verification,
+        failure: null,
+      };
     } catch (error) {
       const reportedError = await failureAfterRecording(state, "verification_failed", boundary.startedAt, error);
+      if (beforeVerification !== null && state.baseline !== null) {
+        try {
+          const changedFiles = await changedFilesAfterVerification(state.baseline);
+          return {
+            ...boundary.result,
+            changedFiles,
+            status: "failed",
+            failure: infrastructureFailure("verifying", reportedError),
+          };
+        } catch (measurementError) {
+          return {
+            ...boundary.result,
+            status: "failed",
+            failure: infrastructureFailure("verifying", measurementError),
+          };
+        }
+      }
       return { ...boundary.result, status: "failed", failure: infrastructureFailure("verifying", reportedError) };
     }
   };
@@ -993,7 +1068,8 @@ export function createCodingRunGraph(
     if (state.pendingHumanDecision === null) {
       throw new Error("Human decision state is incomplete");
     }
-    const request = HumanDecisionRequestSchema.parse(state.pendingHumanDecision);
+    const request = recoverHumanDecisionRequest(state.pendingHumanDecision);
+    if (request === null) throw new Error("Human decision checkpoint is invalid");
     const response = HumanDecisionResponseSchema.forRequest(request).parse(
       interrupt(request),
     );
@@ -1147,11 +1223,11 @@ export function createCodingRunGraph(
       if (response !== undefined) {
         const snapshot = await compiled.getState(config(threadId));
         const values = snapshot.values as Partial<CodingRunState>;
-        const request = HumanDecisionRequestSchema.safeParse(values.pendingHumanDecision);
-        if (!request.success) {
+        const request = recoverHumanDecisionRequest(values.pendingHumanDecision);
+        if (request === null) {
           throw new Error("Cannot resume without a matching pending human request");
         }
-        safeResponse = HumanDecisionResponseSchema.forRequest(request.data).parse(response);
+        safeResponse = HumanDecisionResponseSchema.forRequest(request).parse(response);
       }
       return compiled.invoke(
         safeResponse === undefined ? null : new Command({ resume: safeResponse }),

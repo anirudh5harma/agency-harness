@@ -3,8 +3,20 @@ import { z } from "zod";
 const NonEmptyStringSchema = z.string().trim().min(1);
 export function redactSecrets(value: string): string {
   return value
+    .replace(
+      /(\b[A-Z0-9_]*(?:DATABASE|DB|POSTGRES(?:QL)?|MYSQL|MARIADB|MONGO(?:DB)?|REDIS)_URL\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
+      "$1[REDACTED]",
+    )
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/giu, "$1[REDACTED]@")
     .replace(/\bBearer\s+[^\s,;]+/giu, "Bearer [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gu, "[REDACTED]")
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu, "[REDACTED]")
+    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/gu, "[REDACTED]")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu, "[REDACTED]")
+    .replace(
+      /(\baws[_ -]?(?:access[_ -]?key[_ -]?id|secret[_ -]?access[_ -]?key|session[_ -]?token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
+      "$1[REDACTED]",
+    )
     .replace(
       /(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
       "$1[REDACTED]",
@@ -15,6 +27,24 @@ const HumanDecisionIdSchema = z
   .trim()
   .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u);
 const HumanDecisionTextSchema = z.string().trim().min(1).max(1_000).transform(redactSecrets);
+function containsTerminalSpoofingControl(value: string): boolean {
+  return [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f
+      || (codePoint >= 0x7f && codePoint <= 0x9f)
+      || /[\p{Cf}\p{Zl}\p{Zp}]/u.test(character);
+  });
+}
+
+function terminalSafeApprovalText(value: string, context: z.RefinementCtx, path: PropertyKey[]): void {
+  if (containsTerminalSpoofingControl(value)) {
+    context.addIssue({
+      code: "custom",
+      path,
+      message: "approval presentation cannot contain terminal control, separator, or directionality characters",
+    });
+  }
+}
 
 export const HumanDecisionOptionSchema = z.strictObject({
   id: HumanDecisionIdSchema,
@@ -22,6 +52,12 @@ export const HumanDecisionOptionSchema = z.strictObject({
   description: z.string().trim().min(1).max(240).transform(redactSecrets),
 });
 export type HumanDecisionOption = z.infer<typeof HumanDecisionOptionSchema>;
+
+export const APPROVAL_DECISION_OPTIONS: readonly HumanDecisionOption[] = Object.freeze([
+  Object.freeze({ id: "approve", label: "Approve", description: "Run this exact action once." }),
+  Object.freeze({ id: "reject", label: "Reject", description: "Cancel this action." }),
+  Object.freeze({ id: "edit", label: "Edit", description: "Provide different guidance; do not run the original action." }),
+]);
 
 export const HumanDecisionRequestSchema = z
   .strictObject({
@@ -57,9 +93,55 @@ export const HumanDecisionRequestSchema = z
           message: "approvals require approve, reject, and edit options",
         });
       }
+      terminalSafeApprovalText(request.question, context, ["question"]);
+      if (request.context !== undefined) terminalSafeApprovalText(request.context, context, ["context"]);
+      if (request.risk !== undefined) terminalSafeApprovalText(request.risk, context, ["risk"]);
+      if (request.action !== undefined) terminalSafeApprovalText(request.action, context, ["action"]);
+      request.options.forEach((option, index) => {
+        terminalSafeApprovalText(option.label, context, ["options", index, "label"]);
+        terminalSafeApprovalText(option.description, context, ["options", index, "description"]);
+      });
     }
-  });
+  })
+  .transform((request) => request.kind === "approval"
+    ? { ...request, options: APPROVAL_DECISION_OPTIONS.map((option) => ({ ...option })) }
+    : request);
 export type HumanDecisionRequest = z.infer<typeof HumanDecisionRequestSchema>;
+
+function visiblyEscapeTerminalControls(value: string): string {
+  return [...value].map((character) => {
+    if (!containsTerminalSpoofingControl(character)) return character;
+    const codePoint = character.codePointAt(0) ?? 0;
+    return `\\u{${codePoint.toString(16).padStart(4, "0")}}`;
+  }).join("");
+}
+
+/**
+ * Reads checkpoint-era requests that predate terminal-safe approval text.
+ * Live provider requests must continue through HumanDecisionRequestSchema.
+ */
+export function recoverHumanDecisionRequest(value: unknown): HumanDecisionRequest | null {
+  const current = HumanDecisionRequestSchema.safeParse(value);
+  if (current.success) return current.data;
+  if (typeof value !== "object" || value === null || !("kind" in value) || value.kind !== "approval") return null;
+  const legacy = value as Record<string, unknown>;
+  const escaped = { ...legacy };
+  for (const field of ["question", "context", "risk", "action"] as const) {
+    if (typeof escaped[field] === "string") escaped[field] = visiblyEscapeTerminalControls(escaped[field]);
+  }
+  if (Array.isArray(escaped.options)) {
+    escaped.options = escaped.options.map((option) => {
+      if (typeof option !== "object" || option === null) return option;
+      const safe = { ...option } as Record<string, unknown>;
+      for (const field of ["label", "description"] as const) {
+        if (typeof safe[field] === "string") safe[field] = visiblyEscapeTerminalControls(safe[field]);
+      }
+      return safe;
+    });
+  }
+  const recovered = HumanDecisionRequestSchema.safeParse(escaped);
+  return recovered.success ? recovered.data : null;
+}
 
 const HumanDecisionResponseBaseSchema = z
   .strictObject({
@@ -148,6 +230,8 @@ export const CommandResultSchema = z.strictObject({
   signal: NonEmptyStringSchema.nullable().default(null),
   stdout: z.string(),
   stderr: z.string(),
+  stdoutTruncated: z.boolean().optional(),
+  stderrTruncated: z.boolean().optional(),
   durationMs: z.number().finite().nonnegative(),
   timedOut: z.boolean().default(false),
 });

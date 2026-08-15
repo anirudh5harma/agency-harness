@@ -60,7 +60,7 @@ It never stages, commits, pushes, or opens a PR in the target repository.
 - Human elevation with 2–3 choices, approval/reject/edit actions, or free-form input.
 - Durable session compaction and editable project knowledge under
   `.devagency/knowledge/`.
-- SQLite run recovery, bounded repair, safe lifecycle trajectories, and numeric run
+- Portable durable run recovery, bounded repair, safe lifecycle trajectories, and numeric run
   evaluations.
 - Optional isolated Git worktree via `agency --worktree`; worktrees are preserved
   unless explicitly discarded.
@@ -118,7 +118,7 @@ files and consequential commands need exact one-shot approval. Git mutation,
 publishing, credential access, arbitrary network/cloud commands, and unsupported
 shell composition are blocked.
 
-`.devagency/` contains runtime metadata: session state, SQLite checkpoints, Pi
+`.devagency/` contains runtime metadata: session state, durable graph checkpoints, Pi
 sessions, trajectories, evaluations, Git checkpoint metadata, and project knowledge.
 Agency adds it to the repository-local Git exclude file, not shared `.gitignore`.
 

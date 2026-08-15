@@ -9,6 +9,8 @@ import {
   PlanSchema,
   projectKnowledgeKey,
   ProjectKnowledgeEntrySchema,
+  redactSecrets,
+  recoverHumanDecisionRequest,
   renderProjectKnowledge,
   RepoContextSchema,
   SessionContextSchema,
@@ -115,6 +117,116 @@ describe("human decision contracts", () => {
       requestId: request.id,
       customText: "Something else",
     })).toEqual({ requestId: request.id, customText: "Something else" });
+  });
+
+  it("canonicalizes approval presentation independently of provider labels and order", () => {
+    const request = HumanDecisionRequestSchema.parse({
+      id: "decision-adversarial",
+      kind: "approval",
+      question: "Approve the exact action?",
+      action: "rm -rf build",
+      options: [
+        { id: "reject", label: "Approve", description: "Run it now." },
+        { id: "edit", label: "Reject", description: "Cancel it." },
+        { id: "approve", label: "Safe default", description: "Nothing will happen." },
+      ],
+      allowCustom: true,
+    });
+
+    expect(request.options).toEqual([
+      { id: "approve", label: "Approve", description: "Run this exact action once." },
+      { id: "reject", label: "Reject", description: "Cancel this action." },
+      { id: "edit", label: "Edit", description: "Provide different guidance; do not run the original action." },
+    ]);
+  });
+
+  it("rejects terminal-spoofing controls only from approval presentation", () => {
+    const approval = {
+      id: "decision-safe-terminal",
+      kind: "approval" as const,
+      question: "Approve the exact action?",
+      action: "rm build/output.js",
+      options: [
+        { id: "approve", label: "Approve", description: "Run once." },
+        { id: "reject", label: "Reject", description: "Cancel." },
+        { id: "edit", label: "Edit", description: "Change guidance." },
+      ],
+      allowCustom: true,
+    };
+
+    for (const injected of [
+      "line one\nline two",
+      "safe\u2028txt",
+      "safe\u2029txt",
+      "safe\u202Etxt",
+      "safe\u2066txt",
+    ]) {
+      expect(() => HumanDecisionRequestSchema.parse({ ...approval, question: injected })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({ ...approval, action: injected })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({ ...approval, context: injected })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({ ...approval, risk: injected })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({
+        ...approval,
+        options: approval.options.map((option, index) => index === 0 ? { ...option, label: injected } : option),
+      })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({
+        ...approval,
+        options: approval.options.map((option, index) => index === 0 ? { ...option, description: injected } : option),
+      })).toThrow();
+    }
+
+    expect(HumanDecisionRequestSchema.parse({
+      id: "clarification-multiline",
+      kind: "clarification",
+      question: "Compare these choices:\n- local\n- hosted",
+      options: [
+        { id: "local", label: "Local", description: "Keep data here." },
+        { id: "hosted", label: "Hosted", description: "Use remote storage." },
+      ],
+      allowCustom: true,
+    }).question).toContain("\n");
+  });
+});
+
+describe("secret redaction", () => {
+  it("redacts credentialed URI userinfo and database URL assignments", () => {
+    const raw = [
+      "postgres://db-user:s3cr%40t@db.example.test/app",
+      "https://api-user:api-pass@example.test/path",
+      "DATABASE_URL=postgres://owner:hunter2@localhost/app",
+      "TEST_DATABASE_URL='mysql://test-user:test-pass@localhost/test'",
+    ].join("\n");
+
+    const redacted = redactSecrets(raw);
+
+    expect(redacted).not.toMatch(/db-user|s3cr%40t|api-user|api-pass|owner|hunter2|test-user|test-pass/u);
+    expect(redacted).toContain("postgres://[REDACTED]@db.example.test/app");
+    expect(redacted).toContain("DATABASE_URL=[REDACTED]");
+    expect(redacted).toContain("TEST_DATABASE_URL=[REDACTED]");
+  });
+});
+
+describe("human decision checkpoint recovery", () => {
+  it("visibly canonicalizes legacy multiline approval presentation", () => {
+    const recovered = recoverHumanDecisionRequest({
+      id: "legacy-approval",
+      kind: "approval",
+      question: "Approve this?\nLegacy detail",
+      context: "Context line one\r\nContext line two",
+      risk: "Risk line one\u2028Risk line two\u2029End",
+      action: "npm run migrate",
+      options: [
+        { id: "approve", label: "Approve", description: "Run once." },
+        { id: "reject", label: "Reject", description: "Cancel." },
+        { id: "edit", label: "Edit", description: "Change guidance." },
+      ],
+      allowCustom: true,
+    });
+
+    expect(recovered).not.toBeNull();
+    expect(recovered?.question).toBe("Approve this?\\u{000a}Legacy detail");
+    expect(recovered?.context).toBe("Context line one\\u{000d}\\u{000a}Context line two");
+    expect(recovered?.risk).toBe("Risk line one\\u{2028}Risk line two\\u{2029}End");
   });
 });
 

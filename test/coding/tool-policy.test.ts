@@ -15,6 +15,7 @@ import {
   createProtectedBashTool,
   createRoleFileTools,
   defaultToolFactoryBoundary,
+  parseGitVisibleSearchFileList,
 } from "../../src/coding/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -130,6 +131,71 @@ describe("Agency tool policy", () => {
       .rejects.toMatchObject({ name: "AbortError" });
   });
 
+  it("rejects truncated Git search listings before parsing NUL paths", () => {
+    expect(() => parseGitVisibleSearchFileList({
+      stdout: "src/first.ts\0\n… output truncated …\0src/last.ts\0",
+      stdoutTruncated: true,
+    })).toThrow("search listing byte limit");
+  });
+
+  it("makes the aggregate grep cap visible instead of claiming there are no matches", async () => {
+    const { root } = await fixture();
+    const chunk = Buffer.alloc(1024 * 1024, 97);
+    for (let index = 0; index < 32; index += 1) {
+      await writeFile(join(root, `cap-${String(index).padStart(2, "0")}.txt`), chunk);
+    }
+    await writeFile(join(root, "z-after-cap.txt"), "needle-after-cap\n");
+    const grep = createRoleFileTools({ root, role: "planner" }).find(({ name }) => name === "grep")!;
+
+    const result = await invoke(grep, { path: ".", pattern: "needle-after-cap", literal: true });
+
+    expect(result.content).toEqual([{
+      type: "text",
+      text: "Search stopped after 33554432 aggregate bytes; results are incomplete.",
+    }]);
+    expect(result.details).toEqual({ searchByteLimitReached: 32 * 1024 * 1024 });
+  });
+
+  it("makes every grep incompleteness cause visible in model content", async () => {
+    const { root } = await fixture();
+    await writeFile(join(root, "oversized.txt"), Buffer.alloc(1024 * 1024 + 1, 97));
+    const manyMatches = Array.from({ length: 180 }, (_, index) =>
+      `needle-${index} ${"x".repeat(1_990)}`).join("\n");
+    await writeFile(join(root, "many.txt"), `${manyMatches}\n`);
+    const grep = createRoleFileTools({ root, role: "planner" }).find(({ name }) => name === "grep")!;
+
+    const noMatch = await invoke(grep, { path: ".", pattern: "absent", literal: true });
+    expect(JSON.stringify(noMatch)).toContain("oversized file");
+    expect(JSON.stringify(noMatch)).not.toContain("No matches found");
+    expect(noMatch.details).toMatchObject({ oversizedFileCount: 1 });
+
+    const capped = await invoke(grep, { path: ".", pattern: "needle", literal: true, limit: 1 });
+    expect(JSON.stringify(capped)).toContain("match limit");
+    expect(capped.details).toMatchObject({ matchLimitReached: 1 });
+
+    const sliced = await invoke(grep, { path: ".", pattern: "needle", literal: true, limit: 180 });
+    expect(JSON.stringify(sliced)).toContain("content limit");
+    expect(sliced.details).toMatchObject({ contentLimitReached: 256 * 1024 });
+  });
+
+  it("makes find result and content caps visible in model content", async () => {
+    const { root } = await fixture();
+    const directory = join(root, "wide");
+    await mkdir(directory);
+    for (let index = 0; index < 1_300; index += 1) {
+      await writeFile(join(directory, `${String(index).padStart(4, "0")}-${"x".repeat(210)}.txt`), "x\n");
+    }
+    const find = createRoleFileTools({ root, role: "planner" }).find(({ name }) => name === "find")!;
+
+    const capped = await invoke(find, { path: ".", pattern: "wide/*", limit: 1 });
+    expect(JSON.stringify(capped)).toContain("result limit");
+    expect(capped.details).toMatchObject({ resultLimitReached: 1 });
+
+    const sliced = await invoke(find, { path: ".", pattern: "wide/*", limit: 2_000 });
+    expect(JSON.stringify(sliced)).toContain("content limit");
+    expect(sliced.details).toMatchObject({ contentLimitReached: 256 * 1024 });
+  });
+
   it("honors Git ignore rules during search", async () => {
     const { root } = await fixture();
     await writeFile(join(root, ".gitignore"), "custom-generated/\n");
@@ -204,6 +270,119 @@ describe("Agency tool policy", () => {
     await expect(invoke(write, { path: "outside-link", content: "nope" })).rejects.toThrow("non-symlink");
   });
 
+  it("never permits dependency, lockfile, or migration mutations and preserves approval", async () => {
+    const { root } = await fixture();
+    await mkdir(join(root, "prisma", "migrations"), { recursive: true });
+    await writeFile(join(root, "package-lock.json"), "{}\n");
+    await writeFile(join(root, "prisma", "migrations", "001.sql"), "select 1;\n");
+    await writeFile(join(root, "package.json"), JSON.stringify({ name: "safe", dependencies: { zod: "1.0.0" } }, null, 2));
+
+    const consumeApproval = vi.fn(() => true);
+    const tools = createRoleFileTools({ root, role: "executor", consumeApproval });
+    const edit = tools.find(({ name }) => name === "edit")!;
+    const write = tools.find(({ name }) => name === "write")!;
+    const blocked = [
+      () => invoke(write, { path: "package-lock.json", content: "{\"lockfileVersion\":3}\n" }),
+      () => invoke(edit, { path: "package-lock.json", edits: [{ oldText: "{}", newText: "{\"lockfileVersion\":3}" }] }),
+      () => invoke(write, { path: "prisma/migrations/001.sql", content: "drop table users;\n" }),
+      () => invoke(edit, { path: "prisma/migrations/001.sql", edits: [{ oldText: "select 1", newText: "drop table users" }] }),
+      () => invoke(write, { path: "package.json", content: JSON.stringify({ name: "safe", dependencies: { zod: "2.0.0" } }) }),
+      () => invoke(edit, { path: "package.json", edits: [{ oldText: '"zod": "1.0.0"', newText: '"zod": "2.0.0"' }] }),
+    ];
+    for (const operation of blocked) {
+      await expect(operation()).rejects.toThrow("Agency policy blocks this operation");
+    }
+    expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
+  it("blocks polyglot dependency manifests and common migration layouts before approval", async () => {
+    const { root } = await fixture();
+    const manifests = [
+      "requirements.txt", "requirements-dev.txt", "pyproject.toml", "Pipfile", "Cargo.toml",
+      "go.mod", "Gemfile", "composer.json", "pom.xml", "build.gradle", "settings.gradle.kts",
+      "Package.swift", "pubspec.yaml", "service.csproj", "workspace.sln", "pnpm-workspace.yaml",
+      "lerna.json", "rush.json", "Directory.Packages.props",
+    ];
+    for (const path of manifests) await writeFile(join(root, path), "original\n");
+    await mkdir(join(root, "alembic", "versions"), { recursive: true });
+    await mkdir(join(root, "db"), { recursive: true });
+    await writeFile(join(root, "alembic", "versions", "001_create.py"), "upgrade = True\n");
+    await writeFile(join(root, "db", "schema.rb"), "schema\n");
+
+    const consumeApproval = vi.fn(() => true);
+    const write = createRoleFileTools({ root, role: "executor", consumeApproval })
+      .find(({ name }) => name === "write")!;
+    for (const path of [...manifests, "alembic/versions/001_create.py", "db/schema.rb"]) {
+      await expect(invoke(write, { path, content: "changed\n" }), path)
+        .rejects.toThrow("Agency policy blocks this operation");
+    }
+    expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
+  it("blocks the extended finite manifest and migration table for edit, write, and rm before approval", async () => {
+    const { root } = await fixture();
+    const protectedPaths = [
+      "setup.py", "setup.cfg", "service.gemspec", "environment.yml", "environment-dev.yml",
+      "mix.exs", "mix.lock", "gradle.lockfile", "rebar.config", "Project.toml", "vcpkg.json",
+      "conanfile.txt", "db/changelog/001-users.xml", "drizzle/0001_users.sql",
+    ];
+    for (const path of protectedPaths) {
+      await mkdir(join(root, path.split("/").slice(0, -1).join("/")), { recursive: true });
+      await writeFile(join(root, path), "original\n");
+    }
+    const consumeApproval = vi.fn(() => true);
+    const tools = createRoleFileTools({ root, role: "executor", consumeApproval });
+    const edit = tools.find(({ name }) => name === "edit")!;
+    const write = tools.find(({ name }) => name === "write")!;
+    const execute = vi.fn(async () => ({ content: [], details: {} }));
+    const bash = createProtectedBashTool({
+      root,
+      consumeApproval,
+      factories: {
+        ...defaultToolFactoryBoundary,
+        createBashTool: vi.fn(() => ({
+          name: "bash", label: "bash", description: "test", parameters: { type: "object" } as never, execute,
+        } as never)),
+      },
+    });
+
+    for (const path of protectedPaths) {
+      await expect(invoke(edit, { path, edits: [{ oldText: "original", newText: "changed" }] }), `edit ${path}`)
+        .rejects.toThrow("Agency policy blocks this operation");
+      await expect(invoke(write, { path, content: "changed\n" }), `write ${path}`)
+        .rejects.toThrow("Agency policy blocks this operation");
+      await expect(bash.execute(`rm-${path}`, { command: `rm ${path}` }, undefined, undefined, {} as never), `rm ${path}`)
+        .rejects.toThrow("Agency policy blocks this operation");
+    }
+    expect(consumeApproval).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects protected rm targets before approval, including recursive contents", async () => {
+    const { root } = await fixture();
+    await mkdir(join(root, "generated"));
+    await writeFile(join(root, "requirements-ci.txt"), "pytest\n");
+    await writeFile(join(root, "generated", "Cargo.toml"), "[package]\n");
+    const execute = vi.fn(async () => ({ content: [], details: {} }));
+    const factories = {
+      ...defaultToolFactoryBoundary,
+      createBashTool: vi.fn(() => ({
+        name: "bash", label: "bash", description: "test", parameters: { type: "object" } as never, execute,
+      } as never)),
+    };
+    const consumeApproval = vi.fn(() => true);
+    const bash = createProtectedBashTool({ root, factories, consumeApproval });
+
+    await expect(bash.execute("direct", { command: "rm requirements-ci.txt" }, undefined, undefined, {} as never))
+      .rejects.toThrow("dependency manifest");
+    await expect(bash.execute("recursive", { command: "rm -rf generated" }, undefined, undefined, {} as never))
+      .rejects.toThrow("dependency manifest");
+    await expect(bash.execute("lock", { command: "rm package.json" }, undefined, undefined, {} as never))
+      .rejects.toThrow("dependency manifest");
+    expect(consumeApproval).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it("denies a fourth distinct mission path before mutation", async () => {
     const { root } = await fixture();
     const budget = new MissionMutationBudget();
@@ -268,21 +447,29 @@ describe("Agency tool policy", () => {
     }
   });
 
-  it("requires exact one-shot approval for consequential shell", () => {
-    let approved = bashApprovalAction(["rm", "-rf", "build"]);
-    expect(approved).toMatch(/^bash:rm argv:rm -rf build sha256:[a-f0-9]{64}$/u);
+  it("requires exact one-shot approval for a single non-recursive rm", () => {
+    let approved = bashApprovalAction(["rm", "build/output.js"]);
+    expect(approved).toMatch(/^bash:rm argv:rm build\/output\.js sha256:[a-f0-9]{64}$/u);
     const consume = (action: string) => {
       if (action !== approved) return false;
       approved = "";
       return true;
     };
-    expect(() => assertAllowedBash("rm -rf other", consume)).toThrow("exact action");
-    expect(() => assertAllowedBash("rm -rf build", consume)).not.toThrow();
-    expect(() => assertAllowedBash("rm -rf build", consume)).toThrow("one-shot approval");
+    expect(() => assertAllowedBash("rm other.js", consume)).toThrow("exact action");
+    expect(() => assertAllowedBash("rm build/output.js", consume)).not.toThrow();
+    expect(() => assertAllowedBash("rm build/output.js", consume)).toThrow("one-shot approval");
 
-    approved = bashApprovalAction(["rm", "-rf", "build  dir"]);
-    expect(() => assertAllowedBash("rm -rf 'build dir'", consume)).toThrow("exact action");
-    expect(() => assertAllowedBash("rm -rf 'build  dir'", consume)).not.toThrow();
+    approved = bashApprovalAction(["rm", "build  file"]);
+    expect(() => assertAllowedBash("rm 'build file'", consume)).toThrow("exact action");
+    expect(() => assertAllowedBash("rm 'build  file'", consume)).not.toThrow();
+  });
+
+  it("rejects recursive and multi-target rm without consuming approval", () => {
+    const consumeApproval = vi.fn(() => true);
+    for (const command of ["rm -rf build", "rm --recursive build", "rm first.ts second.ts"]) {
+      expect(() => assertAllowedBash(command, consumeApproval), command).toThrow("Agency policy");
+    }
+    expect(consumeApproval).not.toHaveBeenCalled();
   });
 
   it("rejects approved rm targets through symlink parents and private aliases", async () => {
@@ -300,10 +487,10 @@ describe("Agency tool policy", () => {
     };
 
     for (const target of ["outside-dir/secret.txt", "src/nested-outside/secret.txt", "metadata-alias/private.txt"]) {
-      const action = bashApprovalAction(["rm", "-rf", target]);
+      const action = bashApprovalAction(["rm", target]);
       const bash = createProtectedBashTool({ root, factories, consumeApproval: (candidate) => candidate === action });
       await expect(
-        bash.execute("approved-rm", { command: `rm -rf ${target}` }, undefined, undefined, {} as never),
+        bash.execute("approved-rm", { command: `rm ${target}` }, undefined, undefined, {} as never),
         target,
       ).rejects.toThrow("Agency policy");
     }
@@ -337,7 +524,7 @@ describe("Agency tool policy", () => {
       factoryOptions,
     } as never));
     const factories = { ...defaultToolFactoryBoundary, createBashTool };
-    const approval = bashApprovalAction(["rm", "-rf", "build"]);
+    const approval = bashApprovalAction(["rm", "build/output.js"]);
     const consumeApproval = vi.fn((action: string) => action === approval);
     const bash = createProtectedBashTool({ root, factories, consumeApproval });
     await bash.execute("git", { command: "git diff -- src/safe.ts" }, undefined, undefined, {} as never);
@@ -364,10 +551,14 @@ describe("Agency tool policy", () => {
     });
 
     for (const timeout of ["5", 0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483.648]) {
-      await expect(bash.execute("invalid-timeout", { command: "rm -rf build", timeout }, undefined, undefined, {} as never), String(timeout)).rejects.toThrow("timeout");
+      await expect(bash.execute("invalid-timeout", { command: "rm build/output.js", timeout }, undefined, undefined, {} as never), String(timeout)).rejects.toThrow("timeout");
     }
     expect(consumeApproval).not.toHaveBeenCalled();
-    await expect(bash.execute("approved", { command: "rm -rf build", timeout: 5 }, undefined, undefined, {} as never)).resolves.toBeDefined();
+    await mkdir(join(root, "build"));
+    await writeFile(join(root, "build", "output.js"), "generated\n");
+    await expect(bash.execute("approved", { command: "rm build/output.js", timeout: 5 }, undefined, undefined, {} as never)).resolves.toMatchObject({
+      details: { agencyMutationPaths: ["build/output.js"] },
+    });
     expect(consumeApproval).toHaveBeenCalledOnce();
   });
 });

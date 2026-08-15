@@ -18,7 +18,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import { runCommand } from "../process/index.js";
-
+import {
+  applyPackageManifestEdits,
+  assertNeverMutablePath,
+  assertPackageDependencyPolicy,
+  isDependencyManifestPath,
+  isLockfilePath,
+  isMigrationPath,
+  isPackageManifestPath,
+} from "./file-mutation-policy.js";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -59,8 +67,10 @@ const MAX_INTERNAL_READ_BYTES = 16 * 1024 * 1024;
 const MAX_SEARCH_DEPTH = 32;
 const MAX_SEARCH_FILES = 20_000;
 const MAX_SEARCH_ENTRIES = 40_000;
+const MAX_SEARCH_LIST_BYTES = 8 * 1024 * 1024;
 const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_SEARCH_CONTENT_CHARS = 256 * 1024;
 const activeMutationSignal = new AsyncLocalStorage<AbortSignal | undefined>();
 const activeToolSignal = new AsyncLocalStorage<AbortSignal | undefined>();
 
@@ -97,6 +107,11 @@ export const defaultToolFactoryBoundary: ToolFactoryBoundary = {
 export interface VerificationInvocation {
   command: string;
   args: readonly string[];
+}
+
+/** Validated paths from one protected mutation, emitted together after successful completion. */
+export interface BatchedProtectedMutationResultDetails {
+  agencyMutationPaths: readonly string[];
 }
 
 function policyError(reason: string): Error {
@@ -310,6 +325,17 @@ function assertSearchDoesNotTargetPrivate(params: unknown, includePattern: boole
 
 interface SearchFile { path: string; size: number }
 
+/** @internal Exported for deterministic policy-boundary tests. */
+export function parseGitVisibleSearchFileList(listed: {
+  stdout: string;
+  stdoutTruncated?: boolean | undefined;
+}): string[] {
+  if (listed.stdoutTruncated === true) {
+    throw policyError(`search listing byte limit is ${MAX_SEARCH_LIST_BYTES}`);
+  }
+  return listed.stdout.split("\0").filter(Boolean).sort();
+}
+
 async function safeSearchFiles(
   root: string,
   input: string,
@@ -327,12 +353,12 @@ async function safeSearchFiles(
     args: ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", relativeSearchRoot === "" ? "." : relativeSearchRoot],
     cwd: canonicalRoot,
     timeoutMs: 10_000,
-    maxOutputBytes: 8 * 1024 * 1024,
+    maxOutputBytes: MAX_SEARCH_LIST_BYTES,
     ...(signal === undefined ? {} : { signal }),
   });
   if (listed.exitCode !== 0) throw policyError("could not enumerate Git-visible search files");
   const files: SearchFile[] = [];
-  const candidates = listed.stdout.split("\0").filter(Boolean).sort();
+  const candidates = parseGitVisibleSearchFileList(listed);
   if (candidates.length > MAX_SEARCH_ENTRIES) throw policyError(`search entry limit is ${MAX_SEARCH_ENTRIES}`);
   for (const candidate of candidates) {
     assertNotAborted(signal, "Search aborted");
@@ -401,11 +427,12 @@ function safeGrepTool(delegate: ToolDefinition, root: string, role: ToolRole): T
       let matches = 0;
       let searchedBytes = 0;
       let searchByteLimitReached = false;
+      let oversizedFileCount = 0;
       for (const file of files) {
         assertNotAborted(signal, "Grep aborted");
         const rel = relative(searchRoot, file.path).split(sep).join("/") || file.path.slice(file.path.lastIndexOf(sep) + 1);
         if (typeof raw.glob === "string" && !matchesGlob(rel, raw.glob)) continue;
-        if (file.size > MAX_SEARCH_FILE_BYTES) continue;
+        if (file.size > MAX_SEARCH_FILE_BYTES) { oversizedFileCount += 1; continue; }
         if (searchedBytes + file.size > MAX_SEARCH_TOTAL_BYTES) {
           searchByteLimitReached = true;
           break;
@@ -428,12 +455,24 @@ function safeGrepTool(delegate: ToolDefinition, root: string, role: ToolRole): T
         }
         if (matches >= limit) break;
       }
+      const joined = output.join("\n"), contentLimitReached = joined.length > MAX_SEARCH_CONTENT_CHARS;
       const details = {
         ...(matches >= limit ? { matchLimitReached: limit } : {}),
+        ...(oversizedFileCount > 0 ? { oversizedFileCount } : {}),
         ...(searchByteLimitReached ? { searchByteLimitReached: MAX_SEARCH_TOTAL_BYTES } : {}),
+        ...(contentLimitReached ? { contentLimitReached: MAX_SEARCH_CONTENT_CHARS } : {}),
       };
+      const warnings = [
+        matches >= limit ? `Search stopped at the ${limit} match limit; results are incomplete.` : undefined,
+        oversizedFileCount > 0 ? `Search skipped ${oversizedFileCount} oversized file(s); results are incomplete.` : undefined,
+        searchByteLimitReached ? `Search stopped after ${MAX_SEARCH_TOTAL_BYTES} aggregate bytes; results are incomplete.` : undefined,
+        contentLimitReached ? `Search output stopped at the ${MAX_SEARCH_CONTENT_CHARS} character content limit; results are incomplete.` : undefined,
+      ].filter((warning): warning is string => warning !== undefined);
+      const text = output.length === 0
+        ? warnings.join("\n") || "No matches found"
+        : [joined.slice(0, MAX_SEARCH_CONTENT_CHARS), ...warnings].join("\n");
       return {
-        content: [{ type: "text", text: output.length === 0 ? "No matches found" : output.join("\n").slice(0, 256 * 1024) }],
+        content: [{ type: "text", text }],
         details: Object.keys(details).length === 0 ? undefined : details,
       };
     },
@@ -451,11 +490,19 @@ function safeFindTool(delegate: ToolDefinition, root: string, role: ToolRole): T
       assertSearchDoesNotTargetPrivate(params, true);
       const limit = finiteInteger(raw.limit, 1_000, "find limit", 1, 100_000);
       const { searchRoot, files } = await safeSearchFiles(root, parameterPath(params), role, signal);
-      const results = files.map((file) => relative(searchRoot, file.path).split(sep).join("/"))
-        .filter((path) => matchesGlob(path, raw.pattern as string)).slice(0, limit);
+      const matches = files.map((file) => relative(searchRoot, file.path).split(sep).join("/"))
+        .filter((path) => matchesGlob(path, raw.pattern as string));
+      const results = matches.slice(0, limit), joined = results.join("\n");
+      const resultLimitReached = matches.length > limit, contentLimitReached = joined.length > MAX_SEARCH_CONTENT_CHARS;
+      const warnings = [
+        resultLimitReached ? `Search stopped at the ${limit} result limit; results are incomplete.` : undefined,
+        contentLimitReached ? `Search output stopped at the ${MAX_SEARCH_CONTENT_CHARS} character content limit; results are incomplete.` : undefined,
+      ].filter((warning): warning is string => warning !== undefined);
       return {
-        content: [{ type: "text", text: results.length === 0 ? "No files found matching pattern" : results.join("\n").slice(0, 256 * 1024) }],
-        details: results.length >= limit ? { resultLimitReached: limit } : undefined,
+        content: [{ type: "text", text: results.length === 0 ? "No files found matching pattern" : [joined.slice(0, MAX_SEARCH_CONTENT_CHARS), ...warnings].join("\n") }],
+        details: warnings.length === 0 ? undefined : {
+          ...(resultLimitReached ? { resultLimitReached: limit } : {}), ...(contentLimitReached ? { contentLimitReached: MAX_SEARCH_CONTENT_CHARS } : {}),
+        },
       };
     },
   };
@@ -607,10 +654,22 @@ function prepareAllowedBash(
   if (words[0] === "rm") {
     const paths = words.slice(1).filter((argument) => !argument.startsWith("-"));
     const options = words.slice(1).filter((argument) => argument.startsWith("-"));
-    if (paths.length === 0 || options.some((option) => !["-r", "-f", "-rf", "-fr", "--recursive", "--force"].includes(option))) {
-      throw policyError("rm requires explicit literal repository paths and known options");
+    if (paths.length !== 1) {
+      throw policyError("rm requires exactly one target so deletion ownership is atomic");
     }
-    for (const path of paths) assertPathClass(path, true);
+    if (options.some((option) => ["-r", "-rf", "-fr", "--recursive"].includes(option))) {
+      throw policyError("recursive rm is not supported because partial deletion cannot be reconciled safely");
+    }
+    if (options.some((option) => !["-f", "--force"].includes(option))) {
+      throw policyError("rm accepts only the force option");
+    }
+    for (const path of paths) {
+      const normalized = assertPathClass(path, true);
+      assertNeverMutablePath(normalized);
+      if (isDependencyManifestPath(normalized)) {
+        throw policyError("dependency manifests cannot be deleted by model tools");
+      }
+    }
     const action = bashApprovalAction(words);
     if (!consumeApproval(action)) {
       throw new Error(`Agency policy requires request_human_input explicit one-shot approval for exact action: ${action}`);
@@ -620,12 +679,42 @@ function prepareAllowedBash(
   throw policyError("executable and argv are not on Agency's exact allowlist");
 }
 
-async function assertSafeRmTargets(root: string, command: string): Promise<void> {
+async function assertSafeRmTargets(root: string, command: string): Promise<string[]> {
   const words = shellWords(command);
-  if (words[0] !== "rm") return;
+  if (words[0] !== "rm") return [];
   const canonicalRoot = await repositoryRoot(root);
+  const mutationPaths = new Set<string>();
+  let visited = 0;
+  const visit = async (target: string): Promise<void> => {
+    visited += 1;
+    if (visited > MAX_SEARCH_ENTRIES) throw policyError(`rm target exceeds ${MAX_SEARCH_ENTRIES} entry limit`);
+    let info;
+    try {
+      info = await lstat(target);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw cause;
+    }
+    if (info.isSymbolicLink()) throw policyError("rm cannot traverse or delete symlinks");
+    if (info.isFile()) {
+      if (info.nlink !== 1) throw policyError("rm cannot delete hard-linked files");
+      const path = relative(canonicalRoot, target).split(sep).join("/");
+      assertPathClass(path, true);
+      if (isCredentialPath(path)) throw policyError("credential-like paths cannot be changed by model tools");
+      assertNeverMutablePath(path);
+      if (isDependencyManifestPath(path)) throw policyError("dependency manifests cannot be deleted by model tools");
+      mutationPaths.add(path);
+      return;
+    }
+    if (!info.isDirectory()) throw policyError("rm cannot delete special files");
+    const entries = await readdir(target, { withFileTypes: true });
+    for (const entry of entries) await visit(resolve(target, entry.name));
+  };
   for (const input of words.slice(1).filter((argument) => !argument.startsWith("-"))) {
     const normalized = assertPathClass(input, true);
+    if (isCredentialPath(normalized)) throw policyError("credential-like paths cannot be changed by model tools");
+    assertNeverMutablePath(normalized);
+    if (isDependencyManifestPath(normalized)) throw policyError("dependency manifests cannot be deleted by model tools");
     const target = resolve(canonicalRoot, normalized);
     if (!isWithin(canonicalRoot, target) || target === canonicalRoot) {
       throw policyError("rm target must stay inside repository");
@@ -657,7 +746,9 @@ async function assertSafeRmTargets(root: string, command: string): Promise<void>
       if (cause instanceof Error && cause.message.startsWith("Agency policy")) throw cause;
       if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
     }
+    await visit(target);
   }
+  return [...mutationPaths].sort();
 }
 
 async function assertSafeGitTargets(root: string, command: string): Promise<void> {
@@ -680,11 +771,41 @@ export function assertAllowedBash(
   prepareAllowedBash(command, consumeApproval, verificationCommands);
 }
 
+async function assertUnconditionallyAllowedMutation(
+  root: string,
+  params: unknown,
+  tool: "edit" | "write",
+): Promise<void> {
+  const path = parameterPath(params);
+  assertNeverMutablePath(path);
+  if (!isPackageManifestPath(path)) return;
+
+  let original = "{}";
+  try {
+    original = (await safeReadFile(root, path, "executor")).toString("utf8");
+  } catch (error) {
+    if (!(error instanceof Error && error.message.includes("path does not exist"))) throw error;
+    if (tool === "edit") throw error;
+  }
+  let proposed: string;
+  if (tool === "write") {
+    const content = (params as { content?: unknown }).content;
+    if (typeof content !== "string") throw policyError("write requires string content");
+    proposed = content;
+  } else {
+    const edits = (params as { edits?: Array<{ oldText?: unknown; newText?: unknown }> }).edits;
+    if (!Array.isArray(edits) || edits.length === 0 || edits.some(({ oldText, newText }) => typeof oldText !== "string" || typeof newText !== "string")) {
+      throw policyError("edit requires non-empty string replacement pairs");
+    }
+    proposed = applyPackageManifestEdits(original, edits as Array<{ oldText: string; newText: string }>);
+  }
+  assertPackageDependencyPolicy(original, proposed);
+}
+
 function isSensitivePath(path: string): boolean {
   const normalized = relativePath(path).toLowerCase();
-  const name = normalized.split("/").at(-1) ?? "";
-  return name === "package.json" || /^(?:package-lock|npm-shrinkwrap|pnpm-lock|yarn\.lock|bun\.lockb?)$/u.test(name) ||
-    normalized.startsWith(".github/") || normalized.includes("/migrations/") || normalized.startsWith("migrations/") ||
+  return isPackageManifestPath(path) || isLockfilePath(path) || isMigrationPath(path) ||
+    normalized.startsWith(".github/") ||
     /(?:^|\/)(?:ci|deploy)(?:\/|$)/u.test(normalized) ||
     isCredentialPath(normalized);
 }
@@ -767,6 +888,7 @@ export function createRoleFileTools(options: {
       throw policyError("credential-like paths cannot be changed by model tools");
     }
     await safeMutationPath(root, mutationPath);
+    await assertUnconditionallyAllowedMutation(root, params, tool);
     const approval = await mutationNeedsApproval(root, params, tool);
     if (signal?.aborted === true) throw new DOMException("File mutation aborted", "AbortError");
     if (approval !== undefined && !consumeApproval(approval)) {
@@ -856,14 +978,22 @@ export function createProtectedBashTool(options: {
         throw policyError("bash timeout must be a finite positive number no greater than 2147483.647 seconds");
       }
       await assertSafeGitTargets(options.root, (params as { command: string }).command);
-      await assertSafeRmTargets(options.root, (params as { command: string }).command);
+      const mutationPaths = await assertSafeRmTargets(options.root, (params as { command: string }).command);
       const command = prepareAllowedBash(
         (params as { command: string }).command,
         options.consumeApproval ?? (() => false),
         options.verificationCommands ?? [],
       );
       assertNotAborted(signal, "Bash call aborted");
-      return delegate.execute(toolCallId, { ...(params as object), command }, signal, onUpdate, context);
+      const result = await delegate.execute(toolCallId, { ...(params as object), command }, signal, onUpdate, context);
+      if (mutationPaths.length === 0) return result;
+      const existingDetails = typeof result.details === "object" && result.details !== null
+        ? result.details as Record<string, unknown>
+        : {};
+      return {
+        ...result,
+        details: { ...existingDetails, agencyMutationPaths: mutationPaths },
+      };
     },
   };
 }

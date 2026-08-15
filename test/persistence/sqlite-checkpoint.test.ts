@@ -1,8 +1,8 @@
-import { mkdtemp, stat, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { END, START, StateGraph, StateSchema } from "@langchain/langgraph";
+import { END, MemorySaver, START, StateGraph, StateSchema } from "@langchain/langgraph";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
@@ -33,6 +33,18 @@ function compileTestGraph(
     .compile({ checkpointer });
 }
 
+function compileInterruptedTestGraph(
+  checkpointer: Awaited<
+    ReturnType<typeof createSqliteCheckpointPersistence>
+  >["checkpointer"],
+) {
+  return new StateGraph(TestStateSchema)
+    .addNode("record", (state) => ({ value: state.value }))
+    .addEdge(START, "record")
+    .addEdge("record", END)
+    .compile({ checkpointer, interruptBefore: ["record"] });
+}
+
 function config(threadId: string) {
   return { configurable: { thread_id: threadId } };
 }
@@ -45,7 +57,18 @@ afterEach(async () => {
   );
 });
 
-describe("SQLite checkpoint persistence", () => {
+describe("durable checkpoint persistence", () => {
+  it("has no install-time native checkpoint dependency", async () => {
+    const manifest = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>;
+    };
+
+    expect(manifest.dependencies).not.toHaveProperty("@langchain/langgraph-checkpoint-sqlite");
+    expect(await readFile(join(process.cwd(), "package-lock.json"), "utf8")).not.toContain(
+      '"node_modules/better-sqlite3"',
+    );
+  });
+
   it("survives close and reopen at .devagency/state.db", async () => {
     const projectRoot = await temporaryProject();
     const first = await createSqliteCheckpointPersistence(projectRoot);
@@ -59,9 +82,29 @@ describe("SQLite checkpoint persistence", () => {
 
     expect(reopened.path).toBe(join(projectRoot, ".devagency", "state.db"));
     expect((await stat(reopened.path)).isFile()).toBe(true);
+    expect(JSON.parse(await readFile(reopened.path, "utf8"))).toMatchObject({
+      format: "agency-checkpoints",
+      version: 1,
+    });
     await expect(reopenedGraph.getState(config("thread-1"))).resolves.toMatchObject({
       values: { value: "persisted" },
     });
+    reopened.close();
+  });
+
+  it("does not rewrite a valid checkpoint during reopen", async () => {
+    const projectRoot = await temporaryProject();
+    const first = await createSqliteCheckpointPersistence(projectRoot);
+    const graph = compileTestGraph(first.checkpointer);
+    await graph.invoke({ value: "persisted" }, config("thread-1"));
+    first.close();
+
+    const path = join(projectRoot, ".devagency", "state.db");
+    const fixedTime = new Date("2020-01-02T03:04:05.000Z");
+    await utimes(path, fixedTime, fixedTime);
+
+    const reopened = await createSqliteCheckpointPersistence(projectRoot);
+    expect((await stat(path)).mtimeMs).toBe(fixedTime.getTime());
     reopened.close();
   });
 
@@ -80,6 +123,140 @@ describe("SQLite checkpoint persistence", () => {
       values: { value: "second" },
     });
     persistence.close();
+  });
+
+  it("serializes concurrent thread updates before reopening", async () => {
+    const projectRoot = await temporaryProject();
+    const persistence = await createSqliteCheckpointPersistence(projectRoot);
+    const graph = compileTestGraph(persistence.checkpointer);
+
+    await Promise.all(Array.from({ length: 12 }, (_, index) =>
+      graph.invoke({ value: `value-${index}` }, config(`thread-${index}`)),
+    ));
+    persistence.close();
+
+    const reopened = await createSqliteCheckpointPersistence(projectRoot);
+    const reopenedGraph = compileTestGraph(reopened.checkpointer);
+    await Promise.all(Array.from({ length: 12 }, async (_, index) => {
+      await expect(reopenedGraph.getState(config(`thread-${index}`))).resolves.toMatchObject({
+        values: { value: `value-${index}` },
+      });
+    }));
+    reopened.close();
+  });
+
+  it("merges updates from independent persistence instances and refreshes reads", async () => {
+    const projectRoot = await temporaryProject();
+    const first = await createSqliteCheckpointPersistence(projectRoot);
+    const second = await createSqliteCheckpointPersistence(projectRoot);
+    const firstGraph = compileTestGraph(first.checkpointer);
+    const secondGraph = compileTestGraph(second.checkpointer);
+
+    await Promise.all([
+      firstGraph.invoke({ value: "from-first" }, config("first-thread")),
+      secondGraph.invoke({ value: "from-second" }, config("second-thread")),
+    ]);
+
+    await expect(firstGraph.getState(config("second-thread"))).resolves.toMatchObject({
+      values: { value: "from-second" },
+    });
+    await expect(secondGraph.getState(config("first-thread"))).resolves.toMatchObject({
+      values: { value: "from-first" },
+    });
+
+    first.close();
+    second.close();
+    const reopened = await createSqliteCheckpointPersistence(projectRoot);
+    const reopenedGraph = compileTestGraph(reopened.checkpointer);
+    await expect(reopenedGraph.getState(config("first-thread"))).resolves.toMatchObject({
+      values: { value: "from-first" },
+    });
+    await expect(reopenedGraph.getState(config("second-thread"))).resolves.toMatchObject({
+      values: { value: "from-second" },
+    });
+    reopened.close();
+  });
+
+  it("migrates an interrupted legacy SQLite checkpoint and resumes its pending work", async () => {
+    const projectRoot = await temporaryProject();
+    const metadataRoot = join(projectRoot, ".devagency");
+    const path = join(metadataRoot, "state.db");
+    const source = new MemorySaver();
+    const sourceGraph = compileInterruptedTestGraph(source);
+    await sourceGraph.invoke({ value: "legacy" }, config("legacy-thread"));
+    await expect(sourceGraph.getState(config("legacy-thread"))).resolves.toMatchObject({
+      values: { value: "legacy" },
+      next: ["record"],
+    });
+    const interruptedTuple = await source.getTuple(config("legacy-thread"));
+    expect(interruptedTuple).toBeDefined();
+    await source.putWrites(
+      interruptedTuple!.config,
+      [["migration-proof", { retained: true }]],
+      "migration-proof-task",
+    );
+    const legacyPendingWrites = (await source.getTuple(config("legacy-thread")))?.pendingWrites;
+    expect(legacyPendingWrites?.length).toBeGreaterThan(0);
+
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(metadataRoot, { mode: 0o700 });
+    const { DatabaseSync } = await import("node:sqlite");
+    const database = new DatabaseSync(path);
+    database.exec(`
+      CREATE TABLE checkpoints (
+        thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL DEFAULT '',
+        checkpoint_id TEXT NOT NULL, parent_checkpoint_id TEXT, type TEXT,
+        checkpoint BLOB, metadata BLOB,
+        PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+      );
+      CREATE TABLE writes (
+        thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL DEFAULT '',
+        checkpoint_id TEXT NOT NULL, task_id TEXT NOT NULL, idx INTEGER NOT NULL,
+        channel TEXT NOT NULL, type TEXT, value BLOB,
+        PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+      );
+    `);
+    const insertCheckpoint = database.prepare(`
+      INSERT INTO checkpoints VALUES (?, ?, ?, ?, 'json', ?, ?)
+    `);
+    for (const [threadId, namespaces] of Object.entries(source.storage)) {
+      for (const [namespace, checkpoints] of Object.entries(namespaces)) {
+        for (const [checkpointId, [checkpoint, metadata, parentId]] of Object.entries(checkpoints)) {
+          insertCheckpoint.run(threadId, namespace, checkpointId, parentId ?? null, checkpoint, metadata);
+        }
+      }
+    }
+    const insertWrite = database.prepare(`
+      INSERT INTO writes VALUES (?, ?, ?, ?, ?, ?, 'json', ?)
+    `);
+    for (const [outerKey, writes] of Object.entries(source.writes)) {
+      const [threadId, namespace, checkpointId] = JSON.parse(outerKey) as string[];
+      for (const [innerKey, [taskId, channel, value]] of Object.entries(writes)) {
+        const index = Number(innerKey.slice(innerKey.lastIndexOf(",") + 1));
+        insertWrite.run(threadId, namespace, checkpointId, taskId, index, channel, value);
+      }
+    }
+    database.close();
+
+    const migrated = await createSqliteCheckpointPersistence(projectRoot);
+    const migratedGraph = compileTestGraph(migrated.checkpointer);
+    await expect(migratedGraph.getState(config("legacy-thread"))).resolves.toMatchObject({
+      values: { value: "legacy" },
+      next: ["record"],
+    });
+    expect(
+      (await migrated.checkpointer.getTuple(config("legacy-thread")))?.pendingWrites,
+    ).toEqual(legacyPendingWrites);
+    await migratedGraph.invoke(null, config("legacy-thread"));
+    await expect(migratedGraph.getState(config("legacy-thread"))).resolves.toMatchObject({
+      values: { value: "legacy" },
+      next: [],
+    });
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+      format: "agency-checkpoints",
+      version: 1,
+    });
+    migrated.close();
   });
 
   it("deletes a terminal thread while retaining an incomplete thread", async () => {
@@ -300,6 +477,28 @@ describe("SQLite checkpoint persistence", () => {
     persistence.close();
     await expect(persistence.deleteThread("thread-1")).rejects.toMatchObject({
       code: "CHECKPOINT_DELETE_FAILED",
+    });
+  });
+
+  it("rejects corrupt and oversized checkpoint state during initialization", async () => {
+    const corruptRoot = await temporaryProject();
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(join(corruptRoot, ".devagency"), { mode: 0o700 });
+    await writeFile(join(corruptRoot, ".devagency", "state.db"), "not checkpoint data", {
+      mode: 0o600,
+    });
+    await expect(createSqliteCheckpointPersistence(corruptRoot)).rejects.toMatchObject({
+      code: "CHECKPOINT_INITIALIZATION_FAILED",
+    });
+
+    const oversizedRoot = await temporaryProject();
+    const metadataRoot = join(oversizedRoot, ".devagency");
+    await mkdir(metadataRoot, { mode: 0o700 });
+    const path = join(metadataRoot, "state.db");
+    await writeFile(path, "x", { mode: 0o600 });
+    await truncate(path, 64 * 1024 * 1024 + 1);
+    await expect(createSqliteCheckpointPersistence(oversizedRoot)).rejects.toMatchObject({
+      code: "CHECKPOINT_INITIALIZATION_FAILED",
     });
   });
 

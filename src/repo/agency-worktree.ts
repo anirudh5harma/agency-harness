@@ -68,6 +68,32 @@ async function load(sourceRoot: string): Promise<WorktreeMetadata> {
   }
 }
 
+async function loadExistingReadOnly(sourceRoot: string): Promise<WorktreeMetadata | null> {
+  const directory = join(sourceRoot, ".devagency");
+  const path = metadataPath(sourceRoot);
+  try {
+    const directoryInfo = await lstat(directory);
+    if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) return null;
+    const fileInfo = await lstat(path);
+    if (!fileInfo.isFile() || fileInfo.isSymbolicLink() || fileInfo.nlink !== 1 || fileInfo.size > 1024 * 1024) return null;
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const before = await handle.stat({ bigint: true });
+      if (!before.isFile() || before.nlink !== 1n || before.size > 1024n * 1024n) return null;
+      const contents = await handle.readFile("utf8");
+      const after = await handle.stat({ bigint: true });
+      if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs) return null;
+      const parsed = JSON.parse(contents) as WorktreeMetadata;
+      return parsed.version === 1 && Array.isArray(parsed.worktrees) ? parsed : null;
+    } finally {
+      await handle.close();
+    }
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null;
+    return null;
+  }
+}
+
 async function save(sourceRoot: string, metadata: WorktreeMetadata): Promise<void> {
   await ensureMetadataDirectory(sourceRoot);
   const path = metadataPath(sourceRoot);
@@ -202,7 +228,7 @@ export async function findAgencyWorktree(cwd: string): Promise<AgencyWorktreeCon
   const root = await findGitRoot(cwd);
   const candidate = resolve(root, "..", "..");
   for (const sourceRoot of [root, candidate]) {
-    const metadata = await load(sourceRoot).catch(() => null);
+    const metadata = await loadExistingReadOnly(sourceRoot);
     const match = metadata?.worktrees.find(({ path }) => resolve(path) === resolve(root));
     if (match !== undefined) return match;
   }

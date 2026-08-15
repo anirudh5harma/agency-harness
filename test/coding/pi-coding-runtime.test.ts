@@ -471,8 +471,8 @@ describe("PiCodingRuntime", () => {
 
   it("scopes consequential shell approval to the exact command for one use", async () => {
     const testRepo = { ...repo, rootPath: process.cwd() };
-    const command = "rm -rf build";
-    const action = bashApprovalAction(["rm", "-rf", "build"]);
+    const command = "rm obsolete-output.js";
+    const action = bashApprovalAction(["rm", "obsolete-output.js"]);
     let prompts = 0;
     let firstRun: unknown;
     let secondError: unknown;
@@ -767,6 +767,48 @@ describe("PiCodingRuntime", () => {
     expect(boundary.sessions[0]?.prompts[1]?.length).toBeLessThan(10_000);
   });
 
+  it("defensively redacts verification secrets from repair prompts", async () => {
+    const boundary = createBoundary({});
+    const runtime = await PiCodingRuntime.create({ sdk: boundary.sdk });
+    await runtime.execute({ intent: "Build", repo, plan, sessionId: "agency-secrets" });
+    const secrets = [
+      "Bearer bearer-secret-value",
+      "sk-providerSecret123",
+      "token=plain-token-value",
+      "password=hunter2",
+      "AKIAIOSFODNN7EXAMPLE",
+      "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    ];
+
+    await runtime.repair({
+      intent: "Build",
+      repo,
+      plan,
+      sessionId: "agency-secrets",
+      attempt: 1,
+      changedFiles: [],
+      failure: {
+        stage: "verifying",
+        message: `failed ${secrets.join(" ")}`,
+        recoverable: true,
+        command: {
+          command: "npm",
+          args: ["test"],
+          exitCode: 1,
+          signal: null,
+          stdout: secrets.join("\n"),
+          stderr: secrets.join("\n"),
+          durationMs: 1,
+          timedOut: false,
+        },
+      },
+    });
+
+    const prompt = boundary.sessions[0]?.prompts[1] ?? "";
+    for (const secret of secrets) expect(prompt).not.toContain(secret);
+    expect(prompt).toContain("[REDACTED]");
+  });
+
   it("streams assistant text while returning the final message without duplicating it", async () => {
     const boundary = createBoundary({
       executorPrompt: async (session) => {
@@ -881,7 +923,7 @@ describe("PiCodingRuntime", () => {
     await expect(invoke("git diff -- src/coding/tool-policy.ts")).resolves.toBeDefined();
 
     for (const destructive of ["rm -rf build", "rm -fr build", "rm --recursive build"]) {
-      await expect(invoke(destructive), destructive).rejects.toThrow("one-shot approval");
+      await expect(invoke(destructive), destructive).rejects.toThrow("recursive rm");
     }
   });
 
@@ -1089,6 +1131,56 @@ describe("normalizePiEvent", () => {
     expect(JSON.stringify(events)).not.toContain("very large raw output");
   });
 
+  it("emits validated protected-shell deletion paths only after success", () => {
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    normalizePiEvent({
+      type: "tool_execution_start",
+      toolCallId: "rm-1",
+      toolName: "bash",
+      args: { command: "rm -rf build" },
+    }, state, 100);
+    expect(normalizePiEvent({
+      type: "tool_execution_end",
+      toolCallId: "rm-1",
+      toolName: "bash",
+      result: {
+        content: [{ type: "text", text: "deleted" }],
+        details: { agencyMutationPaths: ["build/output.js", "../escape", ".git/config", "build/output.js"] },
+      },
+      isError: false,
+    }, state, 125)).toEqual([
+      { type: "command_finished", command: "rm -rf build", exitCode: 0, durationMs: 25 },
+      { type: "file_changed", path: "build/output.js" },
+    ]);
+    expect(state.changedFiles).toEqual(new Set(["build/output.js"]));
+
+    const failedState = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    normalizePiEvent({
+      type: "tool_execution_start",
+      toolCallId: "rm-failed",
+      toolName: "bash",
+      args: { command: "rm build/output.js" },
+    }, failedState, 100);
+    expect(normalizePiEvent({
+      type: "tool_execution_end",
+      toolCallId: "rm-failed",
+      toolName: "bash",
+      result: { content: [], details: { agencyMutationPaths: ["build/output.js"] } },
+      isError: true,
+    }, failedState, 125)).not.toContainEqual({ type: "file_changed", path: "build/output.js" });
+    expect(failedState.changedFiles).toEqual(new Set());
+  });
+
   it("redacts secrets from command events before emission", () => {
     const state = {
       calls: new Map(),
@@ -1157,6 +1249,38 @@ describe("normalizePiEvent", () => {
     expect(rendered).not.toContain("secret123");
     expect(rendered).not.toContain("bearer-secret");
     expect(rendered).not.toContain("hunter2");
+  });
+
+  it("redacts credentialed URI userinfo at every assistant-delta split position", () => {
+    const uris = [
+      "https://deploy-user:p%40ss@example.test/private",
+      "custom+ssh://deploy-user:p%40ss@example.test/private",
+    ];
+    for (const uri of uris) {
+      const text = `Connect ${uri} now`;
+      for (let split = 0; split <= text.length; split += 1) {
+        const state = {
+          calls: new Map(),
+          changedFiles: new Set<string>(),
+          finalMessage: "",
+          providerError: undefined,
+        };
+        const events = [
+          ...normalizePiEvent(assistantTextDelta(text.slice(0, split)), state),
+          ...normalizePiEvent(assistantTextDelta(text.slice(split)), state),
+          ...normalizePiEvent(assistantMessage(text), state),
+        ];
+        const rendered = events
+          .filter((event): event is Extract<AgencyEvent, { type: "assistant_text_delta" }> =>
+            event.type === "assistant_text_delta")
+          .map(({ delta }) => delta)
+          .join("");
+        expect(rendered, `${uri} split ${split}`).not.toContain("deploy-user");
+        expect(rendered, `${uri} split ${split}`).not.toContain("p%40ss");
+        expect(rendered, `${uri} split ${split}`).toContain("[REDACTED]");
+        expect(rendered, `${uri} split ${split}`).toContain("@example.test/private");
+      }
+    }
   });
 
   it("keeps assignment values sensitive across whitespace and escaped quote chunks", () => {

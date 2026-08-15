@@ -3,8 +3,9 @@ import { randomUUID } from "node:crypto";
 import type { CodingRuntime } from "../coding/index.js";
 import { PiCodingRuntime } from "../coding/index.js";
 import {
-  HumanDecisionRequestSchema,
+  APPROVAL_DECISION_OPTIONS,
   HumanDecisionResponseSchema,
+  recoverHumanDecisionRequest,
   type HumanDecisionRequest,
   type HumanDecisionResponse,
   type RunSummary,
@@ -47,6 +48,17 @@ import {
 } from "./renderer.js";
 
 const MAX_USER_INTENT_CHARS = 8_000;
+
+function quotedTerminalLine(value: string): string {
+  const encoded = [...value].map((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) || /[\p{Cf}\p{Zl}\p{Zp}]/u.test(character)) {
+      return `\\u{${codePoint.toString(16).padStart(4, "0")}}`;
+    }
+    return JSON.stringify(character).slice(1, -1);
+  }).join("");
+  return `"${encoded}"`;
+}
 
 async function closeResources(
   actions: readonly (() => void | Promise<void>)[],
@@ -126,6 +138,7 @@ export interface AgencyApplicationDependencies {
     requestDiscard(signal: AbortSignal): Promise<boolean>;
   };
   createId?: () => string;
+  onPromptReady?: () => void;
 }
 
 export class AgencyApplication implements ReplHandler {
@@ -142,6 +155,7 @@ export class AgencyApplication implements ReplHandler {
   readonly #createId: () => string;
   readonly #gitCheckpoints: GitCheckpointManager;
   readonly #evaluationStore: EvaluationRepository;
+  readonly #onPromptReady: () => void;
   readonly #detachMutationTracking: () => void;
   #activeMutationRunId: string | null = null;
   #mutationWrites: Promise<void> = Promise.resolve();
@@ -174,6 +188,7 @@ export class AgencyApplication implements ReplHandler {
     this.#inspectRecovery =
       input.dependencies.inspectRecovery ?? inspectIncompleteRunRecovery;
     this.#createId = input.dependencies.createId ?? randomUUID;
+    this.#onPromptReady = input.dependencies.onPromptReady ?? (() => {});
     this.#gitCheckpoints = new GitCheckpointManager(input.inspection.rootPath);
     this.#evaluationStore = input.evaluationStore;
     this.#detachMutationTracking = input.eventBus.subscribe("file_changed", ({ path }) => {
@@ -296,7 +311,7 @@ export class AgencyApplication implements ReplHandler {
   async run(): Promise<void> {
     this.#renderer.header(this.#inspection, this.#session);
     await this.#offerRecovery();
-    await new AgencyRepl(this.#io, this).run();
+    await new AgencyRepl(this.#io, this, "agency> ", this.#onPromptReady).run();
   }
 
   async handle(line: string, signal: AbortSignal): Promise<"continue" | "exit"> {
@@ -448,8 +463,12 @@ export class AgencyApplication implements ReplHandler {
         activeController = new AbortController();
         const response = await this.#promptHumanDecision(pendingRequest, activeController.signal);
         if (response === null || activeController.signal.aborted) {
-          if (activeController.signal.aborted) await this.#finalizeCancellation(candidate.entry.threadId);
-          else this.#renderer.setRunStatus("idle");
+          const finalized = await this.#finalizeCancellation(candidate.entry.threadId);
+          if (finalized) {
+            await this.#gitCheckpoints.finishRun(candidate.entry.runId).catch((error: unknown) => {
+              this.#renderer.recovery(`Warning: could not finalize undo ownership for recovered run ${candidate.entry.runId}: ${error instanceof Error ? error.message : String(error)}.`);
+            });
+          }
           return;
         }
         this.#renderer.setRunStatus("running");
@@ -540,10 +559,7 @@ export class AgencyApplication implements ReplHandler {
   #pendingRequest(snapshot: unknown): HumanDecisionRequest | null {
     const values = checkpointValues(snapshot);
     if (values === null) return null;
-    const parsed = HumanDecisionRequestSchema.safeParse(
-      values.pendingHumanDecision,
-    );
-    return parsed.success ? parsed.data : null;
+    return recoverHumanDecisionRequest(values.pendingHumanDecision);
   }
 
   async #resolveHumanInput(
@@ -567,8 +583,9 @@ export class AgencyApplication implements ReplHandler {
     this.#renderer.message(request.question);
     if (request.context !== undefined) this.#renderer.message(`Context: ${request.context}`);
     if (request.risk !== undefined) this.#renderer.message(`Risk: ${request.risk}`);
-    if (request.kind === "approval") this.#renderer.message(`Exact action: ${request.action}`);
-    request.options.forEach((option, index) => {
+    if (request.kind === "approval") this.#renderer.message(`Exact action: ${quotedTerminalLine(request.action!)}`);
+    const displayedOptions = request.kind === "approval" ? APPROVAL_DECISION_OPTIONS : request.options;
+    displayedOptions.forEach((option, index) => {
       const shortcut = request.kind === "approval"
         ? ({ approve: "a", reject: "r", edit: "e" } as Record<string, string>)[option.id]
         : undefined;
@@ -591,8 +608,8 @@ export class AgencyApplication implements ReplHandler {
       const shortcut = request.kind === "approval"
         ? ({ a: "approve", r: "reject", e: "edit" } as Record<string, string>)[value.toLowerCase()]
         : undefined;
-      const numeric = /^\d+$/u.test(value) ? request.options[Number(value) - 1]?.id : undefined;
-      const optionId = shortcut ?? numeric ?? request.options.find(
+      const numeric = /^\d+$/u.test(value) ? displayedOptions[Number(value) - 1]?.id : undefined;
+      const optionId = shortcut ?? numeric ?? displayedOptions.find(
         ({ id }) => id.toLowerCase() === value.toLowerCase(),
       )?.id;
       if (optionId === "edit") {
@@ -658,19 +675,22 @@ export class AgencyApplication implements ReplHandler {
     }
   }
 
-  async #finalizeCancellation(threadId: string): Promise<void> {
+  async #finalizeCancellation(threadId: string): Promise<boolean> {
     this.#renderer.setRunStatus("cancelled");
     try {
       const state = await this.#graph.cancel?.(threadId);
       if (state === undefined) {
         this.#renderer.message("Cancelled.");
-        return;
+        return false;
       }
       await this.#handleTerminalRun(state);
+      return state.failure?.stage !== "finalizing"
+        && ["completed", "failed", "cancelled"].includes(state.status);
     } catch (error) {
       this.#renderer.recovery(
         `Cancellation finalization for ${threadId} remains recoverable: ${error instanceof Error ? error.message : String(error)}.`,
       );
+      return false;
     }
   }
 

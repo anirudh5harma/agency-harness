@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,8 +12,14 @@ import {
   GitCheckpointManager,
   createAgencyWorktree,
   discardAgencyWorktree,
+  findAgencyWorktree,
   runBoundedGitWithInput,
 } from "../../src/repo/index.js";
+import {
+  bashApprovalAction,
+  createProtectedBashTool,
+  normalizePiEvent,
+} from "../../src/coding/index.js";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -368,6 +374,23 @@ describe("Git checkpoints", () => {
 });
 
 describe("Agency worktrees", () => {
+  it("discovers read-only when neither repository nor ancestor has a registry", async () => {
+    const outer = await mkdtemp(join(tmpdir(), "agency-worktree-discovery-"));
+    temporaryDirectories.push(outer);
+    const root = join(outer, "projects", "target");
+    await mkdir(root, { recursive: true });
+    await git(root, ["init", "-q"]);
+
+    await expect(findAgencyWorktree(root)).resolves.toBeNull();
+    await expect(lstat(join(root, ".devagency"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(join(outer, ".devagency"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    await mkdir(join(root, ".devagency"), { mode: 0o755 });
+    const modeBefore = (await lstat(join(root, ".devagency"))).mode & 0o777;
+    await expect(findAgencyWorktree(root)).resolves.toBeNull();
+    expect((await lstat(join(root, ".devagency"))).mode & 0o777).toBe(modeBefore);
+  });
+
   it("creates isolated owned worktree and only discards exact clean ownership", async () => {
     const root = await repository();
     const context = await createAgencyWorktree(root, { id: "12345678", slug: "test project" });
@@ -379,6 +402,19 @@ describe("Agency worktrees", () => {
     await expect(discardAgencyWorktree(context, { confirmed: false })).rejects.toMatchObject({ code: "GIT_DESTRUCTIVE_CONFIRMATION_REQUIRED" });
     await discardAgencyWorktree(context, { confirmed: true });
     expect((await git(root, ["branch", "--list", context.branch])).trim()).toBe("");
+  });
+
+  it("finds an owned worktree without changing its source metadata", async () => {
+    const root = await repository();
+    const context = await createAgencyWorktree(root, { id: "findowned", slug: "test project" });
+    temporaryDirectories.push(context.path);
+    const registryPath = join(root, ".devagency", "agency-worktrees.json");
+    const before = await readFile(registryPath);
+
+    await expect(findAgencyWorktree(context.path)).resolves.toEqual(context);
+    expect(await readFile(registryPath)).toEqual(before);
+
+    await discardAgencyWorktree(context, { confirmed: true });
   });
 
   it("rejects unborn worktree creation truthfully", async () => {
@@ -404,5 +440,57 @@ describe("Agency worktrees", () => {
 
     await expect(discardAgencyWorktree(context, { confirmed: true })).rejects.toMatchObject({ code: "GIT_WORKTREE_DIRTY" });
     await discardAgencyWorktree(context, { confirmed: true, discardDirty: true });
+  });
+});
+
+describe("protected shell deletion ownership", () => {
+  it("restores an unchanged exact-approved deletion and refuses a user-diverged path", async () => {
+    const exercise = async (diverge: boolean) => {
+      const root = await repository();
+      const manager = new GitCheckpointManager(root);
+      const checkpoint = await manager.create("before protected rm");
+      const runId = diverge ? "rm-diverged" : "rm-unchanged";
+      await manager.beginRun(runId);
+      const command = "rm delete-me.txt";
+      const approval = bashApprovalAction(["rm", "delete-me.txt"]);
+      const bash = createProtectedBashTool({
+        root,
+        consumeApproval: (action) => action === approval,
+      });
+      const state = {
+        calls: new Map(),
+        changedFiles: new Set<string>(),
+        finalMessage: "",
+        providerError: undefined,
+      };
+      normalizePiEvent({
+        type: "tool_execution_start",
+        toolCallId: runId,
+        toolName: "bash",
+        args: { command },
+      }, state);
+      const result = await bash.execute(runId, { command }, undefined, undefined, {} as never);
+      const events = normalizePiEvent({
+        type: "tool_execution_end",
+        toolCallId: runId,
+        toolName: "bash",
+        result,
+        isError: false,
+      }, state);
+      for (const event of events) {
+        if (event.type === "file_changed") await manager.recordSuccessfulFileMutation(runId, event.path);
+      }
+      if (diverge) await writeFile(join(root, "delete-me.txt"), "user replacement\n");
+      await manager.finishRun(runId, [...state.changedFiles]);
+      return { root, checkpoint, undo: await manager.undo(checkpoint.id, { allowDeletes: true }) };
+    };
+
+    const unchanged = await exercise(false);
+    expect(unchanged.undo.restored).toEqual(["delete-me.txt"]);
+    expect(await readFile(join(unchanged.root, "delete-me.txt"), "utf8")).toBe("restore me\n");
+
+    const diverged = await exercise(true);
+    expect(diverged.undo.restored).toEqual([]);
+    expect(await readFile(join(diverged.root, "delete-me.txt"), "utf8")).toBe("user replacement\n");
   });
 });

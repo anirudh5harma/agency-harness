@@ -16,6 +16,32 @@ const fixtureRoot = join(projectRoot, "fixtures", "divide");
 const builtCli = join(projectRoot, "dist", "cli", "index.js");
 const timeoutMs = Number.parseInt(process.env.AGENCY_REAL_PI_TIMEOUT_MS ?? "300000", 10);
 const MAX_DIAGNOSTIC_CHARS = 8_000;
+const PROMPT_READY_SIGNAL = "agency-prompt-ready";
+
+export function createPromptReadyInputDriver(inputs, sink) {
+  let buffered = "";
+  let sentInputs = 0;
+  return {
+    accept(chunk) {
+      buffered += chunk;
+      while (buffered.includes("\n")) {
+        const newline = buffered.indexOf("\n");
+        const signal = buffered.slice(0, newline);
+        buffered = buffered.slice(newline + 1);
+        if (signal !== PROMPT_READY_SIGNAL) {
+          throw new Error("Agency emitted an invalid prompt-ready control signal");
+        }
+        if (sentInputs >= inputs.length) {
+          throw new Error("Agency requested more input than the acceptance script provides");
+        }
+        const input = `${inputs[sentInputs]}\n`;
+        sentInputs += 1;
+        if (sentInputs === inputs.length) sink.end(input);
+        else sink.write(input);
+      }
+    },
+  };
+}
 
 function help() {
   process.stdout.write(`Real-Pi divide acceptance\n\nUsage:\n  npm run acceptance:real-pi\n\nBuilds Agency, copies fixtures/divide to a temporary Git repository, installs the\nfixture dependencies, and sends exactly two conversational turns through the normal\nconfigured Pi provider/model. Configure Pi exactly as for ordinary Agency use; this\nscript contains and reads no embedded credentials.\n\nOptional environment:\n  AGENCY_REAL_PI_TIMEOUT_MS  Total Agency subprocess timeout (default: 300000)\n`);
@@ -48,13 +74,16 @@ function runAgency(cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [builtCli], {
       cwd,
-      env: process.env,
-      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, AGENCY_ACCEPTANCE_PROMPT_READY_FD: "3" },
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
-    let sentInputs = 0;
     let settled = false;
+    const inputDriver = createPromptReadyInputDriver(inputs, {
+      write: (value) => child.stdin.write(value),
+      end: (value) => child.stdin.end(value),
+    });
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
@@ -67,12 +96,17 @@ function runAgency(cwd) {
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
       if (stdout.length > 2 * 1024 * 1024) child.kill("SIGTERM");
-      const prompts = stdout.match(/agency> /g)?.length ?? 0;
-      while (sentInputs < prompts && sentInputs < inputs.length) {
-        const input = inputs[sentInputs];
-        sentInputs += 1;
-        if (sentInputs === inputs.length) child.stdin.end(`${input}\n`);
-        else child.stdin.write(`${input}\n`);
+    });
+    child.stdio[3].on("data", (chunk) => {
+      try {
+        inputDriver.accept(chunk.toString());
+      } catch (error) {
+        child.kill("SIGTERM");
+        clearTimeout(timer);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
       }
     });
     child.stderr.on("data", (chunk) => {
