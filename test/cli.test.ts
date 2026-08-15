@@ -642,7 +642,7 @@ describe("Agency terminal application", () => {
     expect(output.value).toContain("[a] Approve");
     expect(output.value).not.toContain("[r] Approve");
     expect(output.value).not.toContain("Harmless");
-    expect(output.value).toContain("Exact action: npx prisma migrate deploy");
+    expect(output.value).toContain('Exact action: "npx prisma migrate deploy"');
     expect(output.value).toContain("Done: migration guidance applied");
   });
 

@@ -49,6 +49,17 @@ import {
 
 const MAX_USER_INTENT_CHARS = 8_000;
 
+function quotedTerminalLine(value: string): string {
+  const encoded = [...value].map((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) || /\p{Cf}/u.test(character)) {
+      return `\\u{${codePoint.toString(16).padStart(4, "0")}}`;
+    }
+    return JSON.stringify(character).slice(1, -1);
+  }).join("");
+  return `"${encoded}"`;
+}
+
 async function closeResources(
   actions: readonly (() => void | Promise<void>)[],
   primaryError?: unknown,
@@ -568,7 +579,7 @@ export class AgencyApplication implements ReplHandler {
     this.#renderer.message(request.question);
     if (request.context !== undefined) this.#renderer.message(`Context: ${request.context}`);
     if (request.risk !== undefined) this.#renderer.message(`Risk: ${request.risk}`);
-    if (request.kind === "approval") this.#renderer.message(`Exact action: ${request.action}`);
+    if (request.kind === "approval") this.#renderer.message(`Exact action: ${quotedTerminalLine(request.action!)}`);
     const displayedOptions = request.kind === "approval" ? APPROVAL_DECISION_OPTIONS : request.options;
     displayedOptions.forEach((option, index) => {
       const shortcut = request.kind === "approval"

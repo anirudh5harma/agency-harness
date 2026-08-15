@@ -390,7 +390,11 @@ describe("Agency tool policy", () => {
       await expect(bash.execute("invalid-timeout", { command: "rm -rf build", timeout }, undefined, undefined, {} as never), String(timeout)).rejects.toThrow("timeout");
     }
     expect(consumeApproval).not.toHaveBeenCalled();
-    await expect(bash.execute("approved", { command: "rm -rf build", timeout: 5 }, undefined, undefined, {} as never)).resolves.toBeDefined();
+    await mkdir(join(root, "build"));
+    await writeFile(join(root, "build", "output.js"), "generated\n");
+    await expect(bash.execute("approved", { command: "rm -rf build", timeout: 5 }, undefined, undefined, {} as never)).resolves.toMatchObject({
+      details: { agencyMutationPaths: ["build/output.js"] },
+    });
     expect(consumeApproval).toHaveBeenCalledOnce();
   });
 });

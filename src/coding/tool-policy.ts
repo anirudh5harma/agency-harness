@@ -621,12 +621,38 @@ function prepareAllowedBash(
   throw policyError("executable and argv are not on Agency's exact allowlist");
 }
 
-async function assertSafeRmTargets(root: string, command: string): Promise<void> {
+async function assertSafeRmTargets(root: string, command: string): Promise<string[]> {
   const words = shellWords(command);
-  if (words[0] !== "rm") return;
+  if (words[0] !== "rm") return [];
   const canonicalRoot = await repositoryRoot(root);
+  const mutationPaths = new Set<string>();
+  let visited = 0;
+  const visit = async (target: string): Promise<void> => {
+    visited += 1;
+    if (visited > MAX_SEARCH_ENTRIES) throw policyError(`rm target exceeds ${MAX_SEARCH_ENTRIES} entry limit`);
+    let info;
+    try {
+      info = await lstat(target);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw cause;
+    }
+    if (info.isSymbolicLink()) throw policyError("rm cannot traverse or delete symlinks");
+    if (info.isFile()) {
+      if (info.nlink !== 1) throw policyError("rm cannot delete hard-linked files");
+      const path = relative(canonicalRoot, target).split(sep).join("/");
+      assertPathClass(path, true);
+      if (isCredentialPath(path)) throw policyError("credential-like paths cannot be changed by model tools");
+      mutationPaths.add(path);
+      return;
+    }
+    if (!info.isDirectory()) throw policyError("rm cannot delete special files");
+    const entries = await readdir(target, { withFileTypes: true });
+    for (const entry of entries) await visit(resolve(target, entry.name));
+  };
   for (const input of words.slice(1).filter((argument) => !argument.startsWith("-"))) {
     const normalized = assertPathClass(input, true);
+    if (isCredentialPath(normalized)) throw policyError("credential-like paths cannot be changed by model tools");
     const target = resolve(canonicalRoot, normalized);
     if (!isWithin(canonicalRoot, target) || target === canonicalRoot) {
       throw policyError("rm target must stay inside repository");
@@ -658,7 +684,9 @@ async function assertSafeRmTargets(root: string, command: string): Promise<void>
       if (cause instanceof Error && cause.message.startsWith("Agency policy")) throw cause;
       if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
     }
+    await visit(target);
   }
+  return [...mutationPaths].sort();
 }
 
 async function assertSafeGitTargets(root: string, command: string): Promise<void> {
@@ -967,14 +995,22 @@ export function createProtectedBashTool(options: {
         throw policyError("bash timeout must be a finite positive number no greater than 2147483.647 seconds");
       }
       await assertSafeGitTargets(options.root, (params as { command: string }).command);
-      await assertSafeRmTargets(options.root, (params as { command: string }).command);
+      const mutationPaths = await assertSafeRmTargets(options.root, (params as { command: string }).command);
       const command = prepareAllowedBash(
         (params as { command: string }).command,
         options.consumeApproval ?? (() => false),
         options.verificationCommands ?? [],
       );
       assertNotAborted(signal, "Bash call aborted");
-      return delegate.execute(toolCallId, { ...(params as object), command }, signal, onUpdate, context);
+      const result = await delegate.execute(toolCallId, { ...(params as object), command }, signal, onUpdate, context);
+      if (mutationPaths.length === 0) return result;
+      const existingDetails = typeof result.details === "object" && result.details !== null
+        ? result.details as Record<string, unknown>
+        : {};
+      return {
+        ...result,
+        details: { ...existingDetails, agencyMutationPaths: mutationPaths },
+      };
     },
   };
 }

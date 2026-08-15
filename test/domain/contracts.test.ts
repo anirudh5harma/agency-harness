@@ -137,6 +137,41 @@ describe("human decision contracts", () => {
       { id: "edit", label: "Edit", description: "Provide different guidance; do not run the original action." },
     ]);
   });
+
+  it("rejects terminal-spoofing controls only from approval presentation", () => {
+    const approval = {
+      id: "decision-safe-terminal",
+      kind: "approval" as const,
+      question: "Approve the exact action?",
+      action: "rm build/output.js",
+      options: [
+        { id: "approve", label: "Approve", description: "Run once." },
+        { id: "reject", label: "Reject", description: "Cancel." },
+        { id: "edit", label: "Edit", description: "Change guidance." },
+      ],
+      allowCustom: true,
+    };
+
+    for (const injected of ["line one\nline two", "safe\u202Etxt", "safe\u2066txt"]) {
+      expect(() => HumanDecisionRequestSchema.parse({ ...approval, question: injected })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({ ...approval, action: injected })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({
+        ...approval,
+        options: approval.options.map((option, index) => index === 0 ? { ...option, label: injected } : option),
+      })).toThrow();
+    }
+
+    expect(HumanDecisionRequestSchema.parse({
+      id: "clarification-multiline",
+      kind: "clarification",
+      question: "Compare these choices:\n- local\n- hosted",
+      options: [
+        { id: "local", label: "Local", description: "Keep data here." },
+        { id: "hosted", label: "Hosted", description: "Use remote storage." },
+      ],
+      allowCustom: true,
+    }).question).toContain("\n");
+  });
 });
 
 describe("PlanSchema", () => {

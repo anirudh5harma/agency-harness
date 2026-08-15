@@ -1131,6 +1131,56 @@ describe("normalizePiEvent", () => {
     expect(JSON.stringify(events)).not.toContain("very large raw output");
   });
 
+  it("emits validated protected-shell deletion paths only after success", () => {
+    const state = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    normalizePiEvent({
+      type: "tool_execution_start",
+      toolCallId: "rm-1",
+      toolName: "bash",
+      args: { command: "rm -rf build" },
+    }, state, 100);
+    expect(normalizePiEvent({
+      type: "tool_execution_end",
+      toolCallId: "rm-1",
+      toolName: "bash",
+      result: {
+        content: [{ type: "text", text: "deleted" }],
+        details: { agencyMutationPaths: ["build/output.js", "../escape", ".git/config", "build/output.js"] },
+      },
+      isError: false,
+    }, state, 125)).toEqual([
+      { type: "command_finished", command: "rm -rf build", exitCode: 0, durationMs: 25 },
+      { type: "file_changed", path: "build/output.js" },
+    ]);
+    expect(state.changedFiles).toEqual(new Set(["build/output.js"]));
+
+    const failedState = {
+      calls: new Map(),
+      changedFiles: new Set<string>(),
+      finalMessage: "",
+      providerError: undefined,
+    };
+    normalizePiEvent({
+      type: "tool_execution_start",
+      toolCallId: "rm-failed",
+      toolName: "bash",
+      args: { command: "rm build/output.js" },
+    }, failedState, 100);
+    expect(normalizePiEvent({
+      type: "tool_execution_end",
+      toolCallId: "rm-failed",
+      toolName: "bash",
+      result: { content: [], details: { agencyMutationPaths: ["build/output.js"] } },
+      isError: true,
+    }, failedState, 125)).not.toContainEqual({ type: "file_changed", path: "build/output.js" });
+    expect(failedState.changedFiles).toEqual(new Set());
+  });
+
   it("redacts secrets from command events before emission", () => {
     const state = {
       calls: new Map(),

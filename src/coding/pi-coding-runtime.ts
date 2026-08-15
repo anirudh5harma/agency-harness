@@ -391,6 +391,20 @@ function stringProperty(value: unknown, key: string): string | undefined {
     : undefined;
 }
 
+function protectedMutationPaths(result: unknown): string[] {
+  if (typeof result !== "object" || result === null) return [];
+  const details = (result as { details?: unknown }).details;
+  if (typeof details !== "object" || details === null) return [];
+  const paths = (details as { agencyMutationPaths?: unknown }).agencyMutationPaths;
+  if (!Array.isArray(paths) || paths.length > 40_000) return [];
+  return [...new Set(paths.filter((path): path is string => {
+    if (typeof path !== "string" || path === "" || path.includes("\0") || path.includes("\\") || path.startsWith("/")) return false;
+    const segments = path.split("/");
+    return segments.every((segment) => segment !== "" && segment !== "." && segment !== "..") &&
+      !segments.some((segment) => [".git", ".devagency", ".agency-worktrees"].includes(segment.toLowerCase()));
+  }))].sort();
+}
+
 export function normalizePiEvent(
   event: AgentSessionEvent,
   state: PiEventState,
@@ -454,6 +468,12 @@ export function normalizePiEvent(
       exitCode: event.isError ? 1 : 0,
       durationMs: Math.max(0, now - call.startedAt),
     });
+  }
+  if (!event.isError && call.toolName === "bash") {
+    for (const path of protectedMutationPaths(event.result)) {
+      state.changedFiles.add(path);
+      events.push({ type: "file_changed", path });
+    }
   }
   if (!event.isError && call.path !== undefined) {
     state.changedFiles.add(call.path);

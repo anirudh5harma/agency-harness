@@ -22,6 +22,22 @@ const HumanDecisionIdSchema = z
   .trim()
   .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u);
 const HumanDecisionTextSchema = z.string().trim().min(1).max(1_000).transform(redactSecrets);
+function containsTerminalSpoofingControl(value: string): boolean {
+  return [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) || /\p{Cf}/u.test(character);
+  });
+}
+
+function terminalSafeApprovalText(value: string, context: z.RefinementCtx, path: PropertyKey[]): void {
+  if (containsTerminalSpoofingControl(value)) {
+    context.addIssue({
+      code: "custom",
+      path,
+      message: "approval presentation cannot contain terminal control or directionality characters",
+    });
+  }
+}
 
 export const HumanDecisionOptionSchema = z.strictObject({
   id: HumanDecisionIdSchema,
@@ -70,6 +86,12 @@ export const HumanDecisionRequestSchema = z
           message: "approvals require approve, reject, and edit options",
         });
       }
+      terminalSafeApprovalText(request.question, context, ["question"]);
+      if (request.action !== undefined) terminalSafeApprovalText(request.action, context, ["action"]);
+      request.options.forEach((option, index) => {
+        terminalSafeApprovalText(option.label, context, ["options", index, "label"]);
+        terminalSafeApprovalText(option.description, context, ["options", index, "description"]);
+      });
     }
   })
   .transform((request) => request.kind === "approval"
