@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, stat, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -77,6 +77,22 @@ describe("durable checkpoint persistence", () => {
     await expect(reopenedGraph.getState(config("thread-1"))).resolves.toMatchObject({
       values: { value: "persisted" },
     });
+    reopened.close();
+  });
+
+  it("does not rewrite a valid checkpoint during reopen", async () => {
+    const projectRoot = await temporaryProject();
+    const first = await createSqliteCheckpointPersistence(projectRoot);
+    const graph = compileTestGraph(first.checkpointer);
+    await graph.invoke({ value: "persisted" }, config("thread-1"));
+    first.close();
+
+    const path = join(projectRoot, ".devagency", "state.db");
+    const fixedTime = new Date("2020-01-02T03:04:05.000Z");
+    await utimes(path, fixedTime, fixedTime);
+
+    const reopened = await createSqliteCheckpointPersistence(projectRoot);
+    expect((await stat(path)).mtimeMs).toBe(fixedTime.getTime());
     reopened.close();
   });
 

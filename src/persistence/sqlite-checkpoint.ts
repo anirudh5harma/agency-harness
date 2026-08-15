@@ -332,7 +332,7 @@ export async function createCheckpointPersistence(
     await ensurePrivateMetadataDirectory(projectRoot);
     const contents = await readPrivateMetadataFile(projectRoot, path, MAX_CHECKPOINT_FILE_BYTES);
     let state: PersistedCheckpointFile;
-    let migratedFromSqlite = false;
+    let writeInitialState = false;
     if (contents === null || contents.length === 0) {
       state = {
         format: CHECKPOINT_FORMAT,
@@ -340,16 +340,19 @@ export async function createCheckpointPersistence(
         storage: emptyRecord(),
         writes: emptyRecord(),
       };
+      writeInitialState = true;
     } else if (contents.startsWith(SQLITE_HEADER)) {
       state = await migrateSqliteCheckpoint(path);
-      migratedFromSqlite = true;
+      writeInitialState = true;
     } else {
       state = parseCheckpointFile(contents);
     }
     saver = new DurableFileSaver(projectRoot, path, state);
-    await writePrivateMetadataFileAtomic(projectRoot, path, serializedCheckpointFile(saver));
+    if (writeInitialState) {
+      await writePrivateMetadataFileAtomic(projectRoot, path, serializedCheckpointFile(saver));
+    }
     await validatePrivateMetadataFile(projectRoot, path);
-    if (migratedFromSqlite) {
+    if (contents?.startsWith(SQLITE_HEADER) === true) {
       await Promise.all([
         rm(`${path}-wal`, { force: true }).catch(() => undefined),
         rm(`${path}-shm`, { force: true }).catch(() => undefined),
