@@ -204,6 +204,29 @@ describe("Agency tool policy", () => {
     await expect(invoke(write, { path: "outside-link", content: "nope" })).rejects.toThrow("non-symlink");
   });
 
+  it("never permits dependency, lockfile, or migration mutations and preserves approval", async () => {
+    const { root } = await fixture();
+    await mkdir(join(root, "prisma", "migrations"), { recursive: true });
+    await writeFile(join(root, "package-lock.json"), "{}\n");
+    await writeFile(join(root, "prisma", "migrations", "001.sql"), "select 1;\n");
+    await writeFile(join(root, "package.json"), JSON.stringify({ name: "safe", dependencies: { zod: "1.0.0" } }, null, 2));
+
+    const consumeApproval = vi.fn(() => true);
+    const tools = createRoleFileTools({ root, role: "executor", consumeApproval });
+    const edit = tools.find(({ name }) => name === "edit")!;
+    const write = tools.find(({ name }) => name === "write")!;
+    const blocked = [
+      invoke(write, { path: "package-lock.json", content: "{\"lockfileVersion\":3}\n" }),
+      invoke(edit, { path: "package-lock.json", edits: [{ oldText: "{}", newText: "{\"lockfileVersion\":3}" }] }),
+      invoke(write, { path: "prisma/migrations/001.sql", content: "drop table users;\n" }),
+      invoke(edit, { path: "prisma/migrations/001.sql", edits: [{ oldText: "select 1", newText: "drop table users" }] }),
+      invoke(write, { path: "package.json", content: JSON.stringify({ name: "safe", dependencies: { zod: "2.0.0" } }) }),
+      invoke(edit, { path: "package.json", edits: [{ oldText: '"zod": "1.0.0"', newText: '"zod": "2.0.0"' }] }),
+    ];
+    for (const result of blocked) await expect(result).rejects.toThrow("Agency policy blocks this operation");
+    expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
   it("denies a fourth distinct mission path before mutation", async () => {
     const { root } = await fixture();
     const budget = new MissionMutationBudget();

@@ -116,6 +116,27 @@ describe("human decision contracts", () => {
       customText: "Something else",
     })).toEqual({ requestId: request.id, customText: "Something else" });
   });
+
+  it("canonicalizes approval presentation independently of provider labels and order", () => {
+    const request = HumanDecisionRequestSchema.parse({
+      id: "decision-adversarial",
+      kind: "approval",
+      question: "Approve the exact action?",
+      action: "rm -rf build",
+      options: [
+        { id: "reject", label: "Approve", description: "Run it now." },
+        { id: "edit", label: "Reject", description: "Cancel it." },
+        { id: "approve", label: "Safe default", description: "Nothing will happen." },
+      ],
+      allowCustom: true,
+    });
+
+    expect(request.options).toEqual([
+      { id: "approve", label: "Approve", description: "Run this exact action once." },
+      { id: "reject", label: "Reject", description: "Cancel this action." },
+      { id: "edit", label: "Edit", description: "Provide different guidance; do not run the original action." },
+    ]);
+  });
 });
 
 describe("PlanSchema", () => {

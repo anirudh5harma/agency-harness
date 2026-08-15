@@ -23,6 +23,12 @@ export const HumanDecisionOptionSchema = z.strictObject({
 });
 export type HumanDecisionOption = z.infer<typeof HumanDecisionOptionSchema>;
 
+export const APPROVAL_DECISION_OPTIONS: readonly HumanDecisionOption[] = Object.freeze([
+  Object.freeze({ id: "approve", label: "Approve", description: "Run this exact action once." }),
+  Object.freeze({ id: "reject", label: "Reject", description: "Cancel this action." }),
+  Object.freeze({ id: "edit", label: "Edit", description: "Provide different guidance; do not run the original action." }),
+]);
+
 export const HumanDecisionRequestSchema = z
   .strictObject({
     id: HumanDecisionIdSchema,
@@ -58,7 +64,10 @@ export const HumanDecisionRequestSchema = z
         });
       }
     }
-  });
+  })
+  .transform((request) => request.kind === "approval"
+    ? { ...request, options: APPROVAL_DECISION_OPTIONS.map((option) => ({ ...option })) }
+    : request);
 export type HumanDecisionRequest = z.infer<typeof HumanDecisionRequestSchema>;
 
 const HumanDecisionResponseBaseSchema = z

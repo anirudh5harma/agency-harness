@@ -16,6 +16,7 @@ import {
 import { dirname, isAbsolute, matchesGlob, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { isDeepStrictEqual } from "node:util";
 
 import { runCommand } from "../process/index.js";
 
@@ -680,11 +681,120 @@ export function assertAllowedBash(
   prepareAllowedBash(command, consumeApproval, verificationCommands);
 }
 
+const LOCKFILE_NAMES = new Set([
+  "bun.lock", "bun.lockb", "cargo.lock", "composer.lock", "deno.lock", "gemfile.lock",
+  "go.sum", "npm-shrinkwrap.json", "package-lock.json", "package.resolved", "packages.lock.json",
+  "pipfile.lock", "pnpm-lock.yaml", "poetry.lock", "pubspec.lock", "podfile.lock", "uv.lock", "yarn.lock",
+]);
+const PACKAGE_DEPENDENCY_FIELDS = [
+  "dependencies", "devDependencies", "peerDependencies", "peerDependenciesMeta",
+  "optionalDependencies", "bundledDependencies", "bundleDependencies", "overrides", "resolutions",
+] as const;
+
+function isLockfilePath(path: string): boolean {
+  const name = relativePath(path).toLowerCase().split("/").at(-1) ?? "";
+  return LOCKFILE_NAMES.has(name);
+}
+
+function isMigrationPath(path: string): boolean {
+  return relativePath(path).toLowerCase().split("/").some((segment) => /^(?:migrations?|migrate)$/u.test(segment));
+}
+
+function isPackageManifestPath(path: string): boolean {
+  return (relativePath(path).toLowerCase().split("/").at(-1) ?? "") === "package.json";
+}
+
+function parsePackageManifest(content: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw policyError("package manifest changes must remain valid JSON with unchanged dependency sections");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw policyError("package manifest must remain a JSON object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function dependencyPolicyView(manifest: Record<string, unknown>): Record<string, unknown> {
+  const view: Record<string, unknown> = {};
+  for (const field of PACKAGE_DEPENDENCY_FIELDS) {
+    if (Object.hasOwn(manifest, field)) view[field] = manifest[field];
+  }
+  const pnpm = manifest.pnpm;
+  if (typeof pnpm === "object" && pnpm !== null && !Array.isArray(pnpm)) {
+    const pnpmPolicy: Record<string, unknown> = {};
+    for (const field of ["overrides", "packageExtensions", "peerDependencyRules"] as const) {
+      if (Object.hasOwn(pnpm, field)) pnpmPolicy[field] = (pnpm as Record<string, unknown>)[field];
+    }
+    if (Object.keys(pnpmPolicy).length > 0) view.pnpm = pnpmPolicy;
+  }
+  return view;
+}
+
+function applyPackageEdits(original: string, edits: Array<{ oldText: string; newText: string }>): string {
+  const content = original.replace(/^\uFEFF/u, "").replace(/\r\n?/gu, "\n");
+  const replacements = edits.map(({ oldText, newText }) => {
+    const normalizedOld = oldText.replace(/\r\n?/gu, "\n");
+    const first = content.indexOf(normalizedOld);
+    if (normalizedOld === "" || first < 0 || content.indexOf(normalizedOld, first + normalizedOld.length) >= 0) {
+      throw policyError("package manifest edit targets must be unique and non-empty");
+    }
+    return { start: first, end: first + normalizedOld.length, newText: newText.replace(/\r\n?/gu, "\n") };
+  }).sort((left, right) => left.start - right.start);
+  if (replacements.some((replacement, index) => index > 0 && replacement.start < replacements[index - 1]!.end)) {
+    throw policyError("package manifest edits cannot overlap");
+  }
+  let output = "";
+  let cursor = 0;
+  for (const replacement of replacements) {
+    output += content.slice(cursor, replacement.start) + replacement.newText;
+    cursor = replacement.end;
+  }
+  return output + content.slice(cursor);
+}
+
+async function assertUnconditionallyAllowedMutation(
+  root: string,
+  params: unknown,
+  tool: "edit" | "write",
+): Promise<void> {
+  const path = parameterPath(params);
+  if (isLockfilePath(path)) throw policyError("lockfiles cannot be changed by model tools");
+  if (isMigrationPath(path)) throw policyError("migrations cannot be changed by model tools");
+  if (!isPackageManifestPath(path)) return;
+
+  let original = "{}";
+  try {
+    original = (await safeReadFile(root, path, "executor")).toString("utf8");
+  } catch (error) {
+    if (!(error instanceof Error && error.message.includes("path does not exist"))) throw error;
+    if (tool === "edit") throw error;
+  }
+  let proposed: string;
+  if (tool === "write") {
+    const content = (params as { content?: unknown }).content;
+    if (typeof content !== "string") throw policyError("write requires string content");
+    proposed = content;
+  } else {
+    const edits = (params as { edits?: Array<{ oldText?: unknown; newText?: unknown }> }).edits;
+    if (!Array.isArray(edits) || edits.length === 0 || edits.some(({ oldText, newText }) => typeof oldText !== "string" || typeof newText !== "string")) {
+      throw policyError("edit requires non-empty string replacement pairs");
+    }
+    proposed = applyPackageEdits(original, edits as Array<{ oldText: string; newText: string }>);
+  }
+  const before = dependencyPolicyView(parsePackageManifest(original));
+  const after = dependencyPolicyView(parsePackageManifest(proposed));
+  if (!isDeepStrictEqual(before, after)) {
+    throw policyError("package dependency sections cannot be changed by model tools");
+  }
+}
+
 function isSensitivePath(path: string): boolean {
   const normalized = relativePath(path).toLowerCase();
-  const name = normalized.split("/").at(-1) ?? "";
-  return name === "package.json" || /^(?:package-lock|npm-shrinkwrap|pnpm-lock|yarn\.lock|bun\.lockb?)$/u.test(name) ||
-    normalized.startsWith(".github/") || normalized.includes("/migrations/") || normalized.startsWith("migrations/") ||
+  return isPackageManifestPath(path) || isLockfilePath(path) || isMigrationPath(path) ||
+    normalized.startsWith(".github/") ||
     /(?:^|\/)(?:ci|deploy)(?:\/|$)/u.test(normalized) ||
     isCredentialPath(normalized);
 }
@@ -767,6 +877,7 @@ export function createRoleFileTools(options: {
       throw policyError("credential-like paths cannot be changed by model tools");
     }
     await safeMutationPath(root, mutationPath);
+    await assertUnconditionallyAllowedMutation(root, params, tool);
     const approval = await mutationNeedsApproval(root, params, tool);
     if (signal?.aborted === true) throw new DOMException("File mutation aborted", "AbortError");
     if (approval !== undefined && !consumeApproval(approval)) {

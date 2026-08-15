@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { CodingRuntime } from "../coding/index.js";
 import { PiCodingRuntime } from "../coding/index.js";
 import {
+  APPROVAL_DECISION_OPTIONS,
   HumanDecisionRequestSchema,
   HumanDecisionResponseSchema,
   type HumanDecisionRequest,
@@ -568,7 +569,8 @@ export class AgencyApplication implements ReplHandler {
     if (request.context !== undefined) this.#renderer.message(`Context: ${request.context}`);
     if (request.risk !== undefined) this.#renderer.message(`Risk: ${request.risk}`);
     if (request.kind === "approval") this.#renderer.message(`Exact action: ${request.action}`);
-    request.options.forEach((option, index) => {
+    const displayedOptions = request.kind === "approval" ? APPROVAL_DECISION_OPTIONS : request.options;
+    displayedOptions.forEach((option, index) => {
       const shortcut = request.kind === "approval"
         ? ({ approve: "a", reject: "r", edit: "e" } as Record<string, string>)[option.id]
         : undefined;
@@ -591,8 +593,8 @@ export class AgencyApplication implements ReplHandler {
       const shortcut = request.kind === "approval"
         ? ({ a: "approve", r: "reject", e: "edit" } as Record<string, string>)[value.toLowerCase()]
         : undefined;
-      const numeric = /^\d+$/u.test(value) ? request.options[Number(value) - 1]?.id : undefined;
-      const optionId = shortcut ?? numeric ?? request.options.find(
+      const numeric = /^\d+$/u.test(value) ? displayedOptions[Number(value) - 1]?.id : undefined;
+      const optionId = shortcut ?? numeric ?? displayedOptions.find(
         ({ id }) => id.toLowerCase() === value.toLowerCase(),
       )?.id;
       if (optionId === "edit") {

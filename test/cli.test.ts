@@ -522,7 +522,7 @@ describe("Agency terminal application", () => {
     expect(output.value).toContain("belongs to session original-session; the current session was left unchanged");
   });
 
-  it("renders and resolves a pending approval during startup recovery", async () => {
+  it("owns approval ordering and still accepts edited guidance during startup recovery", async () => {
     const cwd = await temporaryGitProject();
     const session: SessionContext = {
       sessionId: "session-1",
@@ -536,9 +536,9 @@ describe("Agency terminal application", () => {
       risk: "It changes the schema.",
       action: "npx prisma migrate deploy",
       options: [
-        { id: "approve", label: "Approve", description: "Run this exact action once." },
-        { id: "reject", label: "Reject", description: "Cancel the action." },
-        { id: "edit", label: "Edit", description: "Provide safer guidance." },
+        { id: "reject", label: "Approve", description: "Run this exact action once." },
+        { id: "edit", label: "Reject", description: "Cancel the action." },
+        { id: "approve", label: "Harmless", description: "Nothing will happen." },
       ],
       allowCustom: true,
     };
@@ -556,6 +556,19 @@ describe("Agency terminal application", () => {
       ],
       pendingHumanDecision: request,
     });
+    const editedRequest = {
+      ...request,
+      id: "migration-guidance",
+      options: [
+        { id: "approve", label: "Approve", description: "Run this exact action once." },
+        { id: "reject", label: "Reject", description: "Cancel the action." },
+        { id: "edit", label: "Edit", description: "Provide safer guidance." },
+      ],
+    };
+    const awaitingEdit = await CodingRunStateSchema.validateInput({
+      ...interrupted,
+      pendingHumanDecision: editedRequest,
+    });
     const completed = {
       ...interrupted,
       status: "completed" as const,
@@ -563,8 +576,10 @@ describe("Agency terminal application", () => {
       verification: { status: "passed" as const, summary: "tests passed", commands: [] },
       summary: "migration guidance applied",
     };
-    const resume = vi.fn(async () => completed);
-    const io = new ScriptedIO(["e", "Use a dry-run migration", "/exit"]);
+    const resume = vi.fn()
+      .mockResolvedValueOnce(awaitingEdit)
+      .mockResolvedValueOnce(completed);
+    const io = new ScriptedIO(["1", "e", "Use a dry-run migration", "/exit"]);
     const output = new BufferOutput();
 
     await runAgency({
@@ -612,12 +627,21 @@ describe("Agency terminal application", () => {
 
     expect(io.prompts).toContain("Choose [a] approve, [r] reject, [e] edit: ");
     expect(io.prompts).toContain("Edited instruction: ");
-    expect(resume).toHaveBeenCalledWith(
+    expect(resume).toHaveBeenNthCalledWith(
+      1,
       "thread-approval",
-      { requestId: request.id, customText: "Use a dry-run migration" },
+      { requestId: request.id, optionId: "approve" },
+      expect.any(Object),
+    );
+    expect(resume).toHaveBeenNthCalledWith(
+      2,
+      "thread-approval",
+      { requestId: editedRequest.id, customText: "Use a dry-run migration" },
       expect.any(Object),
     );
     expect(output.value).toContain("[a] Approve");
+    expect(output.value).not.toContain("[r] Approve");
+    expect(output.value).not.toContain("Harmless");
     expect(output.value).toContain("Exact action: npx prisma migrate deploy");
     expect(output.value).toContain("Done: migration guidance applied");
   });
