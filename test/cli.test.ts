@@ -14,6 +14,7 @@ import {
   isMainModule,
   parseCliArguments,
   runAgency,
+  verifyProject,
   type ReplHandler,
   type TerminalIO,
   type TextOutput,
@@ -23,6 +24,7 @@ import type { Plan, SessionContext } from "../src/domain/index.js";
 import {
   CodingRunStateSchema,
   type CodingRunGraphRunner,
+  type CodingRunState,
 } from "../src/graph/index.js";
 import type { SqliteCheckpointPersistence } from "../src/persistence/index.js";
 import { GitCheckpointManager, resolveGitExcludePath } from "../src/repo/index.js";
@@ -105,6 +107,21 @@ afterEach(async () => {
 });
 
 describe("Agency terminal application", () => {
+  it("makes /verify non-successful when package metadata requires a stripped environment key", async () => {
+    const cwd = await temporaryGitProject();
+    await writeFile(join(cwd, "package.json"), JSON.stringify({
+      name: "fixture",
+      scripts: { test: "node -e \"process.exit(99)\"" },
+      agency: { requiredVerificationEnvironmentKeys: ["AGENCY_TEST_REQUIRED_SECRET_DO_NOT_SET"] },
+    }));
+
+    await expect(verifyProject(cwd, new AbortController().signal)).resolves.toEqual({
+      status: "skipped",
+      summary: "Verification environment is missing required keys: AGENCY_TEST_REQUIRED_SECRET_DO_NOT_SET",
+      commands: [],
+    });
+  });
+
   it("parses --worktree and --help deterministically", () => {
     expect(parseCliArguments([])).toEqual({ help: false, policy: false, version: false, worktree: false, update: null });
     expect(parseCliArguments(["--worktree", "--policy", "--help", "--version"])).toEqual({ help: true, policy: true, version: true, worktree: true, update: null });
@@ -727,6 +744,96 @@ describe("Agency terminal application", () => {
     );
     expect(output.value).toContain("Approve this migration?\\u{000a}Legacy checkpoint detail");
     expect(output.value).not.toContain("Approve this migration?\nLegacy checkpoint detail");
+  });
+
+  it.each([
+    { label: "finalizes", cancelFails: false, bindingRetained: false },
+    { label: "retains", cancelFails: true, bindingRetained: true },
+  ])("$label the crash-era Git binding when legacy approval EOF cancellation settles truthfully", async ({ cancelFails, bindingRetained }) => {
+    const cwd = await temporaryGitProject();
+    const checkpoints = new GitCheckpointManager(cwd);
+    await checkpoints.create("before crash");
+    await checkpoints.beginRun("legacy-run");
+    const session: SessionContext = { sessionId: "legacy-session", recentTurns: [], runSummaries: [] };
+    const pending = {
+      runId: "legacy-run",
+      threadId: "legacy-thread",
+      sessionId: session.sessionId,
+      repoPath: cwd,
+      userIntent: "legacy migration",
+      status: "executing",
+      codingPlan: plan,
+      changedFiles: [],
+      verification: null,
+      pendingHumanDecision: {
+        id: "legacy-approval",
+        kind: "approval",
+        question: "Approve this?\nLegacy detail",
+        action: "npm run migrate",
+        options: [
+          { id: "approve", label: "Approve", description: "Run once." },
+          { id: "reject", label: "Reject", description: "Cancel." },
+          { id: "edit", label: "Edit", description: "Change guidance." },
+        ],
+        allowCustom: true,
+      },
+    } as unknown as CodingRunState;
+    const cancelled = await CodingRunStateSchema.validateInput({
+      ...pending,
+      status: "cancelled",
+      pendingHumanDecision: null,
+      summary: "Run cancelled.",
+    });
+
+    const recoveryOutput = new BufferOutput();
+    await runAgency({
+      cwd,
+      io: new ScriptedIO([]),
+      output: recoveryOutput,
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => new FakeCodingRuntime(),
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread: async () => {},
+        close: () => {},
+      }),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => session,
+        createNew: async () => session,
+        recordUserTurn: async () => session,
+        recordRunSummary: async () => session,
+      }),
+      registryFactory: () => ({ list: async () => [], upsert: async () => {}, updateStatus: async () => {} }),
+      graphFactory: () => ({
+        invoke: async () => cancelled,
+        getState: async () => ({}),
+        resume: async () => cancelled,
+        cancel: async () => {
+          if (cancelFails) throw new Error("registry unavailable");
+          return cancelled;
+        },
+      }),
+      inspectRecovery: async () => [{
+        status: "resumable",
+        entry: {
+          runId: pending.runId,
+          threadId: pending.threadId,
+          sessionId: pending.sessionId,
+          userIntent: pending.userIntent,
+          status: "executing",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+        snapshot: { values: pending, next: ["human"], tasks: [] },
+      }],
+    });
+
+    const metadata = JSON.parse(await readFile(join(cwd, ".devagency", "git-checkpoints.json"), "utf8")) as {
+      runBindings: Record<string, unknown>;
+    };
+    if (!cancelFails) expect(recoveryOutput.value).not.toContain("could not finalize undo ownership");
+    expect("legacy-run" in metadata.runBindings, recoveryOutput.value).toBe(bindingRetained);
   });
 
   it("renders a terminal result before warning when checkpoint pruning fails", async () => {

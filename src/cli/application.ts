@@ -52,7 +52,7 @@ const MAX_USER_INTENT_CHARS = 8_000;
 function quotedTerminalLine(value: string): string {
   const encoded = [...value].map((character) => {
     const codePoint = character.codePointAt(0) ?? 0;
-    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) || /\p{Cf}/u.test(character)) {
+    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) || /[\p{Cf}\p{Zl}\p{Zp}]/u.test(character)) {
       return `\\u{${codePoint.toString(16).padStart(4, "0")}}`;
     }
     return JSON.stringify(character).slice(1, -1);
@@ -463,8 +463,12 @@ export class AgencyApplication implements ReplHandler {
         activeController = new AbortController();
         const response = await this.#promptHumanDecision(pendingRequest, activeController.signal);
         if (response === null || activeController.signal.aborted) {
-          if (activeController.signal.aborted) await this.#finalizeCancellation(candidate.entry.threadId);
-          else this.#renderer.setRunStatus("idle");
+          const finalized = await this.#finalizeCancellation(candidate.entry.threadId);
+          if (finalized) {
+            await this.#gitCheckpoints.finishRun(candidate.entry.runId).catch((error: unknown) => {
+              this.#renderer.recovery(`Warning: could not finalize undo ownership for recovered run ${candidate.entry.runId}: ${error instanceof Error ? error.message : String(error)}.`);
+            });
+          }
           return;
         }
         this.#renderer.setRunStatus("running");
@@ -671,19 +675,22 @@ export class AgencyApplication implements ReplHandler {
     }
   }
 
-  async #finalizeCancellation(threadId: string): Promise<void> {
+  async #finalizeCancellation(threadId: string): Promise<boolean> {
     this.#renderer.setRunStatus("cancelled");
     try {
       const state = await this.#graph.cancel?.(threadId);
       if (state === undefined) {
         this.#renderer.message("Cancelled.");
-        return;
+        return false;
       }
       await this.#handleTerminalRun(state);
+      return state.failure?.stage !== "finalizing"
+        && ["completed", "failed", "cancelled"].includes(state.status);
     } catch (error) {
       this.#renderer.recovery(
         `Cancellation finalization for ${threadId} remains recoverable: ${error instanceof Error ? error.message : String(error)}.`,
       );
+      return false;
     }
   }
 

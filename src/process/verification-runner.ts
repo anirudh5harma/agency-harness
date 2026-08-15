@@ -37,7 +37,16 @@ export interface VerificationRunnerOptions {
 interface PackageManifest {
   packageManager?: unknown;
   scripts?: unknown;
+  agency?: unknown;
 }
+
+export interface NodeVerificationConfiguration {
+  commands: VerificationCommand[];
+  requiredEnvironmentKeys: string[];
+}
+
+const EnvironmentKeySchema = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u;
+const MAX_REQUIRED_ENVIRONMENT_KEYS = 64;
 
 const VERIFICATION_ENVIRONMENT_KEYS = [
   "PATH", "Path", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP",
@@ -72,15 +81,15 @@ function packageRunner(packageManager: unknown): string {
   return name === "pnpm" || name === "yarn" || name === "bun" ? name : "npm";
 }
 
-export async function detectNodeVerificationCommands(
+export async function detectNodeVerificationConfiguration(
   cwd: string,
-): Promise<VerificationCommand[]> {
+): Promise<NodeVerificationConfiguration> {
   let manifest: PackageManifest;
   try {
     manifest = JSON.parse(await readFile(join(cwd, "package.json"), "utf8")) as PackageManifest;
   } catch (cause) {
     const error = cause as NodeJS.ErrnoException;
-    if (error.code === "ENOENT") return [];
+    if (error.code === "ENOENT") return { commands: [], requiredEnvironmentKeys: [] };
     throw new InfrastructureError(
       "PACKAGE_METADATA_INVALID",
       `Could not read package metadata at ${join(cwd, "package.json")}`,
@@ -93,8 +102,26 @@ export async function detectNodeVerificationCommands(
       ? (manifest.scripts as Record<string, unknown>)
       : {};
   const runner = packageRunner(manifest.packageManager);
+  const agency = manifest.agency !== null && typeof manifest.agency === "object"
+    ? manifest.agency as Record<string, unknown>
+    : {};
+  const configuredKeys = agency.requiredVerificationEnvironmentKeys;
+  if (
+    configuredKeys !== undefined
+    && (
+      !Array.isArray(configuredKeys)
+      || configuredKeys.length > MAX_REQUIRED_ENVIRONMENT_KEYS
+      || configuredKeys.some((key) => typeof key !== "string" || !EnvironmentKeySchema.test(key))
+    )
+  ) {
+    throw new InfrastructureError(
+      "PACKAGE_METADATA_INVALID",
+      "package.json agency.requiredVerificationEnvironmentKeys must be an array of at most 64 environment variable names",
+    );
+  }
+  const requiredEnvironmentKeys = [...new Set((configuredKeys ?? []) as string[])].sort();
 
-  return VERIFICATION_ORDER.filter(
+  const commands = VERIFICATION_ORDER.filter(
     (name) => typeof scripts[name] === "string" && scripts[name].trim() !== "",
   ).map((name) => ({
     name,
@@ -102,6 +129,13 @@ export async function detectNodeVerificationCommands(
     args: ["run", name],
     required: true,
   }));
+  return { commands, requiredEnvironmentKeys };
+}
+
+export async function detectNodeVerificationCommands(
+  cwd: string,
+): Promise<VerificationCommand[]> {
+  return (await detectNodeVerificationConfiguration(cwd)).commands;
 }
 
 export class VerificationRunner {
@@ -123,7 +157,7 @@ export class VerificationRunner {
     const environment = verificationEnvironment(options.environment ?? process.env);
     const requiredEnvironmentKeys = [...new Set(options.requiredEnvironmentKeys ?? [])]
       .map((key) => key.trim())
-      .filter((key) => /^[A-Za-z_][A-Za-z0-9_]*$/u.test(key))
+      .filter((key) => EnvironmentKeySchema.test(key))
       .sort();
     this.#missingRequiredEnvironmentKeys = requiredEnvironmentKeys.filter(
       (key) => environment[key] === undefined,

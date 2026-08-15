@@ -30,7 +30,9 @@ const HumanDecisionTextSchema = z.string().trim().min(1).max(1_000).transform(re
 function containsTerminalSpoofingControl(value: string): boolean {
   return [...value].some((character) => {
     const codePoint = character.codePointAt(0) ?? 0;
-    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) || /\p{Cf}/u.test(character);
+    return codePoint <= 0x1f
+      || (codePoint >= 0x7f && codePoint <= 0x9f)
+      || /[\p{Cf}\p{Zl}\p{Zp}]/u.test(character);
   });
 }
 
@@ -39,7 +41,7 @@ function terminalSafeApprovalText(value: string, context: z.RefinementCtx, path:
     context.addIssue({
       code: "custom",
       path,
-      message: "approval presentation cannot contain terminal control or directionality characters",
+      message: "approval presentation cannot contain terminal control, separator, or directionality characters",
     });
   }
 }

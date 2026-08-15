@@ -3,13 +3,14 @@ import { isDeepStrictEqual } from "node:util";
 const LOCKFILE_NAMES = new Set([
   "bun.lock", "bun.lockb", "cargo.lock", "composer.lock", "deno.lock", "gemfile.lock",
   "go.sum", "npm-shrinkwrap.json", "package-lock.json", "package.resolved", "packages.lock.json",
-  "pipfile.lock", "pnpm-lock.yaml", "poetry.lock", "pubspec.lock", "podfile.lock", "uv.lock", "yarn.lock",
+  "gradle.lockfile", "mix.lock", "pipfile.lock", "pnpm-lock.yaml", "poetry.lock", "pubspec.lock", "podfile.lock", "uv.lock", "yarn.lock",
 ]);
 
 const DEPENDENCY_MANIFEST_NAMES = new Set([
   "build.gradle", "build.gradle.kts", "cargo.toml", "composer.json", "gemfile", "go.mod",
   "package.swift", "packages.config", "paket.dependencies", "pipfile", "pom.xml", "pubspec.yaml",
   "pyproject.toml", "settings.gradle", "settings.gradle.kts",
+  "conanfile.txt", "mix.exs", "project.toml", "rebar.config", "setup.cfg", "setup.py", "vcpkg.json",
   // Workspace-level dependency topology is dependency policy too.
   "lerna.json", "nx.json", "pnpm-workspace.yaml", "rush.json", "turbo.json", "workspace.json",
   // Central .NET dependency and build manifests.
@@ -41,17 +42,21 @@ export function isDependencyManifestPath(path: string): boolean {
   const name = normalizedSegments(path).at(-1) ?? "";
   return isPackageManifestPath(path) || DEPENDENCY_MANIFEST_NAMES.has(name) ||
     /^requirements[^/]*\.txt$/u.test(name) ||
+    /^environment[^/]*\.yml$/u.test(name) ||
+    /\.gemspec$/u.test(name) ||
     /\.(?:csproj|fsproj|vbproj|vcxproj|sln|slnx)$/u.test(name) ||
     /(?:^|\/)gradle\/libs\.versions\.toml$/u.test(path.toLowerCase());
 }
 
 export function isMigrationPath(path: string): boolean {
   const segments = normalizedSegments(path);
+  if (segments.includes("drizzle")) return true;
   if (segments.some((segment) => /^(?:migrations?|migrate)$/u.test(segment))) return true;
   return segments.some((segment, index) =>
     segment === "versions" && index > 0 && ["alembic", "schema"].includes(segments[index - 1] ?? "")) ||
     segments.some((segment, index) =>
       index > 0 && segment === "versions" && segments.slice(0, index).includes("alembic")) ||
+    segments.some((segment, index) => segment === "changelog" && segments[index - 1] === "db") ||
     (segments.at(-2) === "db" && ["schema.rb", "structure.sql"].includes(segments.at(-1) ?? ""));
 }
 

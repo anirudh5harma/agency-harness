@@ -126,6 +126,38 @@ afterEach(async () => {
 });
 
 describe("coding run graph", () => {
+  it("uses package-declared required verification environment names in the real graph flow", async () => {
+    const root = await repository();
+    await writeFile(join(root, "package.json"), JSON.stringify({
+      scripts: { test: "node -e \"process.exit(99)\"" },
+      agency: { requiredVerificationEnvironmentKeys: ["AGENCY_TEST_REQUIRED_SECRET_DO_NOT_SET"] },
+    }));
+    await execFileAsync("git", ["add", "package.json"], { cwd: root });
+    await execFileAsync("git", ["commit", "-m", "add verification config"], { cwd: root });
+    const runtime = new FakeCodingRuntime();
+    runtime.enqueuePlanResult({ plan, message: "planned" });
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+    const deps: CodingRunGraphDependencies = {
+      runtime,
+      inspectRepository,
+      captureGitBaseline,
+      getChangedFiles,
+      registry: new IncompleteRunRegistry(root),
+    };
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state).toMatchObject({
+      status: "failed",
+      verification: {
+        status: "skipped",
+        summary: "Verification environment is missing required keys: AGENCY_TEST_REQUIRED_SECRET_DO_NOT_SET",
+        commands: [],
+      },
+      failure: { stage: "verifying", recoverable: false },
+    });
+  });
+
   it("records exact failed-run model counts without estimating usage", async () => {
     const root = await repository();
     const runtime = new FakeCodingRuntime();

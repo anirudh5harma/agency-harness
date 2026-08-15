@@ -156,6 +156,46 @@ describe("Agency tool policy", () => {
     expect(result.details).toEqual({ searchByteLimitReached: 32 * 1024 * 1024 });
   });
 
+  it("makes every grep incompleteness cause visible in model content", async () => {
+    const { root } = await fixture();
+    await writeFile(join(root, "oversized.txt"), Buffer.alloc(1024 * 1024 + 1, 97));
+    const manyMatches = Array.from({ length: 180 }, (_, index) =>
+      `needle-${index} ${"x".repeat(1_990)}`).join("\n");
+    await writeFile(join(root, "many.txt"), `${manyMatches}\n`);
+    const grep = createRoleFileTools({ root, role: "planner" }).find(({ name }) => name === "grep")!;
+
+    const noMatch = await invoke(grep, { path: ".", pattern: "absent", literal: true });
+    expect(JSON.stringify(noMatch)).toContain("oversized file");
+    expect(JSON.stringify(noMatch)).not.toContain("No matches found");
+    expect(noMatch.details).toMatchObject({ oversizedFileCount: 1 });
+
+    const capped = await invoke(grep, { path: ".", pattern: "needle", literal: true, limit: 1 });
+    expect(JSON.stringify(capped)).toContain("match limit");
+    expect(capped.details).toMatchObject({ matchLimitReached: 1 });
+
+    const sliced = await invoke(grep, { path: ".", pattern: "needle", literal: true, limit: 180 });
+    expect(JSON.stringify(sliced)).toContain("content limit");
+    expect(sliced.details).toMatchObject({ contentLimitReached: 256 * 1024 });
+  });
+
+  it("makes find result and content caps visible in model content", async () => {
+    const { root } = await fixture();
+    const directory = join(root, "wide");
+    await mkdir(directory);
+    for (let index = 0; index < 1_300; index += 1) {
+      await writeFile(join(directory, `${String(index).padStart(4, "0")}-${"x".repeat(210)}.txt`), "x\n");
+    }
+    const find = createRoleFileTools({ root, role: "planner" }).find(({ name }) => name === "find")!;
+
+    const capped = await invoke(find, { path: ".", pattern: "wide/*", limit: 1 });
+    expect(JSON.stringify(capped)).toContain("result limit");
+    expect(capped.details).toMatchObject({ resultLimitReached: 1 });
+
+    const sliced = await invoke(find, { path: ".", pattern: "wide/*", limit: 2_000 });
+    expect(JSON.stringify(sliced)).toContain("content limit");
+    expect(sliced.details).toMatchObject({ contentLimitReached: 256 * 1024 });
+  });
+
   it("honors Git ignore rules during search", async () => {
     const { root } = await fixture();
     await writeFile(join(root, ".gitignore"), "custom-generated/\n");
@@ -277,6 +317,45 @@ describe("Agency tool policy", () => {
         .rejects.toThrow("Agency policy blocks this operation");
     }
     expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
+  it("blocks the extended finite manifest and migration table for edit, write, and rm before approval", async () => {
+    const { root } = await fixture();
+    const protectedPaths = [
+      "setup.py", "setup.cfg", "service.gemspec", "environment.yml", "environment-dev.yml",
+      "mix.exs", "mix.lock", "gradle.lockfile", "rebar.config", "Project.toml", "vcpkg.json",
+      "conanfile.txt", "db/changelog/001-users.xml", "drizzle/0001_users.sql",
+    ];
+    for (const path of protectedPaths) {
+      await mkdir(join(root, path.split("/").slice(0, -1).join("/")), { recursive: true });
+      await writeFile(join(root, path), "original\n");
+    }
+    const consumeApproval = vi.fn(() => true);
+    const tools = createRoleFileTools({ root, role: "executor", consumeApproval });
+    const edit = tools.find(({ name }) => name === "edit")!;
+    const write = tools.find(({ name }) => name === "write")!;
+    const execute = vi.fn(async () => ({ content: [], details: {} }));
+    const bash = createProtectedBashTool({
+      root,
+      consumeApproval,
+      factories: {
+        ...defaultToolFactoryBoundary,
+        createBashTool: vi.fn(() => ({
+          name: "bash", label: "bash", description: "test", parameters: { type: "object" } as never, execute,
+        } as never)),
+      },
+    });
+
+    for (const path of protectedPaths) {
+      await expect(invoke(edit, { path, edits: [{ oldText: "original", newText: "changed" }] }), `edit ${path}`)
+        .rejects.toThrow("Agency policy blocks this operation");
+      await expect(invoke(write, { path, content: "changed\n" }), `write ${path}`)
+        .rejects.toThrow("Agency policy blocks this operation");
+      await expect(bash.execute(`rm-${path}`, { command: `rm ${path}` }, undefined, undefined, {} as never), `rm ${path}`)
+        .rejects.toThrow("Agency policy blocks this operation");
+    }
+    expect(consumeApproval).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it("rejects protected rm targets before approval, including recursive contents", async () => {

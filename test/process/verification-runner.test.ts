@@ -7,6 +7,7 @@ import type { CommandResult } from "../../src/domain/index.js";
 import { EventBus } from "../../src/events/index.js";
 import {
   VerificationRunner,
+  detectNodeVerificationConfiguration,
   detectNodeVerificationCommands,
   type VerificationCommand,
 } from "../../src/process/index.js";
@@ -35,6 +36,40 @@ describe("detectNodeVerificationCommands", () => {
       { name: "lint", command: "npm", args: ["run", "lint"], required: true },
       { name: "build", command: "npm", args: ["run", "build"], required: true },
     ]);
+  });
+
+  it("reads bounded required verification environment key names from package metadata", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agency-verify-"));
+    directories.push(root);
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({
+        scripts: { test: "vitest" },
+        agency: { requiredVerificationEnvironmentKeys: ["TEST_DATABASE_URL", "FEATURE_FLAG"] },
+      }),
+    );
+
+    await expect(detectNodeVerificationConfiguration(root)).resolves.toEqual({
+      commands: [{ name: "test", command: "npm", args: ["run", "test"], required: true }],
+      requiredEnvironmentKeys: ["FEATURE_FLAG", "TEST_DATABASE_URL"],
+    });
+  });
+
+  it("rejects malformed required verification environment configuration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agency-verify-"));
+    directories.push(root);
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({
+        scripts: { test: "vitest" },
+        agency: { requiredVerificationEnvironmentKeys: ["DATABASE_URL=secret"] },
+      }),
+    );
+
+    await expect(detectNodeVerificationConfiguration(root)).rejects.toMatchObject({
+      name: "InfrastructureError",
+      code: "PACKAGE_METADATA_INVALID",
+    });
   });
 });
 

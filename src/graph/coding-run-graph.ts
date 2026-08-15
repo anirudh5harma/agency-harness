@@ -52,7 +52,7 @@ import type {
 import { ProjectKnowledgeStore, type ProjectKnowledgeStoreBoundary } from "../persistence/index.js";
 import {
   VerificationRunner,
-  detectNodeVerificationCommands,
+  detectNodeVerificationConfiguration,
   InfrastructureError,
   type VerificationCommand,
 } from "../process/index.js";
@@ -144,6 +144,9 @@ const VerificationScriptsSchema = z.record(
   z.string().trim().min(1).max(1_000),
   z.string().max(MAX_TEXT),
 );
+const VerificationEnvironmentKeysSchema = z.array(
+  z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u),
+).max(64);
 
 export const CodingRunStateSchema = new StateSchema({
   runId: IdentifierSchema,
@@ -175,6 +178,7 @@ export const CodingRunStateSchema = new StateSchema({
     .max(MAX_COMMANDS)
     .default([]),
   verificationScripts: VerificationScriptsSchema.default({}),
+  requiredVerificationEnvironmentKeys: VerificationEnvironmentKeysSchema.default([]),
   attempt: z.number().int().nonnegative().max(20).default(0),
   missionKind: z.enum(["tests", "dead-code", "simplify", "performance"]).nullable().default(null),
   toolCalls: z.number().int().nonnegative().max(1_000_000).default(0),
@@ -226,10 +230,12 @@ export interface CodingRunGraphDependencies {
   captureGitBaseline?: (cwd: string) => Promise<GitBaseline>;
   getChangedFiles?: (baseline: GitBaseline) => Promise<GitFileChange[]>;
   detectVerificationCommands?: (cwd: string) => Promise<VerificationCommand[]>;
+  detectVerificationConfiguration?: typeof detectNodeVerificationConfiguration;
   runVerification?: (
     commands: readonly VerificationCommand[],
     cwd: string,
     signal: AbortSignal,
+    requiredEnvironmentKeys: readonly string[],
   ) => Promise<VerificationResult>;
   eventBus?: EventBus;
   trajectoryWriter?: TrajectoryWriter;
@@ -409,18 +415,25 @@ export function createCodingRunGraph(
     dependencies.loadRepoInstructions ?? loadRepositoryInstructions;
   const captureBaseline = dependencies.captureGitBaseline ?? captureGitBaseline;
   const changedFilesSince = dependencies.getChangedFiles ?? getChangedFiles;
-  const detectCommands =
-    dependencies.detectVerificationCommands ?? detectNodeVerificationCommands;
+  const detectConfiguration = dependencies.detectVerificationConfiguration
+    ?? (dependencies.detectVerificationCommands === undefined
+      ? detectNodeVerificationConfiguration
+      : async (cwd: string) => ({
+          commands: await dependencies.detectVerificationCommands!(cwd),
+          requiredEnvironmentKeys: [],
+        }));
   const runVerification =
     dependencies.runVerification ??
-    ((commands, cwd, signal) =>
-      new VerificationRunner({
+    (async (commands, cwd, signal, requiredEnvironmentKeys) => {
+      return new VerificationRunner({
         ...(dependencies.eventBus === undefined ? {} : { eventBus: dependencies.eventBus }),
         signal,
+        requiredEnvironmentKeys,
       }).run(
         commands,
         cwd,
-      ));
+      );
+    });
   const now = dependencies.now ?? (() => new Date());
   const ensureMetadataIgnored =
     dependencies.ensureMetadataIgnored ?? ensureAgencyMetadataIgnored;
@@ -621,10 +634,13 @@ export function createCodingRunGraph(
         inspection.instructionFiles,
       );
       const baseline = await captureBaseline(inspection.rootPath);
+      const detectedVerification = await detectConfiguration(inspection.rootPath);
       const verificationCommands = z
         .array(VerificationCommandSchema)
         .max(MAX_COMMANDS)
-        .parse(await detectCommands(inspection.rootPath));
+        .parse(detectedVerification.commands);
+      const requiredVerificationEnvironmentKeys = VerificationEnvironmentKeysSchema
+        .parse(detectedVerification.requiredEnvironmentKeys);
       const preparedVerificationScripts = await verificationScripts(
         inspection.rootPath,
         verificationCommands,
@@ -641,6 +657,7 @@ export function createCodingRunGraph(
           baseline,
           verificationCommands,
           verificationScripts: preparedVerificationScripts,
+          requiredVerificationEnvironmentKeys,
           verification: {
             status: "skipped",
             summary: message,
@@ -664,6 +681,7 @@ export function createCodingRunGraph(
         baseline,
         verificationCommands,
         verificationScripts: preparedVerificationScripts,
+        requiredVerificationEnvironmentKeys,
         createdAt,
         updatedAt: createdAt,
       };
@@ -870,6 +888,7 @@ export function createCodingRunGraph(
           commands,
           state.repoPath,
           runtime.signal ?? new AbortController().signal,
+          state.requiredVerificationEnvironmentKeys,
         ),
       );
       const changedFiles = await changedFilesAfterVerification(state.baseline);

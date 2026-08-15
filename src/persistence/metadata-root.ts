@@ -1,11 +1,22 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
+import { link, lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 const METADATA_DIRECTORY_MODE = 0o700;
 const METADATA_FILE_MODE = 0o600;
+const MAX_LOCK_BYTES = 4 * 1024;
+const MALFORMED_LOCK_GRACE_MS = 30_000;
+const PROCESS_START_ID = randomUUID();
+const PROCESS_STARTED_AT = Date.now() - Math.round(process.uptime() * 1_000);
 const metadataFileLocks = new Map<string, Promise<void>>();
+
+interface MetadataFileLease {
+  readonly pid: number;
+  readonly token: string;
+  readonly createdAt: number;
+  readonly processStartId: string;
+}
 
 async function hardenDirectory(path: string): Promise<void> {
   const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -154,26 +165,85 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-async function removeAbandonedLock(projectRoot: string, lockPath: string): Promise<void> {
-  let contents: string;
+function parseMetadataFileLease(contents: string): MetadataFileLease | null {
+  let value: unknown;
   try {
-    contents = await readPrivateMetadataFile(projectRoot, lockPath, 1024) ?? "";
+    value = JSON.parse(contents);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null) return null;
+  const lease = value as Partial<MetadataFileLease>;
+  if (
+    !Number.isSafeInteger(lease.pid)
+    || (lease.pid ?? 0) <= 0
+    || !Number.isSafeInteger(lease.createdAt)
+    || typeof lease.token !== "string"
+    || lease.token.length === 0
+    || typeof lease.processStartId !== "string"
+    || lease.processStartId.length === 0
+  ) return null;
+  return lease as MetadataFileLease;
+}
+
+function leaseOwnerIsGone(lease: MetadataFileLease): boolean {
+  if (!processIsAlive(lease.pid)) return true;
+  return lease.pid === process.pid
+    && lease.processStartId !== PROCESS_START_ID
+    && lease.createdAt < PROCESS_STARTED_AT;
+}
+
+async function restoreQuarantinedLock(quarantinePath: string, lockPath: string): Promise<void> {
+  try {
+    await link(quarantinePath, lockPath);
+    await rm(quarantinePath, { force: true });
+  } catch {
+    // A new canonical lease won the race. Preserve the displaced lease for diagnosis.
+  }
+}
+
+async function removeAbandonedLock(projectRoot: string, lockPath: string): Promise<void> {
+  let observedBytes: string;
+  try {
+    observedBytes = await readPrivateMetadataFile(projectRoot, lockPath, MAX_LOCK_BYTES) ?? "";
   } catch {
     return;
   }
-  const match = /^pid=(\d+)\ncreated=(\d+)\n$/.exec(contents);
-  const pid = Number(match?.[1]);
-  const createdAt = Number(match?.[2]);
-  const validOwner = Number.isSafeInteger(pid) && pid > 0 && Number.isSafeInteger(createdAt);
-  const abandoned = validOwner
-    ? Date.now() - createdAt > 24 * 60 * 60 * 1_000 || !processIsAlive(pid)
-    : (Date.now() - (await lstat(lockPath)).mtimeMs) > 10_000;
-  if (!abandoned) return;
-  const stalePath = `${lockPath}.${randomUUID()}.stale`;
+  const observed = parseMetadataFileLease(observedBytes);
+  if (observed !== null && !leaseOwnerIsGone(observed)) return;
+  if (observed === null) {
+    try {
+      if (Date.now() - (await lstat(lockPath)).mtimeMs <= MALFORMED_LOCK_GRACE_MS) return;
+    } catch {
+      return;
+    }
+  }
+
+  const quarantinePath = `${lockPath}.${randomUUID()}.stale`;
+  let quarantined = false;
   try {
-    await rename(lockPath, stalePath);
-    await rm(stalePath, { force: true });
+    await rename(lockPath, quarantinePath);
+    quarantined = true;
+    const movedBytes = await readPrivateMetadataFile(projectRoot, quarantinePath, MAX_LOCK_BYTES) ?? "";
+    const moved = parseMetadataFileLease(movedBytes);
+    const unchangedLease = observed !== null
+      && moved !== null
+      && movedBytes === observedBytes
+      && moved.token === observed.token
+      && leaseOwnerIsGone(moved);
+    const unchangedMalformed = observed === null
+      && moved === null
+      && movedBytes === observedBytes
+      && Date.now() - (await lstat(quarantinePath)).mtimeMs > MALFORMED_LOCK_GRACE_MS;
+    if (unchangedLease || unchangedMalformed) {
+      await rm(quarantinePath, { force: true });
+      quarantined = false;
+    } else {
+      await restoreQuarantinedLock(quarantinePath, lockPath);
+      quarantined = false;
+    }
   } catch (cause) {
+    if (quarantined) await restoreQuarantinedLock(quarantinePath, lockPath);
     if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
   }
 }
@@ -181,6 +251,13 @@ async function removeAbandonedLock(projectRoot: string, lockPath: string): Promi
 async function acquireMetadataFileLock(projectRoot: string, path: string): Promise<() => Promise<void>> {
   await ensurePrivateMetadataDirectory(projectRoot, dirname(path));
   const lockPath = `${path}.lock`;
+  const token = randomUUID();
+  const lease: MetadataFileLease = {
+    pid: process.pid,
+    token,
+    createdAt: Date.now(),
+    processStartId: PROCESS_START_ID,
+  };
   const deadline = Date.now() + 30_000;
   while (true) {
     try {
@@ -190,18 +267,32 @@ async function acquireMetadataFileLock(projectRoot: string, path: string): Promi
         METADATA_FILE_MODE,
       );
       try {
-        await handle.writeFile(`pid=${process.pid}\ncreated=${Date.now()}\n`);
+        await handle.writeFile(JSON.stringify(lease));
         await handle.sync();
       } catch (cause) {
         await handle.close().catch(() => undefined);
         await rm(lockPath, { force: true }).catch(() => undefined);
         throw cause;
       }
+      await handle.close();
       return async () => {
+        const quarantinePath = `${lockPath}.${randomUUID()}.release`;
+        let quarantined = false;
         try {
-          await handle.close();
-        } finally {
-          await rm(lockPath, { force: true });
+          await rename(lockPath, quarantinePath);
+          quarantined = true;
+          const movedBytes = await readPrivateMetadataFile(projectRoot, quarantinePath, MAX_LOCK_BYTES);
+          const moved = movedBytes === null ? null : parseMetadataFileLease(movedBytes);
+          if (moved?.token === token) {
+            await rm(quarantinePath, { force: true });
+            quarantined = false;
+          } else {
+            await restoreQuarantinedLock(quarantinePath, lockPath);
+            quarantined = false;
+          }
+        } catch {
+          if (quarantined) await restoreQuarantinedLock(quarantinePath, lockPath);
+          // Never unlink a lease whose token cannot be proven to be ours.
         }
       };
     } catch (cause) {

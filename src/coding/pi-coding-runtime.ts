@@ -190,6 +190,8 @@ const SENSITIVE_ASSIGNMENT_NAMES = [
   "token",
   "password",
 ] as const;
+const COMMON_URI_SCHEMES = ["ftp", "git", "http", "https", "mongodb", "mysql", "postgres", "postgresql", "redis", "ssh"];
+const URI_PREFIX_PATTERN = /(?:\b[a-z][a-z0-9+.-]*:\/\/|:\/\/)/iu;
 const SENSITIVE_PREFIX_PATTERN = /\b(?:Bearer\s+|sk-|(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password)\b\s*[:=]\s*)/iu;
 
 function uncertainSensitiveSuffixStart(value: string): number {
@@ -197,6 +199,8 @@ function uncertainSensitiveSuffixStart(value: string): number {
     if (index > 0 && /[A-Za-z0-9_]/u.test(value[index - 1] ?? "")) continue;
     const suffix = value.slice(index).toLowerCase();
     if ("bearer".startsWith(suffix.trimEnd()) || "sk-".startsWith(suffix)) return index;
+    if (COMMON_URI_SCHEMES.some((scheme) => scheme.startsWith(suffix)) ||
+      /^(?:[a-z][a-z0-9+.-]*)?:(?:\/(?:\/)?)?$/u.test(suffix)) return index;
 
     const operator = suffix.search(/[:=]/u);
     const rawName = operator === -1 ? suffix.trimEnd() : suffix.slice(0, operator).trimEnd();
@@ -214,6 +218,9 @@ function uncertainSensitiveSuffixStart(value: string): number {
  */
 class IncrementalSecretRedactor {
   #pending = "";
+  #uriPrefix: string | null = null;
+  #uriAuthority = "";
+  #uriOverflow = false;
   #sensitivePrefix: string | null = null;
   #quote: "\"" | "'" | null | undefined;
   #awaitingValue = false;
@@ -223,6 +230,13 @@ class IncrementalSecretRedactor {
     let output = "";
     let remaining = chunk;
     while (remaining !== "") {
+      if (this.#uriPrefix !== null) {
+        const consumed = this.#consumeUri(remaining);
+        output += consumed.output;
+        remaining = consumed.remaining;
+        if (consumed.waiting) break;
+        continue;
+      }
       if (this.#sensitivePrefix !== null) {
         const consumed = this.#consumeSensitive(remaining);
         output += consumed.output;
@@ -233,6 +247,14 @@ class IncrementalSecretRedactor {
 
       this.#pending += remaining;
       remaining = "";
+      const uri = URI_PREFIX_PATTERN.exec(this.#pending);
+      if (uri !== null) {
+        output += redactSecrets(this.#pending.slice(0, uri.index));
+        this.#uriPrefix = uri[0];
+        remaining = this.#pending.slice(uri.index + uri[0].length);
+        this.#pending = "";
+        continue;
+      }
       const match = SENSITIVE_PREFIX_PATTERN.exec(this.#pending);
       if (match !== null) {
         output += redactSecrets(this.#pending.slice(0, match.index));
@@ -257,17 +279,43 @@ class IncrementalSecretRedactor {
     }
 
     if (!done) return output;
-    if (this.#sensitivePrefix !== null) {
+    if (this.#uriPrefix !== null) {
+      output += `${this.#uriPrefix}${this.#uriOverflow ? "[REDACTED]" : this.#uriAuthority}`;
+    } else if (this.#sensitivePrefix !== null) {
       output += `${this.#sensitivePrefix}[REDACTED]`;
     } else {
       output += redactSecrets(this.#pending);
     }
     this.#pending = "";
+    this.#uriPrefix = null;
+    this.#uriAuthority = "";
+    this.#uriOverflow = false;
     this.#sensitivePrefix = null;
     this.#quote = undefined;
     this.#awaitingValue = false;
     this.#escaped = false;
     return output;
+  }
+
+  #consumeUri(value: string): { output: string; remaining: string; waiting: boolean } {
+    const boundary = value.search(/[@/?#\s,;&]/u);
+    if (boundary === -1) {
+      const capacity = MAX_STREAM_REDACTOR_PENDING - this.#uriAuthority.length;
+      this.#uriAuthority += value.slice(0, Math.max(0, capacity));
+      if (value.length > capacity) this.#uriOverflow = true;
+      return { output: "", remaining: "", waiting: true };
+    }
+    const character = value[boundary] ?? "";
+    const authority = this.#uriOverflow || this.#uriAuthority.length + boundary > MAX_STREAM_REDACTOR_PENDING
+      ? "[REDACTED]"
+      : this.#uriAuthority + value.slice(0, boundary);
+    const output = character === "@"
+      ? `${this.#uriPrefix ?? ""}[REDACTED]@`
+      : `${this.#uriPrefix ?? ""}${authority}${character}`;
+    this.#uriPrefix = null;
+    this.#uriAuthority = "";
+    this.#uriOverflow = false;
+    return { output, remaining: value.slice(boundary + 1), waiting: false };
   }
 
   #consumeSensitive(value: string): { output: string; remaining: string; waiting: boolean } {

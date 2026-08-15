@@ -154,7 +154,13 @@ describe("human decision contracts", () => {
       allowCustom: true,
     };
 
-    for (const injected of ["line one\nline two", "safe\u202Etxt", "safe\u2066txt"]) {
+    for (const injected of [
+      "line one\nline two",
+      "safe\u2028txt",
+      "safe\u2029txt",
+      "safe\u202Etxt",
+      "safe\u2066txt",
+    ]) {
       expect(() => HumanDecisionRequestSchema.parse({ ...approval, question: injected })).toThrow();
       expect(() => HumanDecisionRequestSchema.parse({ ...approval, action: injected })).toThrow();
       expect(() => HumanDecisionRequestSchema.parse({ ...approval, context: injected })).toThrow();
@@ -162,6 +168,10 @@ describe("human decision contracts", () => {
       expect(() => HumanDecisionRequestSchema.parse({
         ...approval,
         options: approval.options.map((option, index) => index === 0 ? { ...option, label: injected } : option),
+      })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({
+        ...approval,
+        options: approval.options.map((option, index) => index === 0 ? { ...option, description: injected } : option),
       })).toThrow();
     }
 
@@ -203,7 +213,7 @@ describe("human decision checkpoint recovery", () => {
       kind: "approval",
       question: "Approve this?\nLegacy detail",
       context: "Context line one\r\nContext line two",
-      risk: "Risk line one\u202ERisk line two",
+      risk: "Risk line one\u2028Risk line two\u2029End",
       action: "npm run migrate",
       options: [
         { id: "approve", label: "Approve", description: "Run once." },
@@ -216,7 +226,7 @@ describe("human decision checkpoint recovery", () => {
     expect(recovered).not.toBeNull();
     expect(recovered?.question).toBe("Approve this?\\u{000a}Legacy detail");
     expect(recovered?.context).toBe("Context line one\\u{000d}\\u{000a}Context line two");
-    expect(recovered?.risk).toBe("Risk line one\\u{202e}Risk line two");
+    expect(recovered?.risk).toBe("Risk line one\\u{2028}Risk line two\\u{2029}End");
   });
 });
 

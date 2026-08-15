@@ -27,7 +27,6 @@ import {
   isMigrationPath,
   isPackageManifestPath,
 } from "./file-mutation-policy.js";
-
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -71,6 +70,7 @@ const MAX_SEARCH_ENTRIES = 40_000;
 const MAX_SEARCH_LIST_BYTES = 8 * 1024 * 1024;
 const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_SEARCH_CONTENT_CHARS = 256 * 1024;
 const activeMutationSignal = new AsyncLocalStorage<AbortSignal | undefined>();
 const activeToolSignal = new AsyncLocalStorage<AbortSignal | undefined>();
 
@@ -427,11 +427,12 @@ function safeGrepTool(delegate: ToolDefinition, root: string, role: ToolRole): T
       let matches = 0;
       let searchedBytes = 0;
       let searchByteLimitReached = false;
+      let oversizedFileCount = 0;
       for (const file of files) {
         assertNotAborted(signal, "Grep aborted");
         const rel = relative(searchRoot, file.path).split(sep).join("/") || file.path.slice(file.path.lastIndexOf(sep) + 1);
         if (typeof raw.glob === "string" && !matchesGlob(rel, raw.glob)) continue;
-        if (file.size > MAX_SEARCH_FILE_BYTES) continue;
+        if (file.size > MAX_SEARCH_FILE_BYTES) { oversizedFileCount += 1; continue; }
         if (searchedBytes + file.size > MAX_SEARCH_TOTAL_BYTES) {
           searchByteLimitReached = true;
           break;
@@ -454,16 +455,22 @@ function safeGrepTool(delegate: ToolDefinition, root: string, role: ToolRole): T
         }
         if (matches >= limit) break;
       }
+      const joined = output.join("\n"), contentLimitReached = joined.length > MAX_SEARCH_CONTENT_CHARS;
       const details = {
         ...(matches >= limit ? { matchLimitReached: limit } : {}),
+        ...(oversizedFileCount > 0 ? { oversizedFileCount } : {}),
         ...(searchByteLimitReached ? { searchByteLimitReached: MAX_SEARCH_TOTAL_BYTES } : {}),
+        ...(contentLimitReached ? { contentLimitReached: MAX_SEARCH_CONTENT_CHARS } : {}),
       };
-      const incompleteWarning = searchByteLimitReached
-        ? `Search stopped after ${MAX_SEARCH_TOTAL_BYTES} aggregate bytes; results are incomplete.`
-        : undefined;
+      const warnings = [
+        matches >= limit ? `Search stopped at the ${limit} match limit; results are incomplete.` : undefined,
+        oversizedFileCount > 0 ? `Search skipped ${oversizedFileCount} oversized file(s); results are incomplete.` : undefined,
+        searchByteLimitReached ? `Search stopped after ${MAX_SEARCH_TOTAL_BYTES} aggregate bytes; results are incomplete.` : undefined,
+        contentLimitReached ? `Search output stopped at the ${MAX_SEARCH_CONTENT_CHARS} character content limit; results are incomplete.` : undefined,
+      ].filter((warning): warning is string => warning !== undefined);
       const text = output.length === 0
-        ? incompleteWarning ?? "No matches found"
-        : [output.join("\n").slice(0, 256 * 1024), incompleteWarning].filter(Boolean).join("\n");
+        ? warnings.join("\n") || "No matches found"
+        : [joined.slice(0, MAX_SEARCH_CONTENT_CHARS), ...warnings].join("\n");
       return {
         content: [{ type: "text", text }],
         details: Object.keys(details).length === 0 ? undefined : details,
@@ -483,11 +490,19 @@ function safeFindTool(delegate: ToolDefinition, root: string, role: ToolRole): T
       assertSearchDoesNotTargetPrivate(params, true);
       const limit = finiteInteger(raw.limit, 1_000, "find limit", 1, 100_000);
       const { searchRoot, files } = await safeSearchFiles(root, parameterPath(params), role, signal);
-      const results = files.map((file) => relative(searchRoot, file.path).split(sep).join("/"))
-        .filter((path) => matchesGlob(path, raw.pattern as string)).slice(0, limit);
+      const matches = files.map((file) => relative(searchRoot, file.path).split(sep).join("/"))
+        .filter((path) => matchesGlob(path, raw.pattern as string));
+      const results = matches.slice(0, limit), joined = results.join("\n");
+      const resultLimitReached = matches.length > limit, contentLimitReached = joined.length > MAX_SEARCH_CONTENT_CHARS;
+      const warnings = [
+        resultLimitReached ? `Search stopped at the ${limit} result limit; results are incomplete.` : undefined,
+        contentLimitReached ? `Search output stopped at the ${MAX_SEARCH_CONTENT_CHARS} character content limit; results are incomplete.` : undefined,
+      ].filter((warning): warning is string => warning !== undefined);
       return {
-        content: [{ type: "text", text: results.length === 0 ? "No files found matching pattern" : results.join("\n").slice(0, 256 * 1024) }],
-        details: results.length >= limit ? { resultLimitReached: limit } : undefined,
+        content: [{ type: "text", text: results.length === 0 ? "No files found matching pattern" : [joined.slice(0, MAX_SEARCH_CONTENT_CHARS), ...warnings].join("\n") }],
+        details: warnings.length === 0 ? undefined : {
+          ...(resultLimitReached ? { resultLimitReached: limit } : {}), ...(contentLimitReached ? { contentLimitReached: MAX_SEARCH_CONTENT_CHARS } : {}),
+        },
       };
     },
   };

@@ -1251,6 +1251,38 @@ describe("normalizePiEvent", () => {
     expect(rendered).not.toContain("hunter2");
   });
 
+  it("redacts credentialed URI userinfo at every assistant-delta split position", () => {
+    const uris = [
+      "https://deploy-user:p%40ss@example.test/private",
+      "custom+ssh://deploy-user:p%40ss@example.test/private",
+    ];
+    for (const uri of uris) {
+      const text = `Connect ${uri} now`;
+      for (let split = 0; split <= text.length; split += 1) {
+        const state = {
+          calls: new Map(),
+          changedFiles: new Set<string>(),
+          finalMessage: "",
+          providerError: undefined,
+        };
+        const events = [
+          ...normalizePiEvent(assistantTextDelta(text.slice(0, split)), state),
+          ...normalizePiEvent(assistantTextDelta(text.slice(split)), state),
+          ...normalizePiEvent(assistantMessage(text), state),
+        ];
+        const rendered = events
+          .filter((event): event is Extract<AgencyEvent, { type: "assistant_text_delta" }> =>
+            event.type === "assistant_text_delta")
+          .map(({ delta }) => delta)
+          .join("");
+        expect(rendered, `${uri} split ${split}`).not.toContain("deploy-user");
+        expect(rendered, `${uri} split ${split}`).not.toContain("p%40ss");
+        expect(rendered, `${uri} split ${split}`).toContain("[REDACTED]");
+        expect(rendered, `${uri} split ${split}`).toContain("@example.test/private");
+      }
+    }
+  });
+
   it("keeps assignment values sensitive across whitespace and escaped quote chunks", () => {
     const state = {
       calls: new Map(),
