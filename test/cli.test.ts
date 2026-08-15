@@ -646,6 +646,89 @@ describe("Agency terminal application", () => {
     expect(output.value).toContain("Done: migration guidance applied");
   });
 
+  it("canonicalizes and resumes a legacy multiline approval checkpoint", async () => {
+    const cwd = await temporaryGitProject();
+    const session: SessionContext = { sessionId: "legacy-session", recentTurns: [], runSummaries: [] };
+    const legacyRequest = {
+      id: "legacy-approval",
+      kind: "approval" as const,
+      question: "Approve this migration?\nLegacy checkpoint detail",
+      context: "First line\nSecond line",
+      risk: "Schema changes\r\nmay be destructive",
+      action: "npx prisma migrate deploy",
+      options: [
+        { id: "approve", label: "Approve", description: "Run once." },
+        { id: "reject", label: "Reject", description: "Cancel." },
+        { id: "edit", label: "Edit", description: "Change guidance." },
+      ],
+      allowCustom: true,
+    };
+    const legacyState = {
+      runId: "legacy-run",
+      threadId: "legacy-thread",
+      sessionId: session.sessionId,
+      repoPath: cwd,
+      userIntent: "legacy migration",
+      status: "executing" as const,
+      codingPlan: plan,
+      changedFiles: [],
+      verificationCommands: [{ name: "test", command: "npm", args: ["run", "test"], required: true }],
+      pendingHumanDecision: legacyRequest,
+    };
+    const completed = {
+      ...legacyState,
+      status: "completed" as const,
+      pendingHumanDecision: null,
+      verification: { status: "passed" as const, summary: "tests passed", commands: [] },
+      summary: "legacy task resumed",
+    };
+    const resume = vi.fn(async () => completed as never);
+    const output = new BufferOutput();
+
+    await runAgency({
+      cwd,
+      io: new ScriptedIO(["r", "/exit"]),
+      output,
+      errorOutput: new BufferOutput(),
+      runtimeFactory: async () => new FakeCodingRuntime(),
+      checkpointFactory: async () => ({
+        path: join(cwd, ".devagency", "state.db"),
+        checkpointer: {} as SqliteCheckpointPersistence["checkpointer"],
+        deleteThread: async () => {},
+        close: () => {},
+      }),
+      sessionStoreFactory: () => ({
+        loadOrCreate: async () => session,
+        createNew: async () => session,
+        recordUserTurn: async () => session,
+        recordRunSummary: async () => session,
+      }),
+      registryFactory: () => ({ list: async () => [], upsert: async () => {}, updateStatus: async () => {} }),
+      graphFactory: () => ({ invoke: async () => completed as never, getState: async () => ({}), resume }),
+      inspectRecovery: async () => [{
+        status: "resumable",
+        entry: {
+          runId: legacyState.runId,
+          threadId: legacyState.threadId,
+          sessionId: legacyState.sessionId,
+          userIntent: legacyState.userIntent,
+          status: "executing",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+        snapshot: { values: legacyState, next: ["human"], tasks: [] },
+      }],
+    });
+
+    expect(resume).toHaveBeenCalledWith(
+      "legacy-thread",
+      { requestId: "legacy-approval", optionId: "reject" },
+      expect.any(Object),
+    );
+    expect(output.value).toContain("Approve this migration?\\u{000a}Legacy checkpoint detail");
+    expect(output.value).not.toContain("Approve this migration?\nLegacy checkpoint detail");
+  });
+
   it("renders a terminal result before warning when checkpoint pruning fails", async () => {
     const cwd = await temporaryGitProject();
     const session: SessionContext = {

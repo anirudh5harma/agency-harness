@@ -9,6 +9,8 @@ import {
   PlanSchema,
   projectKnowledgeKey,
   ProjectKnowledgeEntrySchema,
+  redactSecrets,
+  recoverHumanDecisionRequest,
   renderProjectKnowledge,
   RepoContextSchema,
   SessionContextSchema,
@@ -155,6 +157,8 @@ describe("human decision contracts", () => {
     for (const injected of ["line one\nline two", "safe\u202Etxt", "safe\u2066txt"]) {
       expect(() => HumanDecisionRequestSchema.parse({ ...approval, question: injected })).toThrow();
       expect(() => HumanDecisionRequestSchema.parse({ ...approval, action: injected })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({ ...approval, context: injected })).toThrow();
+      expect(() => HumanDecisionRequestSchema.parse({ ...approval, risk: injected })).toThrow();
       expect(() => HumanDecisionRequestSchema.parse({
         ...approval,
         options: approval.options.map((option, index) => index === 0 ? { ...option, label: injected } : option),
@@ -171,6 +175,48 @@ describe("human decision contracts", () => {
       ],
       allowCustom: true,
     }).question).toContain("\n");
+  });
+});
+
+describe("secret redaction", () => {
+  it("redacts credentialed URI userinfo and database URL assignments", () => {
+    const raw = [
+      "postgres://db-user:s3cr%40t@db.example.test/app",
+      "https://api-user:api-pass@example.test/path",
+      "DATABASE_URL=postgres://owner:hunter2@localhost/app",
+      "TEST_DATABASE_URL='mysql://test-user:test-pass@localhost/test'",
+    ].join("\n");
+
+    const redacted = redactSecrets(raw);
+
+    expect(redacted).not.toMatch(/db-user|s3cr%40t|api-user|api-pass|owner|hunter2|test-user|test-pass/u);
+    expect(redacted).toContain("postgres://[REDACTED]@db.example.test/app");
+    expect(redacted).toContain("DATABASE_URL=[REDACTED]");
+    expect(redacted).toContain("TEST_DATABASE_URL=[REDACTED]");
+  });
+});
+
+describe("human decision checkpoint recovery", () => {
+  it("visibly canonicalizes legacy multiline approval presentation", () => {
+    const recovered = recoverHumanDecisionRequest({
+      id: "legacy-approval",
+      kind: "approval",
+      question: "Approve this?\nLegacy detail",
+      context: "Context line one\r\nContext line two",
+      risk: "Risk line one\u202ERisk line two",
+      action: "npm run migrate",
+      options: [
+        { id: "approve", label: "Approve", description: "Run once." },
+        { id: "reject", label: "Reject", description: "Cancel." },
+        { id: "edit", label: "Edit", description: "Change guidance." },
+      ],
+      allowCustom: true,
+    });
+
+    expect(recovered).not.toBeNull();
+    expect(recovered?.question).toBe("Approve this?\\u{000a}Legacy detail");
+    expect(recovered?.context).toBe("Context line one\\u{000d}\\u{000a}Context line two");
+    expect(recovered?.risk).toBe("Risk line one\\u{202e}Risk line two");
   });
 });
 

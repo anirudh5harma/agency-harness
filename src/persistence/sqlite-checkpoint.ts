@@ -21,6 +21,7 @@ import {
   ensurePrivateMetadataDirectory,
   readPrivateMetadataFile,
   validatePrivateMetadataFile,
+  withPrivateMetadataFileLock,
   writePrivateMetadataFileAtomic,
 } from "./metadata-root.js";
 
@@ -244,36 +245,59 @@ class DurableFileSaver extends MemorySaver {
     await writePrivateMetadataFileAtomic(this.#projectRoot, this.#path, contents);
   }
 
+  async #refresh(): Promise<void> {
+    const contents = await readPrivateMetadataFile(
+      this.#projectRoot,
+      this.#path,
+      MAX_CHECKPOINT_FILE_BYTES,
+    );
+    if (contents === null || contents.length === 0 || contents.startsWith(SQLITE_HEADER)) {
+      throw new Error("checkpoint file disappeared or changed format");
+    }
+    const latest = parseCheckpointFile(contents);
+    this.storage = latest.storage;
+    this.writes = latest.writes;
+  }
+
   async #mutate<T>(operation: () => Promise<T>): Promise<T> {
     return this.#enqueue(async () => {
       this.#assertOpen();
-      const rollback = serializedCheckpointFile(this);
-      try {
-        const result = await operation();
-        await this.#persist();
-        return result;
-      } catch (cause) {
-        const previous = parseCheckpointFile(rollback);
-        this.storage = previous.storage;
-        this.writes = previous.writes;
-        throw cause;
-      }
+      return withPrivateMetadataFileLock(this.#projectRoot, this.#path, async () => {
+        await this.#refresh();
+        const rollback = serializedCheckpointFile(this);
+        try {
+          const result = await operation();
+          await this.#persist();
+          return result;
+        } catch (cause) {
+          const previous = parseCheckpointFile(rollback);
+          this.storage = previous.storage;
+          this.writes = previous.writes;
+          throw cause;
+        }
+      });
+    });
+  }
+
+  async #read<T>(operation: () => Promise<T>): Promise<T> {
+    return this.#enqueue(async () => {
+      this.#assertOpen();
+      return withPrivateMetadataFileLock(this.#projectRoot, this.#path, async () => {
+        await this.#refresh();
+        return operation();
+      });
     });
   }
 
   override async getTuple(config: RunnableConfig): Promise<CheckpointTuple | undefined> {
-    return this.#enqueue(async () => {
-      this.#assertOpen();
-      return super.getTuple(config);
-    });
+    return this.#read(() => super.getTuple(config));
   }
 
   override async *list(
     config: RunnableConfig,
     options?: CheckpointListOptions,
   ): AsyncGenerator<CheckpointTuple> {
-    const tuples = await this.#enqueue(async () => {
-      this.#assertOpen();
+    const tuples = await this.#read(async () => {
       const result: CheckpointTuple[] = [];
       for await (const tuple of super.list(config, options)) result.push(tuple);
       return result;
@@ -305,10 +329,7 @@ class DurableFileSaver extends MemorySaver {
     config: RunnableConfig;
     channels: string[];
   }): Promise<Record<string, DeltaChannelHistory>> {
-    return this.#enqueue(async () => {
-      this.#assertOpen();
-      return super.getDeltaChannelHistory(options);
-    });
+    return this.#read(() => super.getDeltaChannelHistory(options));
   }
 
   close(): void {
@@ -330,34 +351,37 @@ export async function createCheckpointPersistence(
   let saver: DurableFileSaver;
   try {
     await ensurePrivateMetadataDirectory(projectRoot);
-    const contents = await readPrivateMetadataFile(projectRoot, path, MAX_CHECKPOINT_FILE_BYTES);
-    let state: PersistedCheckpointFile;
-    let writeInitialState = false;
-    if (contents === null || contents.length === 0) {
-      state = {
-        format: CHECKPOINT_FORMAT,
-        version: CHECKPOINT_FORMAT_VERSION,
-        storage: emptyRecord(),
-        writes: emptyRecord(),
-      };
-      writeInitialState = true;
-    } else if (contents.startsWith(SQLITE_HEADER)) {
-      state = await migrateSqliteCheckpoint(path);
-      writeInitialState = true;
-    } else {
-      state = parseCheckpointFile(contents);
-    }
-    saver = new DurableFileSaver(projectRoot, path, state);
-    if (writeInitialState) {
-      await writePrivateMetadataFileAtomic(projectRoot, path, serializedCheckpointFile(saver));
-    }
-    await validatePrivateMetadataFile(projectRoot, path);
-    if (contents?.startsWith(SQLITE_HEADER) === true) {
-      await Promise.all([
-        rm(`${path}-wal`, { force: true }).catch(() => undefined),
-        rm(`${path}-shm`, { force: true }).catch(() => undefined),
-      ]);
-    }
+    saver = await withPrivateMetadataFileLock(projectRoot, path, async () => {
+      const contents = await readPrivateMetadataFile(projectRoot, path, MAX_CHECKPOINT_FILE_BYTES);
+      let state: PersistedCheckpointFile;
+      let writeInitialState = false;
+      if (contents === null || contents.length === 0) {
+        state = {
+          format: CHECKPOINT_FORMAT,
+          version: CHECKPOINT_FORMAT_VERSION,
+          storage: emptyRecord(),
+          writes: emptyRecord(),
+        };
+        writeInitialState = true;
+      } else if (contents.startsWith(SQLITE_HEADER)) {
+        state = await migrateSqliteCheckpoint(path);
+        writeInitialState = true;
+      } else {
+        state = parseCheckpointFile(contents);
+      }
+      const initialized = new DurableFileSaver(projectRoot, path, state);
+      if (writeInitialState) {
+        await writePrivateMetadataFileAtomic(projectRoot, path, serializedCheckpointFile(initialized));
+      }
+      await validatePrivateMetadataFile(projectRoot, path);
+      if (contents?.startsWith(SQLITE_HEADER) === true) {
+        await Promise.all([
+          rm(`${path}-wal`, { force: true }).catch(() => undefined),
+          rm(`${path}-shm`, { force: true }).catch(() => undefined),
+        ]);
+      }
+      return initialized;
+    });
   } catch (cause) {
     throw new InfrastructureError(
       "CHECKPOINT_INITIALIZATION_FAILED",

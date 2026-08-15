@@ -52,6 +52,7 @@ import {
   createRoleFileTools,
   defaultToolFactoryBoundary,
   type ToolFactoryBoundary,
+  type BatchedProtectedMutationResultDetails,
 } from "./tool-policy.js";
 
 const PLANNER_TOOLS = [...ROLE_TOOL_POLICY.planner];
@@ -395,7 +396,7 @@ function protectedMutationPaths(result: unknown): string[] {
   if (typeof result !== "object" || result === null) return [];
   const details = (result as { details?: unknown }).details;
   if (typeof details !== "object" || details === null) return [];
-  const paths = (details as { agencyMutationPaths?: unknown }).agencyMutationPaths;
+  const paths = (details as Partial<BatchedProtectedMutationResultDetails>).agencyMutationPaths;
   if (!Array.isArray(paths) || paths.length > 40_000) return [];
   return [...new Set(paths.filter((path): path is string => {
     if (typeof path !== "string" || path === "" || path.includes("\0") || path.includes("\\") || path.startsWith("/")) return false;

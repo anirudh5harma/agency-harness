@@ -16,9 +16,17 @@ import {
 import { dirname, isAbsolute, matchesGlob, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { isDeepStrictEqual } from "node:util";
 
 import { runCommand } from "../process/index.js";
+import {
+  applyPackageManifestEdits,
+  assertNeverMutablePath,
+  assertPackageDependencyPolicy,
+  isDependencyManifestPath,
+  isLockfilePath,
+  isMigrationPath,
+  isPackageManifestPath,
+} from "./file-mutation-policy.js";
 
 import {
   createBashToolDefinition,
@@ -99,6 +107,11 @@ export const defaultToolFactoryBoundary: ToolFactoryBoundary = {
 export interface VerificationInvocation {
   command: string;
   args: readonly string[];
+}
+
+/** Validated paths from one protected mutation, emitted together after successful completion. */
+export interface BatchedProtectedMutationResultDetails {
+  agencyMutationPaths: readonly string[];
 }
 
 function policyError(reason: string): Error {
@@ -445,8 +458,14 @@ function safeGrepTool(delegate: ToolDefinition, root: string, role: ToolRole): T
         ...(matches >= limit ? { matchLimitReached: limit } : {}),
         ...(searchByteLimitReached ? { searchByteLimitReached: MAX_SEARCH_TOTAL_BYTES } : {}),
       };
+      const incompleteWarning = searchByteLimitReached
+        ? `Search stopped after ${MAX_SEARCH_TOTAL_BYTES} aggregate bytes; results are incomplete.`
+        : undefined;
+      const text = output.length === 0
+        ? incompleteWarning ?? "No matches found"
+        : [output.join("\n").slice(0, 256 * 1024), incompleteWarning].filter(Boolean).join("\n");
       return {
-        content: [{ type: "text", text: output.length === 0 ? "No matches found" : output.join("\n").slice(0, 256 * 1024) }],
+        content: [{ type: "text", text }],
         details: Object.keys(details).length === 0 ? undefined : details,
       };
     },
@@ -620,10 +639,22 @@ function prepareAllowedBash(
   if (words[0] === "rm") {
     const paths = words.slice(1).filter((argument) => !argument.startsWith("-"));
     const options = words.slice(1).filter((argument) => argument.startsWith("-"));
-    if (paths.length === 0 || options.some((option) => !["-r", "-f", "-rf", "-fr", "--recursive", "--force"].includes(option))) {
-      throw policyError("rm requires explicit literal repository paths and known options");
+    if (paths.length !== 1) {
+      throw policyError("rm requires exactly one target so deletion ownership is atomic");
     }
-    for (const path of paths) assertPathClass(path, true);
+    if (options.some((option) => ["-r", "-rf", "-fr", "--recursive"].includes(option))) {
+      throw policyError("recursive rm is not supported because partial deletion cannot be reconciled safely");
+    }
+    if (options.some((option) => !["-f", "--force"].includes(option))) {
+      throw policyError("rm accepts only the force option");
+    }
+    for (const path of paths) {
+      const normalized = assertPathClass(path, true);
+      assertNeverMutablePath(normalized);
+      if (isDependencyManifestPath(normalized)) {
+        throw policyError("dependency manifests cannot be deleted by model tools");
+      }
+    }
     const action = bashApprovalAction(words);
     if (!consumeApproval(action)) {
       throw new Error(`Agency policy requires request_human_input explicit one-shot approval for exact action: ${action}`);
@@ -655,6 +686,8 @@ async function assertSafeRmTargets(root: string, command: string): Promise<strin
       const path = relative(canonicalRoot, target).split(sep).join("/");
       assertPathClass(path, true);
       if (isCredentialPath(path)) throw policyError("credential-like paths cannot be changed by model tools");
+      assertNeverMutablePath(path);
+      if (isDependencyManifestPath(path)) throw policyError("dependency manifests cannot be deleted by model tools");
       mutationPaths.add(path);
       return;
     }
@@ -665,6 +698,8 @@ async function assertSafeRmTargets(root: string, command: string): Promise<strin
   for (const input of words.slice(1).filter((argument) => !argument.startsWith("-"))) {
     const normalized = assertPathClass(input, true);
     if (isCredentialPath(normalized)) throw policyError("credential-like paths cannot be changed by model tools");
+    assertNeverMutablePath(normalized);
+    if (isDependencyManifestPath(normalized)) throw policyError("dependency manifests cannot be deleted by model tools");
     const target = resolve(canonicalRoot, normalized);
     if (!isWithin(canonicalRoot, target) || target === canonicalRoot) {
       throw policyError("rm target must stay inside repository");
@@ -721,88 +756,13 @@ export function assertAllowedBash(
   prepareAllowedBash(command, consumeApproval, verificationCommands);
 }
 
-const LOCKFILE_NAMES = new Set([
-  "bun.lock", "bun.lockb", "cargo.lock", "composer.lock", "deno.lock", "gemfile.lock",
-  "go.sum", "npm-shrinkwrap.json", "package-lock.json", "package.resolved", "packages.lock.json",
-  "pipfile.lock", "pnpm-lock.yaml", "poetry.lock", "pubspec.lock", "podfile.lock", "uv.lock", "yarn.lock",
-]);
-const PACKAGE_DEPENDENCY_FIELDS = [
-  "dependencies", "devDependencies", "peerDependencies", "peerDependenciesMeta",
-  "optionalDependencies", "bundledDependencies", "bundleDependencies", "overrides", "resolutions",
-] as const;
-
-function isLockfilePath(path: string): boolean {
-  const name = relativePath(path).toLowerCase().split("/").at(-1) ?? "";
-  return LOCKFILE_NAMES.has(name);
-}
-
-function isMigrationPath(path: string): boolean {
-  return relativePath(path).toLowerCase().split("/").some((segment) => /^(?:migrations?|migrate)$/u.test(segment));
-}
-
-function isPackageManifestPath(path: string): boolean {
-  return (relativePath(path).toLowerCase().split("/").at(-1) ?? "") === "package.json";
-}
-
-function parsePackageManifest(content: string): Record<string, unknown> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    throw policyError("package manifest changes must remain valid JSON with unchanged dependency sections");
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw policyError("package manifest must remain a JSON object");
-  }
-  return parsed as Record<string, unknown>;
-}
-
-function dependencyPolicyView(manifest: Record<string, unknown>): Record<string, unknown> {
-  const view: Record<string, unknown> = {};
-  for (const field of PACKAGE_DEPENDENCY_FIELDS) {
-    if (Object.hasOwn(manifest, field)) view[field] = manifest[field];
-  }
-  const pnpm = manifest.pnpm;
-  if (typeof pnpm === "object" && pnpm !== null && !Array.isArray(pnpm)) {
-    const pnpmPolicy: Record<string, unknown> = {};
-    for (const field of ["overrides", "packageExtensions", "peerDependencyRules"] as const) {
-      if (Object.hasOwn(pnpm, field)) pnpmPolicy[field] = (pnpm as Record<string, unknown>)[field];
-    }
-    if (Object.keys(pnpmPolicy).length > 0) view.pnpm = pnpmPolicy;
-  }
-  return view;
-}
-
-function applyPackageEdits(original: string, edits: Array<{ oldText: string; newText: string }>): string {
-  const content = original.replace(/^\uFEFF/u, "").replace(/\r\n?/gu, "\n");
-  const replacements = edits.map(({ oldText, newText }) => {
-    const normalizedOld = oldText.replace(/\r\n?/gu, "\n");
-    const first = content.indexOf(normalizedOld);
-    if (normalizedOld === "" || first < 0 || content.indexOf(normalizedOld, first + normalizedOld.length) >= 0) {
-      throw policyError("package manifest edit targets must be unique and non-empty");
-    }
-    return { start: first, end: first + normalizedOld.length, newText: newText.replace(/\r\n?/gu, "\n") };
-  }).sort((left, right) => left.start - right.start);
-  if (replacements.some((replacement, index) => index > 0 && replacement.start < replacements[index - 1]!.end)) {
-    throw policyError("package manifest edits cannot overlap");
-  }
-  let output = "";
-  let cursor = 0;
-  for (const replacement of replacements) {
-    output += content.slice(cursor, replacement.start) + replacement.newText;
-    cursor = replacement.end;
-  }
-  return output + content.slice(cursor);
-}
-
 async function assertUnconditionallyAllowedMutation(
   root: string,
   params: unknown,
   tool: "edit" | "write",
 ): Promise<void> {
   const path = parameterPath(params);
-  if (isLockfilePath(path)) throw policyError("lockfiles cannot be changed by model tools");
-  if (isMigrationPath(path)) throw policyError("migrations cannot be changed by model tools");
+  assertNeverMutablePath(path);
   if (!isPackageManifestPath(path)) return;
 
   let original = "{}";
@@ -822,13 +782,9 @@ async function assertUnconditionallyAllowedMutation(
     if (!Array.isArray(edits) || edits.length === 0 || edits.some(({ oldText, newText }) => typeof oldText !== "string" || typeof newText !== "string")) {
       throw policyError("edit requires non-empty string replacement pairs");
     }
-    proposed = applyPackageEdits(original, edits as Array<{ oldText: string; newText: string }>);
+    proposed = applyPackageManifestEdits(original, edits as Array<{ oldText: string; newText: string }>);
   }
-  const before = dependencyPolicyView(parsePackageManifest(original));
-  const after = dependencyPolicyView(parsePackageManifest(proposed));
-  if (!isDeepStrictEqual(before, after)) {
-    throw policyError("package dependency sections cannot be changed by model tools");
-  }
+  assertPackageDependencyPolicy(original, proposed);
 }
 
 function isSensitivePath(path: string): boolean {

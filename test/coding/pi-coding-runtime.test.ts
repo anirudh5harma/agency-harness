@@ -471,8 +471,8 @@ describe("PiCodingRuntime", () => {
 
   it("scopes consequential shell approval to the exact command for one use", async () => {
     const testRepo = { ...repo, rootPath: process.cwd() };
-    const command = "rm -rf build";
-    const action = bashApprovalAction(["rm", "-rf", "build"]);
+    const command = "rm obsolete-output.js";
+    const action = bashApprovalAction(["rm", "obsolete-output.js"]);
     let prompts = 0;
     let firstRun: unknown;
     let secondError: unknown;
@@ -923,7 +923,7 @@ describe("PiCodingRuntime", () => {
     await expect(invoke("git diff -- src/coding/tool-policy.ts")).resolves.toBeDefined();
 
     for (const destructive of ["rm -rf build", "rm -fr build", "rm --recursive build"]) {
-      await expect(invoke(destructive), destructive).rejects.toThrow("one-shot approval");
+      await expect(invoke(destructive), destructive).rejects.toThrow("recursive rm");
     }
   });
 

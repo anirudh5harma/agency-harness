@@ -404,6 +404,19 @@ describe("Agency worktrees", () => {
     expect((await git(root, ["branch", "--list", context.branch])).trim()).toBe("");
   });
 
+  it("finds an owned worktree without changing its source metadata", async () => {
+    const root = await repository();
+    const context = await createAgencyWorktree(root, { id: "findowned", slug: "test project" });
+    temporaryDirectories.push(context.path);
+    const registryPath = join(root, ".devagency", "agency-worktrees.json");
+    const before = await readFile(registryPath);
+
+    await expect(findAgencyWorktree(context.path)).resolves.toEqual(context);
+    expect(await readFile(registryPath)).toEqual(before);
+
+    await discardAgencyWorktree(context, { confirmed: true });
+  });
+
   it("rejects unborn worktree creation truthfully", async () => {
     const root = await mkdtemp(join(tmpdir(), "agency-unborn-"));
     temporaryDirectories.push(root);

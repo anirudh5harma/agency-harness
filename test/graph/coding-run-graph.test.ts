@@ -24,7 +24,7 @@ import type {
   TrajectoryLifecycleEvent,
   TrajectoryWriter,
 } from "../../src/observability/index.js";
-import { createSqliteCheckpointPersistence, IncompleteRunRegistry, inspectIncompleteRunRecovery } from "../../src/persistence/index.js";
+import { checkpointValues, createSqliteCheckpointPersistence, IncompleteRunRegistry, inspectIncompleteRunRecovery } from "../../src/persistence/index.js";
 import { InfrastructureError } from "../../src/process/index.js";
 import { EventBus } from "../../src/events/index.js";
 import {
@@ -721,7 +721,7 @@ describe("coding run graph", () => {
     expect(runtime.calls.repair[0]?.failure.recoverable).toBe(true);
   });
 
-  it("remeasures and owns only newly visible paths created by verification", async () => {
+  it("remeasures verification-created paths without claiming mutation ownership", async () => {
     const { root, runtime, deps } = await setup([]);
     const bus = new EventBus();
     const ownedPaths: string[] = [];
@@ -737,7 +737,44 @@ describe("coding run graph", () => {
 
     expect(state.status).toBe("completed");
     expect(state.changedFiles).toEqual(["verification-output.txt"]);
-    expect(ownedPaths).toEqual(["verification-output.txt"]);
+    expect(ownedPaths).toEqual([]);
+  });
+
+  it("remeasures a user-like write during verification without claiming mutation ownership", async () => {
+    const { root, runtime, deps } = await setup([]);
+    const bus = new EventBus();
+    const ownedPaths: string[] = [];
+    bus.subscribe("file_changed", ({ path }) => ownedPaths.push(path));
+    deps.eventBus = bus;
+    deps.runVerification = vi.fn(async () => {
+      await writeFile(join(root, "concurrent-user-note.txt"), "user value\n");
+      return verification("passed");
+    });
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.changedFiles).toEqual(["concurrent-user-note.txt"]);
+    expect(ownedPaths).toEqual([]);
+  });
+
+  it("remeasures final state after verification writes and throws without claiming ownership", async () => {
+    const { root, runtime, deps } = await setup([]);
+    const bus = new EventBus();
+    const ownedPaths: string[] = [];
+    bus.subscribe("file_changed", ({ path }) => ownedPaths.push(path));
+    deps.eventBus = bus;
+    deps.runVerification = vi.fn(async () => {
+      await writeFile(join(root, "verification-crash-output.txt"), "partial output\n");
+      throw new Error("verification crashed");
+    });
+    runtime.enqueueExecuteResult({ message: "done", changedFiles: [], sessionId: "pi-1" });
+
+    const state = await createCodingRunGraph(deps).invoke(input(root));
+
+    expect(state.status).toBe("failed");
+    expect(state.changedFiles).toEqual(["verification-crash-output.txt"]);
+    expect(ownedPaths).toEqual([]);
   });
 
   it("remeasures a failed verification before routing its new path to repair", async () => {
@@ -793,6 +830,8 @@ describe("coding run graph", () => {
       "password=hunter2",
       "AKIAIOSFODNN7EXAMPLE",
       "ghp_abcdefghijklmnopqrstuvwxyz123456",
+      "postgres://db-user:s3cr%40t@db.example.test/app",
+      "DATABASE_URL=postgres://owner:hunter2@localhost/app",
     ];
     deps.runVerification = vi.fn(async () => ({
       ...verification("failed"),
@@ -806,11 +845,17 @@ describe("coding run graph", () => {
     runtime.enqueueRepairResult({ message: "fixed", changedFiles: [], sessionId: "pi-1" });
     const persistence = await createSqliteCheckpointPersistence(root);
 
-    const state = await createCodingRunGraph(deps, {
+    const runner = createCodingRunGraph(deps, {
       checkpointer: persistence.checkpointer,
-    }).invoke(input(root));
+    });
+    const state = await runner.invoke(input(root));
 
-    const persistedBoundary = JSON.stringify({ verification: state.verification, repair: runtime.calls.repair[0] });
+    const decodedCheckpoint = checkpointValues(await runner.getState("thread-001"));
+    const persistedBoundary = JSON.stringify({
+      checkpoint: decodedCheckpoint,
+      verification: state.verification,
+      repair: runtime.calls.repair[0],
+    });
     for (const secret of rawSecrets) expect(persistedBoundary).not.toContain(secret);
     expect(persistedBoundary).toContain("[REDACTED]");
     persistence.close();

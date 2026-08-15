@@ -126,6 +126,28 @@ describe("VerificationRunner", () => {
     expect(options?.env).not.toHaveProperty("GITHUB_TOKEN");
   });
 
+  it("reports limited verification when explicitly required project environment is stripped", async () => {
+    const execute = vi.fn(async (command: VerificationCommand) => result(command, 0));
+    const runner = new VerificationRunner({
+      execute,
+      environment: {
+        PATH: "/safe/bin",
+        DATABASE_URL: "postgres://owner:secret@localhost/app",
+      },
+      requiredEnvironmentKeys: ["DATABASE_URL"],
+    });
+
+    const verification = await runner.run(commands.slice(0, 1), process.cwd());
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(verification).toEqual({
+      status: "skipped",
+      summary: "Verification environment is missing required keys: DATABASE_URL",
+      commands: [],
+    });
+    expect(JSON.stringify(verification)).not.toContain("owner:secret");
+  });
+
   it("propagates command spawn failures instead of reporting verification failure", async () => {
     const runner = new VerificationRunner();
 

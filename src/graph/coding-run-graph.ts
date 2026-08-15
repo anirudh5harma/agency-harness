@@ -25,6 +25,7 @@ import {
   ProjectKnowledgeEntrySchema,
   ProjectKnowledgeSchema,
   RepoContextSchema,
+  recoverHumanDecisionRequest,
   redactSecrets,
   SessionContextSchema,
   type AgencyPhase,
@@ -510,21 +511,11 @@ export function createCodingRunGraph(
       .slice(0, MAX_CHANGED_FILES);
   }
 
-  async function changedFilesAfterVerification(
-    baseline: GitBaseline,
-    beforeVerification: readonly string[],
-  ): Promise<string[]> {
-    const changedFiles = await actualChangedFiles(baseline);
-    const alreadyChanged = new Set(beforeVerification);
-    // Cooperative-process attribution: only paths that became Git-visible while
-    // Agency's verifier was running are eligible for undo ownership. Paths dirty
-    // beforehand stay unowned because concurrent user edits cannot be separated.
-    for (const path of changedFiles) {
-      if (!alreadyChanged.has(path)) {
-        dependencies.eventBus?.emit({ type: "file_changed", path });
-      }
-    }
-    return changedFiles;
+  async function changedFilesAfterVerification(baseline: GitBaseline): Promise<string[]> {
+    // Verification is an opaque project process. Its aggregate Git delta stays
+    // truthful, but concurrent user writes cannot be distinguished from verifier
+    // writes and therefore must never become Agency undo ownership.
+    return actualChangedFiles(baseline);
   }
 
   function mergeKnowledge(
@@ -881,10 +872,7 @@ export function createCodingRunGraph(
           runtime.signal ?? new AbortController().signal,
         ),
       );
-      const changedFiles = await changedFilesAfterVerification(
-        state.baseline,
-        beforeVerification,
-      );
+      const changedFiles = await changedFilesAfterVerification(state.baseline);
       const verificationMetrics = {
         verificationCommandCount: state.verificationCommandCount + verification.commands.length,
         verificationCommandDurationsMs: [
@@ -942,10 +930,7 @@ export function createCodingRunGraph(
       const reportedError = await failureAfterRecording(state, "verification_failed", boundary.startedAt, error);
       if (beforeVerification !== null && state.baseline !== null) {
         try {
-          const changedFiles = await changedFilesAfterVerification(
-            state.baseline,
-            beforeVerification,
-          );
+          const changedFiles = await changedFilesAfterVerification(state.baseline);
           return {
             ...boundary.result,
             changedFiles,
@@ -1064,7 +1049,8 @@ export function createCodingRunGraph(
     if (state.pendingHumanDecision === null) {
       throw new Error("Human decision state is incomplete");
     }
-    const request = HumanDecisionRequestSchema.parse(state.pendingHumanDecision);
+    const request = recoverHumanDecisionRequest(state.pendingHumanDecision);
+    if (request === null) throw new Error("Human decision checkpoint is invalid");
     const response = HumanDecisionResponseSchema.forRequest(request).parse(
       interrupt(request),
     );
@@ -1218,11 +1204,11 @@ export function createCodingRunGraph(
       if (response !== undefined) {
         const snapshot = await compiled.getState(config(threadId));
         const values = snapshot.values as Partial<CodingRunState>;
-        const request = HumanDecisionRequestSchema.safeParse(values.pendingHumanDecision);
-        if (!request.success) {
+        const request = recoverHumanDecisionRequest(values.pendingHumanDecision);
+        if (request === null) {
           throw new Error("Cannot resume without a matching pending human request");
         }
-        safeResponse = HumanDecisionResponseSchema.forRequest(request.data).parse(response);
+        safeResponse = HumanDecisionResponseSchema.forRequest(request).parse(response);
       }
       return compiled.invoke(
         safeResponse === undefined ? null : new Command({ resume: safeResponse }),

@@ -4,8 +4,8 @@ import type { CodingRuntime } from "../coding/index.js";
 import { PiCodingRuntime } from "../coding/index.js";
 import {
   APPROVAL_DECISION_OPTIONS,
-  HumanDecisionRequestSchema,
   HumanDecisionResponseSchema,
+  recoverHumanDecisionRequest,
   type HumanDecisionRequest,
   type HumanDecisionResponse,
   type RunSummary,
@@ -555,10 +555,7 @@ export class AgencyApplication implements ReplHandler {
   #pendingRequest(snapshot: unknown): HumanDecisionRequest | null {
     const values = checkpointValues(snapshot);
     if (values === null) return null;
-    const parsed = HumanDecisionRequestSchema.safeParse(
-      values.pendingHumanDecision,
-    );
-    return parsed.success ? parsed.data : null;
+    return recoverHumanDecisionRequest(values.pendingHumanDecision);
   }
 
   async #resolveHumanInput(

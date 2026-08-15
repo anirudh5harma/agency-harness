@@ -30,6 +30,8 @@ export interface VerificationRunnerOptions {
   signal?: AbortSignal;
   /** Source environment is always reduced to verification-safe compatibility keys. */
   environment?: NodeJS.ProcessEnv;
+  /** Keys the target project declares necessary for meaningful verification. */
+  requiredEnvironmentKeys?: readonly string[];
 }
 
 interface PackageManifest {
@@ -106,6 +108,7 @@ export class VerificationRunner {
   readonly #eventBus: EventBus | undefined;
   readonly #execute: CommandExecutor;
   readonly #options: Omit<RunCommandOptions, "command" | "args" | "cwd">;
+  readonly #missingRequiredEnvironmentKeys: string[];
 
   constructor(options: VerificationRunnerOptions = {}) {
     this.#eventBus = options.eventBus;
@@ -117,8 +120,16 @@ export class VerificationRunner {
           command: command.command,
           args: command.args,
         }));
+    const environment = verificationEnvironment(options.environment ?? process.env);
+    const requiredEnvironmentKeys = [...new Set(options.requiredEnvironmentKeys ?? [])]
+      .map((key) => key.trim())
+      .filter((key) => /^[A-Za-z_][A-Za-z0-9_]*$/u.test(key))
+      .sort();
+    this.#missingRequiredEnvironmentKeys = requiredEnvironmentKeys.filter(
+      (key) => environment[key] === undefined,
+    );
     this.#options = {
-      env: verificationEnvironment(options.environment ?? process.env),
+      env: environment,
       ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
       ...(options.maxOutputBytes === undefined
         ? {}
@@ -133,6 +144,13 @@ export class VerificationRunner {
   ): Promise<VerificationResult> {
     if (commands.length === 0) {
       return { status: "skipped", summary: "No verification commands detected", commands: [] };
+    }
+    if (this.#missingRequiredEnvironmentKeys.length > 0) {
+      return {
+        status: "skipped",
+        summary: `Verification environment is missing required keys: ${this.#missingRequiredEnvironmentKeys.join(", ")}`,
+        commands: [],
+      };
     }
 
     const results: CommandResult[] = [];

@@ -138,7 +138,7 @@ describe("Agency tool policy", () => {
     })).toThrow("search listing byte limit");
   });
 
-  it("caps aggregate grep bytes and omits matches after the cap", async () => {
+  it("makes the aggregate grep cap visible instead of claiming there are no matches", async () => {
     const { root } = await fixture();
     const chunk = Buffer.alloc(1024 * 1024, 97);
     for (let index = 0; index < 32; index += 1) {
@@ -149,7 +149,10 @@ describe("Agency tool policy", () => {
 
     const result = await invoke(grep, { path: ".", pattern: "needle-after-cap", literal: true });
 
-    expect(result.content).toEqual([{ type: "text", text: "No matches found" }]);
+    expect(result.content).toEqual([{
+      type: "text",
+      text: "Search stopped after 33554432 aggregate bytes; results are incomplete.",
+    }]);
     expect(result.details).toEqual({ searchByteLimitReached: 32 * 1024 * 1024 });
   });
 
@@ -252,6 +255,55 @@ describe("Agency tool policy", () => {
     expect(consumeApproval).not.toHaveBeenCalled();
   });
 
+  it("blocks polyglot dependency manifests and common migration layouts before approval", async () => {
+    const { root } = await fixture();
+    const manifests = [
+      "requirements.txt", "requirements-dev.txt", "pyproject.toml", "Pipfile", "Cargo.toml",
+      "go.mod", "Gemfile", "composer.json", "pom.xml", "build.gradle", "settings.gradle.kts",
+      "Package.swift", "pubspec.yaml", "service.csproj", "workspace.sln", "pnpm-workspace.yaml",
+      "lerna.json", "rush.json", "Directory.Packages.props",
+    ];
+    for (const path of manifests) await writeFile(join(root, path), "original\n");
+    await mkdir(join(root, "alembic", "versions"), { recursive: true });
+    await mkdir(join(root, "db"), { recursive: true });
+    await writeFile(join(root, "alembic", "versions", "001_create.py"), "upgrade = True\n");
+    await writeFile(join(root, "db", "schema.rb"), "schema\n");
+
+    const consumeApproval = vi.fn(() => true);
+    const write = createRoleFileTools({ root, role: "executor", consumeApproval })
+      .find(({ name }) => name === "write")!;
+    for (const path of [...manifests, "alembic/versions/001_create.py", "db/schema.rb"]) {
+      await expect(invoke(write, { path, content: "changed\n" }), path)
+        .rejects.toThrow("Agency policy blocks this operation");
+    }
+    expect(consumeApproval).not.toHaveBeenCalled();
+  });
+
+  it("rejects protected rm targets before approval, including recursive contents", async () => {
+    const { root } = await fixture();
+    await mkdir(join(root, "generated"));
+    await writeFile(join(root, "requirements-ci.txt"), "pytest\n");
+    await writeFile(join(root, "generated", "Cargo.toml"), "[package]\n");
+    const execute = vi.fn(async () => ({ content: [], details: {} }));
+    const factories = {
+      ...defaultToolFactoryBoundary,
+      createBashTool: vi.fn(() => ({
+        name: "bash", label: "bash", description: "test", parameters: { type: "object" } as never, execute,
+      } as never)),
+    };
+    const consumeApproval = vi.fn(() => true);
+    const bash = createProtectedBashTool({ root, factories, consumeApproval });
+
+    await expect(bash.execute("direct", { command: "rm requirements-ci.txt" }, undefined, undefined, {} as never))
+      .rejects.toThrow("dependency manifest");
+    await expect(bash.execute("recursive", { command: "rm -rf generated" }, undefined, undefined, {} as never))
+      .rejects.toThrow("dependency manifest");
+    await expect(bash.execute("lock", { command: "rm package.json" }, undefined, undefined, {} as never))
+      .rejects.toThrow("dependency manifest");
+    expect(consumeApproval).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it("denies a fourth distinct mission path before mutation", async () => {
     const { root } = await fixture();
     const budget = new MissionMutationBudget();
@@ -316,21 +368,29 @@ describe("Agency tool policy", () => {
     }
   });
 
-  it("requires exact one-shot approval for consequential shell", () => {
-    let approved = bashApprovalAction(["rm", "-rf", "build"]);
-    expect(approved).toMatch(/^bash:rm argv:rm -rf build sha256:[a-f0-9]{64}$/u);
+  it("requires exact one-shot approval for a single non-recursive rm", () => {
+    let approved = bashApprovalAction(["rm", "build/output.js"]);
+    expect(approved).toMatch(/^bash:rm argv:rm build\/output\.js sha256:[a-f0-9]{64}$/u);
     const consume = (action: string) => {
       if (action !== approved) return false;
       approved = "";
       return true;
     };
-    expect(() => assertAllowedBash("rm -rf other", consume)).toThrow("exact action");
-    expect(() => assertAllowedBash("rm -rf build", consume)).not.toThrow();
-    expect(() => assertAllowedBash("rm -rf build", consume)).toThrow("one-shot approval");
+    expect(() => assertAllowedBash("rm other.js", consume)).toThrow("exact action");
+    expect(() => assertAllowedBash("rm build/output.js", consume)).not.toThrow();
+    expect(() => assertAllowedBash("rm build/output.js", consume)).toThrow("one-shot approval");
 
-    approved = bashApprovalAction(["rm", "-rf", "build  dir"]);
-    expect(() => assertAllowedBash("rm -rf 'build dir'", consume)).toThrow("exact action");
-    expect(() => assertAllowedBash("rm -rf 'build  dir'", consume)).not.toThrow();
+    approved = bashApprovalAction(["rm", "build  file"]);
+    expect(() => assertAllowedBash("rm 'build file'", consume)).toThrow("exact action");
+    expect(() => assertAllowedBash("rm 'build  file'", consume)).not.toThrow();
+  });
+
+  it("rejects recursive and multi-target rm without consuming approval", () => {
+    const consumeApproval = vi.fn(() => true);
+    for (const command of ["rm -rf build", "rm --recursive build", "rm first.ts second.ts"]) {
+      expect(() => assertAllowedBash(command, consumeApproval), command).toThrow("Agency policy");
+    }
+    expect(consumeApproval).not.toHaveBeenCalled();
   });
 
   it("rejects approved rm targets through symlink parents and private aliases", async () => {
@@ -348,10 +408,10 @@ describe("Agency tool policy", () => {
     };
 
     for (const target of ["outside-dir/secret.txt", "src/nested-outside/secret.txt", "metadata-alias/private.txt"]) {
-      const action = bashApprovalAction(["rm", "-rf", target]);
+      const action = bashApprovalAction(["rm", target]);
       const bash = createProtectedBashTool({ root, factories, consumeApproval: (candidate) => candidate === action });
       await expect(
-        bash.execute("approved-rm", { command: `rm -rf ${target}` }, undefined, undefined, {} as never),
+        bash.execute("approved-rm", { command: `rm ${target}` }, undefined, undefined, {} as never),
         target,
       ).rejects.toThrow("Agency policy");
     }
@@ -385,7 +445,7 @@ describe("Agency tool policy", () => {
       factoryOptions,
     } as never));
     const factories = { ...defaultToolFactoryBoundary, createBashTool };
-    const approval = bashApprovalAction(["rm", "-rf", "build"]);
+    const approval = bashApprovalAction(["rm", "build/output.js"]);
     const consumeApproval = vi.fn((action: string) => action === approval);
     const bash = createProtectedBashTool({ root, factories, consumeApproval });
     await bash.execute("git", { command: "git diff -- src/safe.ts" }, undefined, undefined, {} as never);
@@ -412,12 +472,12 @@ describe("Agency tool policy", () => {
     });
 
     for (const timeout of ["5", 0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483.648]) {
-      await expect(bash.execute("invalid-timeout", { command: "rm -rf build", timeout }, undefined, undefined, {} as never), String(timeout)).rejects.toThrow("timeout");
+      await expect(bash.execute("invalid-timeout", { command: "rm build/output.js", timeout }, undefined, undefined, {} as never), String(timeout)).rejects.toThrow("timeout");
     }
     expect(consumeApproval).not.toHaveBeenCalled();
     await mkdir(join(root, "build"));
     await writeFile(join(root, "build", "output.js"), "generated\n");
-    await expect(bash.execute("approved", { command: "rm -rf build", timeout: 5 }, undefined, undefined, {} as never)).resolves.toMatchObject({
+    await expect(bash.execute("approved", { command: "rm build/output.js", timeout: 5 }, undefined, undefined, {} as never)).resolves.toMatchObject({
       details: { agencyMutationPaths: ["build/output.js"] },
     });
     expect(consumeApproval).toHaveBeenCalledOnce();

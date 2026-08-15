@@ -3,6 +3,11 @@ import { z } from "zod";
 const NonEmptyStringSchema = z.string().trim().min(1);
 export function redactSecrets(value: string): string {
   return value
+    .replace(
+      /(\b[A-Z0-9_]*(?:DATABASE|DB|POSTGRES(?:QL)?|MYSQL|MARIADB|MONGO(?:DB)?|REDIS)_URL\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
+      "$1[REDACTED]",
+    )
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/giu, "$1[REDACTED]@")
     .replace(/\bBearer\s+[^\s,;]+/giu, "Bearer [REDACTED]")
     .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gu, "[REDACTED]")
     .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu, "[REDACTED]")
@@ -87,6 +92,8 @@ export const HumanDecisionRequestSchema = z
         });
       }
       terminalSafeApprovalText(request.question, context, ["question"]);
+      if (request.context !== undefined) terminalSafeApprovalText(request.context, context, ["context"]);
+      if (request.risk !== undefined) terminalSafeApprovalText(request.risk, context, ["risk"]);
       if (request.action !== undefined) terminalSafeApprovalText(request.action, context, ["action"]);
       request.options.forEach((option, index) => {
         terminalSafeApprovalText(option.label, context, ["options", index, "label"]);
@@ -98,6 +105,41 @@ export const HumanDecisionRequestSchema = z
     ? { ...request, options: APPROVAL_DECISION_OPTIONS.map((option) => ({ ...option })) }
     : request);
 export type HumanDecisionRequest = z.infer<typeof HumanDecisionRequestSchema>;
+
+function visiblyEscapeTerminalControls(value: string): string {
+  return [...value].map((character) => {
+    if (!containsTerminalSpoofingControl(character)) return character;
+    const codePoint = character.codePointAt(0) ?? 0;
+    return `\\u{${codePoint.toString(16).padStart(4, "0")}}`;
+  }).join("");
+}
+
+/**
+ * Reads checkpoint-era requests that predate terminal-safe approval text.
+ * Live provider requests must continue through HumanDecisionRequestSchema.
+ */
+export function recoverHumanDecisionRequest(value: unknown): HumanDecisionRequest | null {
+  const current = HumanDecisionRequestSchema.safeParse(value);
+  if (current.success) return current.data;
+  if (typeof value !== "object" || value === null || !("kind" in value) || value.kind !== "approval") return null;
+  const legacy = value as Record<string, unknown>;
+  const escaped = { ...legacy };
+  for (const field of ["question", "context", "risk", "action"] as const) {
+    if (typeof escaped[field] === "string") escaped[field] = visiblyEscapeTerminalControls(escaped[field]);
+  }
+  if (Array.isArray(escaped.options)) {
+    escaped.options = escaped.options.map((option) => {
+      if (typeof option !== "object" || option === null) return option;
+      const safe = { ...option } as Record<string, unknown>;
+      for (const field of ["label", "description"] as const) {
+        if (typeof safe[field] === "string") safe[field] = visiblyEscapeTerminalControls(safe[field]);
+      }
+      return safe;
+    });
+  }
+  const recovered = HumanDecisionRequestSchema.safeParse(escaped);
+  return recovered.success ? recovered.data : null;
+}
 
 const HumanDecisionResponseBaseSchema = z
   .strictObject({

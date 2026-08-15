@@ -33,6 +33,18 @@ function compileTestGraph(
     .compile({ checkpointer });
 }
 
+function compileInterruptedTestGraph(
+  checkpointer: Awaited<
+    ReturnType<typeof createSqliteCheckpointPersistence>
+  >["checkpointer"],
+) {
+  return new StateGraph(TestStateSchema)
+    .addNode("record", (state) => ({ value: state.value }))
+    .addEdge(START, "record")
+    .addEdge("record", END)
+    .compile({ checkpointer, interruptBefore: ["record"] });
+}
+
 function config(threadId: string) {
   return { configurable: { thread_id: threadId } };
 }
@@ -133,13 +145,58 @@ describe("durable checkpoint persistence", () => {
     reopened.close();
   });
 
-  it("migrates a legacy SQLite checkpoint without losing graph state", async () => {
+  it("merges updates from independent persistence instances and refreshes reads", async () => {
+    const projectRoot = await temporaryProject();
+    const first = await createSqliteCheckpointPersistence(projectRoot);
+    const second = await createSqliteCheckpointPersistence(projectRoot);
+    const firstGraph = compileTestGraph(first.checkpointer);
+    const secondGraph = compileTestGraph(second.checkpointer);
+
+    await Promise.all([
+      firstGraph.invoke({ value: "from-first" }, config("first-thread")),
+      secondGraph.invoke({ value: "from-second" }, config("second-thread")),
+    ]);
+
+    await expect(firstGraph.getState(config("second-thread"))).resolves.toMatchObject({
+      values: { value: "from-second" },
+    });
+    await expect(secondGraph.getState(config("first-thread"))).resolves.toMatchObject({
+      values: { value: "from-first" },
+    });
+
+    first.close();
+    second.close();
+    const reopened = await createSqliteCheckpointPersistence(projectRoot);
+    const reopenedGraph = compileTestGraph(reopened.checkpointer);
+    await expect(reopenedGraph.getState(config("first-thread"))).resolves.toMatchObject({
+      values: { value: "from-first" },
+    });
+    await expect(reopenedGraph.getState(config("second-thread"))).resolves.toMatchObject({
+      values: { value: "from-second" },
+    });
+    reopened.close();
+  });
+
+  it("migrates an interrupted legacy SQLite checkpoint and resumes its pending work", async () => {
     const projectRoot = await temporaryProject();
     const metadataRoot = join(projectRoot, ".devagency");
     const path = join(metadataRoot, "state.db");
     const source = new MemorySaver();
-    const sourceGraph = compileTestGraph(source);
+    const sourceGraph = compileInterruptedTestGraph(source);
     await sourceGraph.invoke({ value: "legacy" }, config("legacy-thread"));
+    await expect(sourceGraph.getState(config("legacy-thread"))).resolves.toMatchObject({
+      values: { value: "legacy" },
+      next: ["record"],
+    });
+    const interruptedTuple = await source.getTuple(config("legacy-thread"));
+    expect(interruptedTuple).toBeDefined();
+    await source.putWrites(
+      interruptedTuple!.config,
+      [["migration-proof", { retained: true }]],
+      "migration-proof-task",
+    );
+    const legacyPendingWrites = (await source.getTuple(config("legacy-thread")))?.pendingWrites;
+    expect(legacyPendingWrites?.length).toBeGreaterThan(0);
 
     const { mkdir } = await import("node:fs/promises");
     await mkdir(metadataRoot, { mode: 0o700 });
@@ -185,6 +242,15 @@ describe("durable checkpoint persistence", () => {
     const migratedGraph = compileTestGraph(migrated.checkpointer);
     await expect(migratedGraph.getState(config("legacy-thread"))).resolves.toMatchObject({
       values: { value: "legacy" },
+      next: ["record"],
+    });
+    expect(
+      (await migrated.checkpointer.getTuple(config("legacy-thread")))?.pendingWrites,
+    ).toEqual(legacyPendingWrites);
+    await migratedGraph.invoke(null, config("legacy-thread"));
+    await expect(migratedGraph.getState(config("legacy-thread"))).resolves.toMatchObject({
+      values: { value: "legacy" },
+      next: [],
     });
     expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
       format: "agency-checkpoints",
